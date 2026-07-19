@@ -4,16 +4,10 @@
 
 Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pathfinding, type-advantage combat, and modular AI architecture. Built with Python 3 + Pygame.
 
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
-[![Pygame](https://img.shields.io/badge/Pygame_CE-2.5-4172B5?style=for-the-badge)](https://pyga.me)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com)
-[![Tests](https://img.shields.io/badge/Tests-62/62-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](#testing)
-[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](#license)
-[![Status](https://img.shields.io/badge/Status-MVP-brightgreen?style=for-the-badge)](#)
-[![GitHub Stars](https://img.shields.io/github/stars/Tleukhanov/My_mvp_game?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/Tleukhanov/My_mvp_game?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/network/members)
-[![GitHub Issues](https://img.shields.io/github/issues/Tleukhanov/My_mvp_game?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/issues)
-[![GitHub Last Commit](https://img.shields.io/github/last-commit/Tleukhanov/My_mvp_game?style=for-the-badge&logo=git&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/commits)
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![Pygame](https://img.shields.io/badge/Pygame_CE-2.5-4172B5)
+![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 </div>
 
