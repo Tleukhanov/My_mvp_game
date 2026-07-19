@@ -4,27 +4,16 @@
 
 Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pathfinding, type-advantage combat, and modular AI architecture. Built with Python 3 + Pygame.
 
----
-
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
-![Pygame](https://img.shields.io/badge/Pygame_CE-2.5-4172B5?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0yMS4yIDEwLjZMMTIuNCAyLjRjLS42LS42LTEuNi0uNi0yLjIgMEwyLjEgMTAuNmMtLjYuNi0uNiAxLjYgMCAyLjJsOC4xIDguMmMuNi42IDEuNi42IDIuMiAwbDguMS04LjJjLjYtLjYuNi0xLjYgMC0yLjJ6TTcuNyAxNC42bC0zLjgtMy44IDMuOC0zLjggMy44IDMuOC0zLjggMy44em01LjYgNS42bC0zLjgtMy44IDMuOC0zLjggMy44IDMuOC0zLjggMy44em0yLjItNS42bC0zLjgtMy44IDMuOC0zLjggMy44IDMuOC0zLjggMy44eiIvPjwvc3ZnPg==&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat-square&logo=docker&logoColor=white)
-![pytest](https://img.shields.io/badge/pytest-62%2F62-0A9EDC?style=flat-square&logo=pytest&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
-![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=flat-square)
-![GitHub stars](https://img.shields.io/github/stars/Tleukhanov/My_mvp_game?style=flat-square&logo=github&logoColor=white)
-![GitHub forks](https://img.shields.io/github/forks/Tleukhanov/My_mvp_game?style=flat-square&logo=github&logoColor=white)
-![GitHub issues](https://img.shields.io/github/issues/Tleukhanov/My_mvp_game?style=flat-square&logo=github&logoColor=white)
-![GitHub last commit](https://img.shields.io/github/last-commit/Tleukhanov/My_mvp_game?style=flat-square&logo=git&logoColor=white)
-![GitHub code size](https://img.shields.io/github/languages/code-size/Tleukhanov/My_mvp_game?style=flat-square)
-![GitHub repo size](https://img.shields.io/github/repo-size/Tleukhanov/My_mvp_game?style=flat-square)
-![GitHub language count](https://img.shields.io/github/languages/count/Tleukhanov/My_mvp_game?style=flat-square)
-![Linux](https://img.shields.io/badge/Platform-Linux-FCC624?style=flat-square&logo=linux&logoColor=black)
-![macOS](https://img.shields.io/badge/Platform-macOS-000000?style=flat-square&logo=apple&logoColor=white)
-![Windows](https://img.shields.io/badge/Platform-Windows-0078D4?style=flat-square&logo=windows&logoColor=white)
-![Pytest](https://img.shields.io/badge/Testing-62_tests-0A9EDC?style=flat-square&logo=pytest&logoColor=white)
-![A*](https://img.shields.io/badge/Pathfinding-A*-FF6B35?style=flat-square)
-![AI](https://img.shields.io/badge/AI-State_Machine-9B59B6?style=flat-square)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
+[![Pygame](https://img.shields.io/badge/Pygame_CE-2.5-4172B5?style=for-the-badge)](https://pyga.me)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com)
+[![Tests](https://img.shields.io/badge/Tests-62/62-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](#testing)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](#license)
+[![Status](https://img.shields.io/badge/Status-MVP-brightgreen?style=for-the-badge)](#)
+[![GitHub Stars](https://img.shields.io/github/stars/Tleukhanov/My_mvp_game?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/Tleukhanov/My_mvp_game?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/Tleukhanov/My_mvp_game?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/issues)
+[![GitHub Last Commit](https://img.shields.io/github/last-commit/Tleukhanov/My_mvp_game?style=for-the-badge&logo=git&logoColor=white)](https://github.com/Tleukhanov/My_mvp_game/commits)
 
 </div>
 
