@@ -1,0 +1,59 @@
+version: "3.8"
+
+# =============================================================================
+#  Tactic Battle - Docker Compose Configuration
+#
+#  HOW TO RUN (choose one method):
+#
+#  METHOD 1 - Linux (X11 forwarding, simplest):
+#    xhost +local:docker
+#    docker compose up --build
+#
+#  METHOD 2 - macOS (requires XQuartz):
+#    brew install --cask xquartz
+#    open -a XQuartz
+#    xhost +local:docker
+#    docker compose up --build
+#
+#  METHOD 3 - Windows (requires VcXsrv or X410):
+#    1. Install VcXsrv from https://sourceforge.net/projects/vcxsrv/
+#    2. Launch XLaunch with "Disable access control" checked
+#    3. Set DISPLAY env: export DISPLAY=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}'):0.0
+#    4. docker compose up --build
+#
+#  METHOD 4 - Headless mode (no display, for CI/testing):
+#    docker compose --profile headless up --build
+#
+# =============================================================================
+
+services:
+  tacticbattle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tacticbattle
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    network_mode: host
+    stdin_open: true
+    tty: true
+    profiles:
+      - gui
+
+  tacticbattle-headless:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - SDL_VIDEODRIVER=dummy
+        - SDL_AUDIODRIVER=dummy
+    container_name: tacticbattle-headless
+    environment:
+      - SDL_VIDEODRIVER=dummy
+      - SDL_AUDIODRIVER=dummy
+    volumes:
+      - ./test_output:/app/test_output
+    profiles:
+      - headless
