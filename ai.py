@@ -46,11 +46,10 @@ class UnitAI:
         if dist <= self.unit.attack_range:
             self.unit.set_attack_target(nearest)
             self.state = AIState.ATTACK
-        elif dist <= CELL_SIZE * 8:
-            self._last_known_enemy_pos = nearest.center
-            self.state = AIState.MOVE
         else:
-            self.state = AIState.IDLE
+            self._last_known_enemy_pos = nearest.center
+            self._chase_target(nearest)
+            self.state = AIState.MOVE
 
     def _do_move(self, enemies: List[Unit]):
         nearest = self._find_nearest_enemy(enemies)
@@ -62,6 +61,10 @@ class UnitAI:
         if self.unit.health_ratio < self._retreat_threshold and nearest:
             self._flee(nearest, enemies)
             return
+
+        if nearest and (not self.unit._path or self.unit._path_index >= len(self.unit._path)):
+            self._last_known_enemy_pos = nearest.center
+            self._chase_target(nearest)
 
         if not self.unit._path or self.unit._path_index >= len(self.unit._path):
             self.state = AIState.IDLE
@@ -118,7 +121,7 @@ class UnitAI:
         else:
             self.state = AIState.IDLE
 
-    def _update_chase(self, target: Unit):
+    def _chase_target(self, target: Unit):
         pixel_path = self.pathfinder.find_path_pixels(
             self.unit.x, self.unit.y, target.x, target.y
         )

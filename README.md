@@ -15,22 +15,35 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 
 ## Features
 
+### Game Modes
+- **Main Menu** — stylish launch screen with mode selection
+- **Skirmish** — quick battle on the default tactical map
+- **Campaign** — 3 handcrafted missions with unique terrain and objectives
+- **Online** — planned (placeholder)
+
+### Campaign Missions
+1. **Битва у моста** — defend/attack a strategic bridge crossing over a river with mountain flanks
+2. **Ущелье смерти** — navigate through a narrow mountain canyon with chokepoints
+3. **Речная крепость** — assault an enemy fortress behind a river and mountain defenses
+
 ### Gameplay
 - **RTS Controls** — left-click to select a unit, right-click to issue move or attack orders
 - **3 Unit Types** — Infantry (circles), Cavalry (squares), Archers (triangles)
 - **Type Advantage System** — Cavalry beats Archers, Archers damage Infantry, Infantry holds against Cavalry
 - **Soldier Count** — each unit represents a regiment (500 soldiers), numbers decrease during combat
 - **Combat Range** — Archers fire from 5 tiles away, melee units close the distance automatically
+- **Unit Collision** — units cannot overlap, they push apart and pathfind around each other
 
 ### Terrain
-- **Mountains** — completely impassable, create natural choke points
-- **Rivers** — 5x movement speed penalty, force tactical routing
+- **Grass Plains** — multiple green tones with procedural grass blades and flowers
+- **Mountains** — impassable with 3D peak shading and shadows
+- **Rivers** — animated flowing water with highlights, waves and depth
 - **Bridges** — the only way to cross rivers at normal speed
-- **Parchment Map** — minimalist historical military map aesthetic with geometric terrain markers
 
 ### AI
-- **State Machine** — Idle / Move / Attack states with 0.5s decision ticks
-- **Auto-Targeting** — Red team finds and engages the nearest Blue unit
+- **Proactive Aggression** — enemies advance toward you from the start, no more standing still
+- **A\* Pathfinding Chase** — AI units navigate around terrain when pursuing targets
+- **State Machine** — Idle / Move / Attack states with decision ticks
 - **Retreat Logic** — units flee when below 20% health
 - **Modular Design** — swap the AI controller with an ML agent via the `AIController` interface
 
@@ -49,7 +62,7 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 | Graphics | Pygame-CE 2.5 |
 | Pathfinding | A\* with terrain cost weighting |
 | AI | Finite State Machine (Idle/Move/Attack/Retreat) |
-| Testing | pytest (62 tests) |
+| Testing | pytest (83 tests) |
 | Container | Docker + docker-compose |
 
 ---
@@ -98,37 +111,18 @@ My_mvp_game/
 ├── config.py            # Constants, enums, colors, unit stats, combat matrix
 ├── map.py               # TacticalMap — 40x22 tile grid with terrain generation
 ├── pathfinding.py       # A* pathfinding with terrain cost awareness
-├── units.py             # Unit base class + Infantry, Cavalry, Archer subclasses
+├── units.py             # Unit class with collision, pathfinder, combat
 ├── ai.py                # State-machine AI (UnitAI + AIController)
 ├── engine.py            # Game loop, event handling, rendering pipeline, HUD
-├── main.py              # Entry point
+├── main.py              # Entry point with menu
+├── menu.py              # Main menu + campaign selection screens
+├── campaigns.py         # 3 campaign mission definitions and maps
 ├── requirements.txt     # pygame-ce dependency
-├── test_tactics.py      # 62 unit, integration, and edge-case tests
+├── test_tactics.py      # 83 unit, integration, and edge-case tests
 ├── Dockerfile           # Docker image (X11 + dummy driver support)
 ├── docker-compose.yml   # Compose profiles: gui + headless
 └── README.md
 ```
-
----
-
-## Map Design
-
-The default tactical map features:
-
-```
-    LEFT (Blue)          CENTER            RIGHT (Red)
-  ┌─────────────┐   ┌──────────┐     ┌─────────────┐
-  │  Infantry    │   │ Mountain │     │  Infantry    │
-  │  Cavalry     │──▶│ Range    │────▶│  Cavalry     │
-  │  Archer      │   │ Bridge   │     │  Archer      │
-  └─────────────┘   └──────────┘     └─────────────┘
-              River          River
-         (5x slow)     (5x slow)
-```
-
-- Central mountain range splits the map vertically
-- Two rivers with bridges create crossing choke points
-- Sparse mountain clusters add tactical cover on flanks
 
 ---
 
@@ -145,17 +139,19 @@ The default tactical map features:
 ## Testing
 
 ```bash
-# Run all 62 tests
+# Run all 83 tests
 python -m pytest test_tactics.py -v
 
 # Test categories:
-# - TestConfig (10)          — constants, enums, combat matrix
-# - TestTacticalMap (11)     — terrain grid, bounds, passability
-# - TestPathfinding (8)      — A* routing, obstacles, bridges
-# - TestUnit (15)            — creation, damage, combat, rendering
-# - TestAI (7)               — state machine, targeting, retreat
-# - TestIntegration (4)      — full-scene rendering, multi-unit
-# - TestEdgeCases (5)        — boundary conditions, overkill
+# - TestConfig (12)            — constants, enums, combat matrix, new colors
+# - TestTacticalMap (13)       — terrain grid, bounds, passability, grass rendering
+# - TestPathfinding (8)        — A* routing, obstacles, bridges
+# - TestUnit (17)              — creation, damage, combat, rendering
+# - TestUnitCollision (5)      — unit separation, overlap prevention
+# - TestAI (8)                 — state machine, targeting, proactive advance
+# - TestCampaigns (10)         — mission validation, map generation
+# - TestIntegration (5)        — full-scene, multi-unit, AI engagement
+# - TestEdgeCases (5)          — boundary conditions, overkill
 ```
 
 ---
@@ -168,10 +164,11 @@ python -m pytest test_tactics.py -v
 3. Add advantage entries in `config.py` → `COMBAT_ADVANTAGE`
 4. Add shape renderer in `units.py` → `Unit._render_*`
 
-### Adding a New Map
-1. Create grid in `map.py` using `TerrainType` enum
-2. Pass grid to `TacticalMap(grid)` constructor
-3. Pathfinding and terrain costs adapt automatically
+### Adding a New Campaign
+1. Create a `get_mission_N()` function in `campaigns.py`
+2. Define the grid, blue_units, red_units
+3. Add to `MISSIONS` dict in `campaigns.py`
+4. Engine auto-loads it when `mission=N` is passed
 
 ### Swapping AI with ML Agent
 ```python
@@ -204,22 +201,6 @@ The `Dockerfile` supports two modes:
 | **Linux** | `xhost +local:docker` then `docker compose --profile gui up --build` |
 | **macOS** | Install XQuartz, open it, `xhost +local:docker`, same compose command |
 | **Windows** | Install VcXsrv, set `DISPLAY` to host IP, same compose command |
-
----
-
-## Roadmap
-
-| Priority | Feature | Description |
-|---|---|---|
-| High | **Scrolling Camera** | Pan and zoom for larger maps |
-| High | **Unit Formations** | Group selection and formation movement |
-| Medium | **Fog of War** | Limited visibility per unit type |
-| Medium | **Morale System** | Units rout after taking heavy casualties |
-| Medium | **New Unit Types** | Artillery, Dragoons, Light Infantry |
-| Medium | **Campaign Mode** | Multi-battle progression with persistent armies |
-| Low | **ML AI Agent** | Reinforcement learning opponent via `AIController` interface |
-| Low | **Multiplayer** | Network multiplayer with turn-based or real-time modes |
-| Low | **Sound Effects** | March, cannon fire, bugle calls |
 
 ---
 

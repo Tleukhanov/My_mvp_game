@@ -45,6 +45,8 @@ class Unit:
 
         self._font = pygame.font.SysFont("consolas", FONT_SIZE_UNIT)
         self._last_attack_time = 0.0
+        self._pathfinder = None
+        self._chase_timer = 0.0
 
     @property
     def grid_col(self) -> int:
@@ -88,6 +90,7 @@ class Unit:
             return
 
         self._attack_timer = max(0.0, self._attack_timer - dt)
+        self._chase_timer = max(0.0, self._chase_timer - dt)
 
         if self._attack_target and self._attack_target.alive:
             dist = self.distance_to(self._attack_target)
@@ -99,9 +102,12 @@ class Unit:
                     self._attack_timer = self.attack_cooldown
                 return
             else:
-                self._chase_target()
+                if self._chase_timer <= 0:
+                    self._chase_target()
+                    self._chase_timer = 1.0
 
         self._move_along_path(dt, game_map)
+        self._resolve_collisions(all_units)
 
     def _move_along_path(self, dt: float, game_map):
         if not self._path or self._path_index >= len(self._path):
@@ -134,10 +140,34 @@ class Unit:
         if not self._attack_target or not self._attack_target.alive:
             self._attack_target = None
             return
-        self._path = [
-            self._attack_target.center,
-        ]
-        self._path_index = 0
+        if self._pathfinder:
+            pixel_path = self._pathfinder.find_path_pixels(
+                self.x, self.y, self._attack_target.x, self._attack_target.y
+            )
+            if pixel_path:
+                self._path = pixel_path
+                self._path_index = 0
+        else:
+            self._path = [
+                self._attack_target.center,
+            ]
+            self._path_index = 0
+
+    MIN_SEPARATION = CELL_SIZE * 0.55
+
+    def _resolve_collisions(self, all_units: List["Unit"]):
+        for other in all_units:
+            if other is self or not other.alive:
+                continue
+            dx = self.x - other.x
+            dy = self.y - other.y
+            dist = math.hypot(dx, dy)
+            if dist < self.MIN_SEPARATION and dist > 0.1:
+                overlap = self.MIN_SEPARATION - dist
+                push_x = (dx / dist) * overlap * 0.5
+                push_y = (dy / dist) * overlap * 0.5
+                self.x += push_x
+                self.y += push_y
 
     def _perform_attack(self, target: "Unit"):
         if not target.alive:

@@ -3,6 +3,7 @@ os.environ["SDL_VIDEODRIVER"] = "dummy"
 os.environ["SDL_AUDIODRIVER"] = "dummy"
 
 import pytest
+import math
 import pygame
 pygame.init()
 pygame.display.set_mode((1, 1))
@@ -11,11 +12,14 @@ from config import (
     TerrainType, UnitType, Team, AIState,
     CELL_SIZE, MAP_COLS, MAP_ROWS,
     TERRAIN_MOVE_COST, UNIT_STATS, COMBAT_ADVANTAGE,
+    COLOR_GRASS_1, COLOR_GRASS_2, COLOR_GRASS_3,
+    COLOR_RIVER, COLOR_RIVER_LIGHT, COLOR_RIVER_FLOW,
 )
 from map import TacticalMap
 from pathfinding import Pathfinder
 from units import Unit
 from ai import AIController, UnitAI
+from campaigns import get_mission_1, get_mission_2, get_mission_3, MISSIONS
 
 
 class TestConfig:
@@ -66,6 +70,16 @@ class TestConfig:
     def test_map_dimensions(self):
         assert MAP_COLS > 0
         assert MAP_ROWS > 0
+
+    def test_grass_colors_defined(self):
+        assert COLOR_GRASS_1 is not None
+        assert COLOR_GRASS_2 is not None
+        assert COLOR_GRASS_3 is not None
+
+    def test_river_colors_defined(self):
+        assert COLOR_RIVER is not None
+        assert COLOR_RIVER_LIGHT is not None
+        assert COLOR_RIVER_FLOW is not None
 
 
 class TestTacticalMap:
@@ -128,6 +142,15 @@ class TestTacticalMap:
     def test_render_does_not_crash(self):
         surface = pygame.Surface((1280, 720))
         self.game_map.render(surface)
+
+    def test_grass_variants_precomputed(self):
+        assert len(self.game_map._grass_variants) > 0
+
+    def test_render_has_grass_colors(self):
+        surface = pygame.Surface((1280, 720))
+        self.game_map.render(surface)
+        center_pixel = surface.get_at((1, 1))
+        assert center_pixel[2] < center_pixel[1]
 
 
 class TestPathfinding:
@@ -304,6 +327,56 @@ class TestUnit:
         assert unit.grid_row == 3
 
 
+class TestUnitCollision:
+    def setup_method(self):
+        self.game_map = TacticalMap()
+
+    def test_close_units_separate(self):
+        u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
+        u2 = Unit(UnitType.INFANTRY, Team.BLUE, 102.0, 100.0)
+        x1_before, x2_before = u1.x, u2.x
+        u1._resolve_collisions([u2])
+        u2._resolve_collisions([u1])
+        dist = math.hypot(u1.x - u2.x, u1.y - u2.y)
+        assert dist > 2.0
+
+    def test_far_units_not_affected(self):
+        u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
+        u2 = Unit(UnitType.INFANTRY, Team.BLUE, 200.0, 200.0)
+        x1, y1 = u1.x, u1.y
+        u1._resolve_collisions([u2])
+        assert u1.x == x1
+        assert u1.y == y1
+
+    def test_dead_units_ignored_in_collision(self):
+        u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
+        u2 = Unit(UnitType.INFANTRY, Team.RED, 101.0, 100.0)
+        u2.alive = False
+        x1, y1 = u1.x, u1.y
+        u1._resolve_collisions([u2])
+        assert u1.x == x1
+        assert u1.y == y1
+
+    def test_collision_in_update(self):
+        u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
+        u2 = Unit(UnitType.INFANTRY, Team.BLUE, 101.0, 100.0)
+        u1.set_move_path([(100.0, 100.0), (150.0, 100.0)])
+        u2.set_move_path([(101.0, 100.0), (151.0, 100.0)])
+        for _ in range(10):
+            u1.update(0.016, self.game_map, [u1, u2])
+            u2.update(0.016, self.game_map, [u1, u2])
+        dist = math.hypot(u1.x - u2.x, u1.y - u2.y)
+        assert dist >= Unit.MIN_SEPARATION - 5
+
+    def test_different_teams_still_separate(self):
+        u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
+        u2 = Unit(UnitType.INFANTRY, Team.RED, 102.0, 100.0)
+        u1._resolve_collisions([u2])
+        u2._resolve_collisions([u1])
+        dist = math.hypot(u1.x - u2.x, u1.y - u2.y)
+        assert dist > 2.0
+
+
 class TestAI:
     def setup_method(self):
         self.game_map = TacticalMap()
@@ -333,15 +406,18 @@ class TestAI:
         nearest = unit_ai._find_nearest_enemy([blue])
         assert nearest is blue
 
-    def test_ai_idle_to_move_when_enemy_nearby(self):
+    def test_ai_moves_towards_distant_enemy(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
-        blue = Unit(UnitType.INFANTRY, Team.BLUE, 12 * CELL_SIZE, 10 * CELL_SIZE)
+        blue = Unit(UnitType.INFANTRY, Team.BLUE, 30 * CELL_SIZE, 10 * CELL_SIZE)
+        red._pathfinder = self.pathfinder
         self.ai.register_unit(red)
 
         unit_ai = self.ai._unit_ais[0]
         assert unit_ai.state == AIState.IDLE
         unit_ai.update(1.0, [blue], [])
-        assert unit_ai.state in (AIState.MOVE, AIState.ATTACK)
+        assert unit_ai.state == AIState.MOVE
+        assert unit_ai.unit._path is not None
+        assert len(unit_ai.unit._path) > 0
 
     def test_ai_attack_when_in_range(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
@@ -372,6 +448,100 @@ class TestAI:
         unit_ai = self.ai._unit_ais[0]
         unit_ai.update(1.0, [blue], [])
         assert unit_ai.state == AIState.IDLE
+
+    def test_ai_chases_with_pathfinding(self):
+        red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
+        red._pathfinder = self.pathfinder
+        blue = Unit(UnitType.INFANTRY, Team.BLUE, 35 * CELL_SIZE, 10 * CELL_SIZE)
+        self.ai.register_unit(red)
+
+        unit_ai = self.ai._unit_ais[0]
+        unit_ai.update(0.5, [blue], [])
+        if unit_ai.unit._path:
+            for px, py in unit_ai.unit._path:
+                col = int(px) // CELL_SIZE
+                row = int(py) // CELL_SIZE
+                if self.game_map.in_bounds(col, row):
+                    assert self.game_map.get_terrain(col, row) != TerrainType.MOUNTAIN
+
+
+class TestCampaigns:
+    def test_mission_1_valid(self):
+        m = get_mission_1()
+        assert m.name == "Битва у моста"
+        assert len(m.grid) == MAP_ROWS
+        assert len(m.blue_units) > 0
+        assert len(m.red_units) > 0
+
+    def test_mission_2_valid(self):
+        m = get_mission_2()
+        assert m.name == "Ущелье смерти"
+        assert len(m.grid) == MAP_ROWS
+        assert len(m.blue_units) > 0
+        assert len(m.red_units) > 0
+
+    def test_mission_3_valid(self):
+        m = get_mission_3()
+        assert m.name == "Речная крепость"
+        assert len(m.grid) == MAP_ROWS
+        assert len(m.blue_units) > 0
+        assert len(m.red_units) > 0
+
+    def test_missions_dict_has_all(self):
+        assert 1 in MISSIONS
+        assert 2 in MISSIONS
+        assert 3 in MISSIONS
+
+    def test_mission_1_has_mountains(self):
+        m = get_mission_1()
+        has_mountain = any(
+            m.grid[r][c] == TerrainType.MOUNTAIN
+            for r in range(len(m.grid))
+            for c in range(len(m.grid[0]))
+        )
+        assert has_mountain
+
+    def test_mission_2_has_narrow_passage(self):
+        m = get_mission_2()
+        mountain_count = sum(
+            1 for r in range(len(m.grid))
+            for c in range(len(m.grid[0]))
+            if m.grid[r][c] == TerrainType.MOUNTAIN
+        )
+        total = len(m.grid) * len(m.grid[0])
+        assert mountain_count / total > 0.3
+
+    def test_mission_3_has_river(self):
+        m = get_mission_3()
+        has_river = any(
+            m.grid[r][c] == TerrainType.RIVER
+            for r in range(len(m.grid))
+            for c in range(len(m.grid[0]))
+        )
+        assert has_river
+
+    def test_campaign_map_render(self):
+        m = get_mission_1()
+        game_map = TacticalMap(m.grid)
+        surface = pygame.Surface((1280, 720))
+        game_map.render(surface)
+
+    def test_campaign_pathfinding(self):
+        m = get_mission_1()
+        game_map = TacticalMap(m.grid)
+        pf = Pathfinder(game_map)
+        blue_start = m.blue_units[0][1:]
+        red_start = m.red_units[0][1:]
+        path = pf.find_path(blue_start, red_start)
+        assert path is not None
+
+    def test_campaign_units_spawn_correctly(self):
+        from engine import UNIT_TYPE_MAP
+        m = get_mission_1()
+        for type_str, col, row in m.blue_units:
+            assert type_str in UNIT_TYPE_MAP
+            assert 0 <= col < MAP_COLS
+            assert 0 <= row < MAP_ROWS
 
 
 class TestIntegration:
@@ -414,6 +584,20 @@ class TestIntegration:
         ]
         for u in units:
             u.render(surface)
+
+    def test_ai_engages_on_spawn(self):
+        game_map = TacticalMap()
+        pf = Pathfinder(game_map)
+        ai = AIController(pf)
+        red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
+        blue = Unit(UnitType.INFANTRY, Team.BLUE, 30 * CELL_SIZE, 10 * CELL_SIZE)
+        red._pathfinder = pf
+        ai.register_unit(red)
+        for _ in range(20):
+            ai.update(0.5, [blue])
+            red.update(0.5, game_map, [red, blue])
+        moved = red.x != 10 * CELL_SIZE or red.y != 10 * CELL_SIZE
+        assert moved
 
 
 class TestEdgeCases:

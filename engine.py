@@ -1,6 +1,6 @@
 import pygame
 import sys
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from config import (
     SCREEN_WIDTH, SCREEN_HEIGHT, HUD_HEIGHT, CELL_SIZE,
     MAP_COLS, MAP_ROWS, FPS, Team, UnitType,
@@ -8,23 +8,29 @@ from config import (
     COLOR_WHITE, COLOR_BLACK, COLOR_BLUE, COLOR_RED,
     FONT_NAME, FONT_SIZE_HUD, FONT_SIZE_TITLE,
     COLOR_MOVE_RANGE, COLOR_ATTACK_RANGE,
-    COLOR_PARCHMENT,
 )
 from map import TacticalMap
 from units import Unit
 from pathfinding import Pathfinder
 from ai import AIController
 
+UNIT_TYPE_MAP = {
+    "infantry": UnitType.INFANTRY,
+    "cavalry": UnitType.CAVALRY,
+    "archer": UnitType.ARCHER,
+}
+
 
 class GameEngine:
-    def __init__(self):
+    def __init__(self, mission: Optional[int] = None):
         pygame.init()
+        self.mission = mission
         pygame.display.set_caption("Tactic Battle - Napoleonic Simulator")
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock = pygame.time.Clock()
         self.running = True
 
-        self.game_map = TacticalMap()
+        self._setup_map()
         self.pathfinder = Pathfinder(self.game_map)
         self.ai_controller = AIController(self.pathfinder)
 
@@ -42,7 +48,46 @@ class GameEngine:
         self._game_over = False
         self._winner: Optional[str] = None
 
+    def _setup_map(self):
+        if self.mission:
+            from campaigns import MISSIONS
+            mission_fn = MISSIONS.get(self.mission)
+            if mission_fn:
+                config = mission_fn()
+                self.game_map = TacticalMap(config.grid)
+                self._mission_config = config
+                return
+        self.game_map = TacticalMap()
+        self._mission_config = None
+
     def _setup_units(self):
+        if self._mission_config:
+            self._setup_campaign_units()
+        else:
+            self._setup_skirmish_units()
+
+        for unit in self.all_units:
+            unit._pathfinder = self.pathfinder
+
+        for unit in self.red_units:
+            self.ai_controller.register_unit(unit)
+
+    def _setup_campaign_units(self):
+        for type_str, col, row in self._mission_config.blue_units:
+            ut = UNIT_TYPE_MAP[type_str]
+            x = col * CELL_SIZE + CELL_SIZE / 2
+            y = row * CELL_SIZE + CELL_SIZE / 2
+            self.blue_units.append(Unit(ut, Team.BLUE, x, y))
+
+        for type_str, col, row in self._mission_config.red_units:
+            ut = UNIT_TYPE_MAP[type_str]
+            x = col * CELL_SIZE + CELL_SIZE / 2
+            y = row * CELL_SIZE + CELL_SIZE / 2
+            self.red_units.append(Unit(ut, Team.RED, x, y))
+
+        self.all_units = self.blue_units + self.red_units
+
+    def _setup_skirmish_units(self):
         blue_infantry = Unit(UnitType.INFANTRY, Team.BLUE, 3 * CELL_SIZE + CELL_SIZE / 2, 8 * CELL_SIZE + CELL_SIZE / 2)
         blue_infantry2 = Unit(UnitType.INFANTRY, Team.BLUE, 4 * CELL_SIZE + CELL_SIZE / 2, 10 * CELL_SIZE + CELL_SIZE / 2)
         blue_cavalry = Unit(UnitType.CAVALRY, Team.BLUE, 5 * CELL_SIZE + CELL_SIZE / 2, 12 * CELL_SIZE + CELL_SIZE / 2)
@@ -56,9 +101,6 @@ class GameEngine:
         self.blue_units = [blue_infantry, blue_infantry2, blue_cavalry, blue_archer]
         self.red_units = [red_infantry, red_infantry2, red_cavalry, red_archer]
         self.all_units = self.blue_units + self.red_units
-
-        for unit in self.red_units:
-            self.ai_controller.register_unit(unit)
 
     def run(self):
         while self.running:
@@ -140,6 +182,9 @@ class GameEngine:
         self.all_units.clear()
         self.blue_units.clear()
         self.red_units.clear()
+        self._setup_map()
+        self.pathfinder = Pathfinder(self.game_map)
+        self.ai_controller = AIController(self.pathfinder)
         self._setup_units()
 
     def _update(self, dt: float):
@@ -213,6 +258,12 @@ class GameEngine:
         hud_y = SCREEN_HEIGHT - HUD_HEIGHT
         pygame.draw.rect(self.screen, COLOR_HUD_BG, (0, hud_y, SCREEN_WIDTH, HUD_HEIGHT))
 
+        if self._mission_config:
+            mission_text = self.font_hud.render(
+                f"MISSION: {self._mission_config.name}", True, COLOR_HUD_TEXT
+            )
+            self.screen.blit(mission_text, (12, hud_y + 2))
+
         total_blue = sum(u.health for u in self.blue_units if u.alive)
         total_red = sum(u.health for u in self.red_units if u.alive)
         blue_alive = sum(1 for u in self.blue_units if u.alive)
@@ -224,8 +275,9 @@ class GameEngine:
         red_text = self.font_hud.render(
             f"RED: {red_alive} units | {total_red} soldiers", True, COLOR_RED
         )
-        self.screen.blit(blue_text, (12, hud_y + 6))
-        self.screen.blit(red_text, (SCREEN_WIDTH - red_text.get_width() - 12, hud_y + 6))
+        y_off = 20 if self._mission_config else 6
+        self.screen.blit(blue_text, (12, hud_y + y_off))
+        self.screen.blit(red_text, (SCREEN_WIDTH - red_text.get_width() - 12, hud_y + y_off))
 
         if self.selected_unit:
             u = self.selected_unit

@@ -7,6 +7,8 @@ from config import (
     COLOR_MOUNTAIN, COLOR_MOUNTAIN_PEAK,
     COLOR_RIVER, COLOR_RIVER_DARK, COLOR_BRIDGE,
     TERRAIN_IMPASSABLE,
+    COLOR_GRASS_1, COLOR_GRASS_2, COLOR_GRASS_3, COLOR_GRASS_DARK,
+    COLOR_RIVER_LIGHT, COLOR_RIVER_FLOW,
 )
 
 
@@ -21,6 +23,8 @@ class TacticalMap:
             self.rows = MAP_ROWS
             self.grid = self._generate_default_map()
         self._precompute_rects()
+        self._precompute_grass_variants()
+        self._river_anim_offset = 0.0
 
     def _precompute_rects(self):
         self._rects = {}
@@ -29,6 +33,16 @@ class TacticalMap:
                 self._rects[(col, row)] = pygame.Rect(
                     col * CELL_SIZE, row * CELL_SIZE, CELL_SIZE, CELL_SIZE
                 )
+
+    def _precompute_grass_variants(self):
+        self._grass_seed = random.Random(42)
+        self._grass_variants = {}
+        for row in range(self.rows):
+            for col in range(self.cols):
+                if self.grid[row][col] == TerrainType.PLAIN:
+                    self._grass_variants[(col, row)] = self._grass_seed.choice(
+                        [COLOR_GRASS_1, COLOR_GRASS_2, COLOR_GRASS_3, COLOR_GRASS_DARK]
+                    )
 
     def _generate_default_map(self) -> List[List[TerrainType]]:
         grid = [[TerrainType.PLAIN for _ in range(self.cols)] for _ in range(self.rows)]
@@ -98,7 +112,7 @@ class TacticalMap:
         return col * CELL_SIZE + CELL_SIZE / 2, row * CELL_SIZE + CELL_SIZE / 2
 
     def render(self, surface: pygame.Surface):
-        surface.fill(COLOR_PARCHMENT)
+        surface.fill(COLOR_GRASS_1)
 
         for row in range(self.rows):
             for col in range(self.cols):
@@ -106,9 +120,20 @@ class TacticalMap:
                 rect = self._rects[(col, row)]
 
                 if terrain == TerrainType.PLAIN:
-                    pygame.draw.rect(surface, COLOR_PARCHMENT, rect)
-                    if (col + row) % 3 == 0:
-                        pygame.draw.rect(surface, COLOR_PARCHMENT_DARK, rect)
+                    grass_color = self._grass_variants.get((col, row), COLOR_GRASS_1)
+                    pygame.draw.rect(surface, grass_color, rect)
+                    rng = random.Random(col * 1000 + row * 7)
+                    if rng.random() < 0.15:
+                        gx = rect.x + rng.randint(4, CELL_SIZE - 4)
+                        gy = rect.y + rng.randint(4, CELL_SIZE - 4)
+                        blade_color = (grass_color[0] - 10, grass_color[1] + 8, grass_color[2] - 5)
+                        blade_color = tuple(max(0, min(255, c)) for c in blade_color)
+                        pygame.draw.line(surface, blade_color, (gx, gy), (gx + 1, gy - 3), 1)
+                    if rng.random() < 0.08:
+                        fx = rect.x + rng.randint(2, CELL_SIZE - 2)
+                        fy = rect.y + rng.randint(2, CELL_SIZE - 2)
+                        flower_color = rng.choice([(220, 210, 80), (240, 240, 200), (200, 180, 220)])
+                        pygame.draw.circle(surface, flower_color, (fx, fy), 1)
 
                 elif terrain == TerrainType.MOUNTAIN:
                     pygame.draw.rect(surface, COLOR_MOUNTAIN, rect)
@@ -120,15 +145,36 @@ class TacticalMap:
                         (cx + CELL_SIZE // 3, cy + CELL_SIZE // 3),
                     ]
                     pygame.draw.polygon(surface, COLOR_MOUNTAIN_PEAK, peak_points)
-                    pygame.draw.polygon(surface, COLOR_PARCHMENT, peak_points, 1)
+                    shadow_points = [
+                        (cx, cy - CELL_SIZE // 2 + 2),
+                        (cx + CELL_SIZE // 3, cy + CELL_SIZE // 3),
+                        (cx, cy + CELL_SIZE // 3),
+                    ]
+                    shadow_color = (100, 90, 80)
+                    pygame.draw.polygon(surface, shadow_color, shadow_points)
 
                 elif terrain == TerrainType.RIVER:
                     pygame.draw.rect(surface, COLOR_RIVER, rect)
-                    rx = rect.x + random.Random(col * 100 + row).randint(4, 10)
+                    rng = random.Random(col * 200 + row * 13)
+                    for s in range(3):
+                        sx = rect.x + rng.randint(2, CELL_SIZE - 4)
+                        sy = rect.y + rng.randint(0, CELL_SIZE - 2)
+                        sl = rng.randint(3, 7)
+                        pygame.draw.line(
+                            surface, COLOR_RIVER_LIGHT,
+                            (sx, sy), (sx + sl, sy - 1), 1
+                        )
+                    bx = rect.x + rng.randint(3, CELL_SIZE - 6)
                     pygame.draw.line(
                         surface, COLOR_RIVER_DARK,
-                        (rx, rect.y), (rx + 5, rect.bottom), 2
+                        (bx, rect.y), (bx + 3, rect.bottom), 2
                     )
+                    wave_y = rect.y + (int(self._river_anim_offset * 2 + col * 7) % CELL_SIZE)
+                    if rect.y <= wave_y <= rect.bottom:
+                        pygame.draw.line(
+                            surface, COLOR_RIVER_FLOW,
+                            (rect.x + 2, wave_y), (rect.right - 2, wave_y), 1
+                        )
 
                 elif terrain == TerrainType.BRIDGE:
                     pygame.draw.rect(surface, COLOR_RIVER, rect)
@@ -143,3 +189,5 @@ class TacticalMap:
                         pygame.draw.line(surface, COLOR_BRIDGE, (bx1, my), (bx2, my), 2)
 
                 pygame.draw.rect(surface, COLOR_GRID_LINE, rect, 1)
+
+        self._river_anim_offset = (self._river_anim_offset + 0.5) % CELL_SIZE
