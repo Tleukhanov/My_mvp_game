@@ -1,6 +1,6 @@
 import pygame
 import random
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from config import (
     TerrainType, CELL_SIZE, MAP_COLS, MAP_ROWS,
     COLOR_PARCHMENT, COLOR_PARCHMENT_DARK, COLOR_GRID_LINE,
@@ -9,11 +9,14 @@ from config import (
     TERRAIN_IMPASSABLE,
     COLOR_GRASS_1, COLOR_GRASS_2, COLOR_GRASS_3, COLOR_GRASS_DARK,
     COLOR_RIVER_LIGHT, COLOR_RIVER_FLOW,
+    COLOR_VILLAGE_NEUTRAL, COLOR_VILLAGE_BLUE, COLOR_VILLAGE_RED,
+    COLOR_VILLAGE_ROOF, COLOR_VILLAGE_WINDOW,
 )
 
 
 class TacticalMap:
-    def __init__(self, grid: Optional[List[List[TerrainType]]] = None):
+    def __init__(self, grid: Optional[List[List[TerrainType]]] = None,
+                 village_positions: Optional[List[Tuple[int, int]]] = None):
         if grid is not None:
             self.grid = grid
             self.rows = len(grid)
@@ -25,6 +28,10 @@ class TacticalMap:
         self._precompute_rects()
         self._precompute_grass_variants()
         self._river_anim_offset = 0.0
+        self.village_owners: Dict[Tuple[int, int], Optional[str]] = {}
+        if village_positions:
+            for pos in village_positions:
+                self.village_owners[pos] = None
 
     def _precompute_rects(self):
         self._rects = {}
@@ -111,6 +118,21 @@ class TacticalMap:
     def grid_to_pixel_center(self, col: int, row: int) -> Tuple[float, float]:
         return col * CELL_SIZE + CELL_SIZE / 2, row * CELL_SIZE + CELL_SIZE / 2
 
+    def get_village_at(self, col: int, row: int) -> Optional[Tuple[int, int]]:
+        if self.get_terrain(col, row) == TerrainType.VILLAGE:
+            return (col, row)
+        return None
+
+    def get_village_owner(self, col: int, row: int) -> Optional[str]:
+        return self.village_owners.get((col, row))
+
+    def set_village_owner(self, col: int, row: int, owner: Optional[str]):
+        if (col, row) in self.village_owners:
+            self.village_owners[(col, row)] = owner
+
+    def get_all_villages(self) -> List[Tuple[int, int]]:
+        return list(self.village_owners.keys())
+
     def render(self, surface: pygame.Surface):
         surface.fill(COLOR_GRASS_1)
 
@@ -187,6 +209,34 @@ class TacticalMap:
                     for i in range(3):
                         my = rect.y + 5 + i * 8
                         pygame.draw.line(surface, COLOR_BRIDGE, (bx1, my), (bx2, my), 2)
+
+                elif terrain == TerrainType.VILLAGE:
+                    owner = self.village_owners.get((col, row))
+                    if owner == "blue":
+                        base_color = COLOR_VILLAGE_BLUE
+                    elif owner == "red":
+                        base_color = COLOR_VILLAGE_RED
+                    else:
+                        base_color = COLOR_VILLAGE_NEUTRAL
+                    pygame.draw.rect(surface, (90, 130, 60), rect)
+                    cx = col * CELL_SIZE + CELL_SIZE // 2
+                    cy = row * CELL_SIZE + CELL_SIZE // 2
+                    bw = CELL_SIZE // 3
+                    bh = CELL_SIZE // 3
+                    house_rect = pygame.Rect(cx - bw, cy - bh // 2, bw * 2, bh)
+                    pygame.draw.rect(surface, base_color, house_rect)
+                    roof_points = [
+                        (cx - bw - 2, cy - bh // 2),
+                        (cx, cy - bh // 2 - 6),
+                        (cx + bw + 2, cy - bh // 2),
+                    ]
+                    pygame.draw.polygon(surface, COLOR_VILLAGE_ROOF, roof_points)
+                    win1 = (cx - bw // 2, cy - 1)
+                    win2 = (cx + bw // 2, cy - 1)
+                    pygame.draw.rect(surface, COLOR_VILLAGE_WINDOW,
+                                     (win1[0] - 2, win1[1] - 2, 4, 4))
+                    pygame.draw.rect(surface, COLOR_VILLAGE_WINDOW,
+                                     (win2[0] - 2, win2[1] - 2, 4, 4))
 
                 pygame.draw.rect(surface, COLOR_GRID_LINE, rect, 1)
 

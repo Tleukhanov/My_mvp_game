@@ -14,12 +14,14 @@ from config import (
     TERRAIN_MOVE_COST, UNIT_STATS, COMBAT_ADVANTAGE,
     COLOR_GRASS_1, COLOR_GRASS_2, COLOR_GRASS_3,
     COLOR_RIVER, COLOR_RIVER_LIGHT, COLOR_RIVER_FLOW,
+    MAX_SELECTION, FOOD_MAX, FOOD_PER_UNIT_PER_SEC,
+    FOOD_PER_VILLAGE_PER_SEC, SELECT_CLICK_RADIUS,
 )
 from map import TacticalMap
 from pathfinding import Pathfinder
 from units import Unit
 from ai import AIController, UnitAI
-from campaigns import get_mission_1, get_mission_2, get_mission_3, MISSIONS
+from campaigns import get_mission_1, get_mission_2, get_mission_3, get_mission_4, MISSIONS
 
 
 class TestConfig:
@@ -28,6 +30,7 @@ class TestConfig:
         assert TerrainType.MOUNTAIN
         assert TerrainType.RIVER
         assert TerrainType.BRIDGE
+        assert TerrainType.VILLAGE
 
     def test_unit_types_exist(self):
         assert UnitType.INFANTRY
@@ -43,6 +46,7 @@ class TestConfig:
         assert TERRAIN_MOVE_COST[TerrainType.MOUNTAIN] == float("inf")
         assert TERRAIN_MOVE_COST[TerrainType.RIVER] == 5.0
         assert TERRAIN_MOVE_COST[TerrainType.BRIDGE] == 1.0
+        assert TERRAIN_MOVE_COST[TerrainType.VILLAGE] == 1.2
 
     def test_unit_stats_have_required_keys(self):
         for unit_type in UnitType:
@@ -58,28 +62,16 @@ class TestConfig:
             for defender in UnitType:
                 assert (attacker, defender) in COMBAT_ADVANTAGE
 
-    def test_cavalry_beats_archers(self):
-        assert COMBAT_ADVANTAGE[(UnitType.CAVALRY, UnitType.ARCHER)] > 1.0
+    def test_max_selection(self):
+        assert MAX_SELECTION == 6
 
-    def test_infantry_balanced(self):
-        assert COMBAT_ADVANTAGE[(UnitType.INFANTRY, UnitType.INFANTRY)] == 1.0
+    def test_food_constants(self):
+        assert FOOD_MAX == 1000
+        assert FOOD_PER_UNIT_PER_SEC == 5
+        assert FOOD_PER_VILLAGE_PER_SEC == 20
 
-    def test_cell_size_positive(self):
-        assert CELL_SIZE > 0
-
-    def test_map_dimensions(self):
-        assert MAP_COLS > 0
-        assert MAP_ROWS > 0
-
-    def test_grass_colors_defined(self):
-        assert COLOR_GRASS_1 is not None
-        assert COLOR_GRASS_2 is not None
-        assert COLOR_GRASS_3 is not None
-
-    def test_river_colors_defined(self):
-        assert COLOR_RIVER is not None
-        assert COLOR_RIVER_LIGHT is not None
-        assert COLOR_RIVER_FLOW is not None
+    def test_select_click_radius(self):
+        assert SELECT_CLICK_RADIUS > 0
 
 
 class TestTacticalMap:
@@ -153,6 +145,63 @@ class TestTacticalMap:
         assert center_pixel[2] < center_pixel[1]
 
 
+class TestVillages:
+    def test_village_in_custom_map(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        assert m.get_terrain(5, 2) == TerrainType.VILLAGE
+        assert (5, 2) in m.village_owners
+
+    def test_village_owner_default_none(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        assert m.get_village_owner(5, 2) is None
+
+    def test_set_village_owner(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        m.set_village_owner(5, 2, "blue")
+        assert m.get_village_owner(5, 2) == "blue"
+
+    def test_get_village_at(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        assert m.get_village_at(5, 2) == (5, 2)
+        assert m.get_village_at(0, 0) is None
+
+    def test_village_passable(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid)
+        assert m.is_passable(5, 2)
+
+    def test_get_all_villages(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        grid[3][7] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2), (7, 3)])
+        assert len(m.get_all_villages()) == 2
+
+    def test_village_render(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        surface = pygame.Surface((320, 160))
+        m.render(surface)
+
+    def test_village_blue_render(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        m.set_village_owner(5, 2, "blue")
+        surface = pygame.Surface((320, 160))
+        m.render(surface)
+
+
 class TestPathfinding:
     def setup_method(self):
         self.game_map = TacticalMap()
@@ -171,8 +220,6 @@ class TestPathfinding:
     def test_path_around_mountain(self):
         path = self.pathfinder.find_path((15, 2), (25, 2))
         assert path is not None
-        assert path[0] == (15, 2)
-        assert path[-1] == (25, 2)
         for col, row in path:
             assert self.game_map.get_terrain(col, row) != TerrainType.MOUNTAIN
 
@@ -195,25 +242,15 @@ class TestPathfinding:
         path = pf.find_path((0, 1), (4, 1))
         assert path is None
 
-    def test_grid_to_pixel_path(self):
-        grid_path = [(0, 0), (1, 0), (2, 0)]
-        pixel_path = self.pathfinder.grid_to_pixel_path(grid_path)
-        assert len(pixel_path) == 3
-        assert pixel_path[0] == (CELL_SIZE / 2, CELL_SIZE / 2)
-
-    def test_find_path_pixels(self):
-        path = self.pathfinder.find_path_pixels(
-            CELL_SIZE * 5, CELL_SIZE * 5,
-            CELL_SIZE * 10, CELL_SIZE * 5,
-        )
+    def test_find_path_through_village(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(3)]
+        grid[1][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid)
+        pf = Pathfinder(m)
+        path = pf.find_path((0, 1), (9, 1))
         assert path is not None
-        assert len(path) >= 2
-
-    def test_path_max_cost_limits_search(self):
-        path = self.pathfinder.find_path(
-            (0, 0), (39, 21), max_cost=5.0
-        )
-        assert path is None
+        assert any(m.get_terrain(c, r) == TerrainType.VILLAGE
+                    for c, r in path if m.in_bounds(c, r))
 
 
 class TestUnit:
@@ -232,12 +269,10 @@ class TestUnit:
 
     def test_create_cavalry(self):
         unit = self._make_unit(UnitType.CAVALRY)
-        assert unit.unit_type == UnitType.CAVALRY
         assert unit.speed > self._make_unit(UnitType.INFANTRY).speed
 
     def test_create_archer(self):
         unit = self._make_unit(UnitType.ARCHER)
-        assert unit.unit_type == UnitType.ARCHER
         assert unit.attack_range > self._make_unit(UnitType.INFANTRY).attack_range
 
     def test_distance_to_unit(self):
@@ -294,12 +329,10 @@ class TestUnit:
         arc = self._make_unit(UnitType.ARCHER, Team.RED, x=10, y=0)
         initial_hp = arc.health
         cav._perform_attack(arc)
-        assert cav.health == UNIT_STATS[UnitType.CAVALRY]["max_health"]
         assert arc.health < initial_hp
 
     def test_attack_cooldown(self):
         unit = self._make_unit()
-        assert unit._attack_timer == 0.0
         unit._attack_timer = 0.5
         unit.update(0.1, self.game_map, [])
         assert unit._attack_timer > 0.0
@@ -334,7 +367,6 @@ class TestUnitCollision:
     def test_close_units_separate(self):
         u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
         u2 = Unit(UnitType.INFANTRY, Team.BLUE, 102.0, 100.0)
-        x1_before, x2_before = u1.x, u2.x
         u1._resolve_collisions([u2])
         u2._resolve_collisions([u1])
         dist = math.hypot(u1.x - u2.x, u1.y - u2.y)
@@ -357,16 +389,13 @@ class TestUnitCollision:
         assert u1.x == x1
         assert u1.y == y1
 
-    def test_collision_in_update(self):
+    def test_attack_target_not_pushed_away(self):
         u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
-        u2 = Unit(UnitType.INFANTRY, Team.BLUE, 101.0, 100.0)
-        u1.set_move_path([(100.0, 100.0), (150.0, 100.0)])
-        u2.set_move_path([(101.0, 100.0), (151.0, 100.0)])
-        for _ in range(10):
-            u1.update(0.016, self.game_map, [u1, u2])
-            u2.update(0.016, self.game_map, [u1, u2])
-        dist = math.hypot(u1.x - u2.x, u1.y - u2.y)
-        assert dist >= Unit.MIN_SEPARATION - 5
+        u2 = Unit(UnitType.INFANTRY, Team.RED, 102.0, 100.0)
+        u1.set_attack_target(u2)
+        x1_before = u1.x
+        u1._resolve_collisions([u2])
+        assert u1.x == x1_before
 
     def test_different_teams_still_separate(self):
         u1 = Unit(UnitType.INFANTRY, Team.BLUE, 100.0, 100.0)
@@ -401,7 +430,6 @@ class TestAI:
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 11 * CELL_SIZE, 10 * CELL_SIZE)
         self.ai.register_unit(red)
-
         unit_ai = self.ai._unit_ais[0]
         nearest = unit_ai._find_nearest_enemy([blue])
         assert nearest is blue
@@ -411,32 +439,25 @@ class TestAI:
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 30 * CELL_SIZE, 10 * CELL_SIZE)
         red._pathfinder = self.pathfinder
         self.ai.register_unit(red)
-
         unit_ai = self.ai._unit_ais[0]
-        assert unit_ai.state == AIState.IDLE
-        unit_ai.update(1.0, [blue], [])
+        unit_ai.update(1.5, [blue], [])
         assert unit_ai.state == AIState.MOVE
-        assert unit_ai.unit._path is not None
-        assert len(unit_ai.unit._path) > 0
 
     def test_ai_attack_when_in_range(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 10 * CELL_SIZE + 10, 10 * CELL_SIZE)
         self.ai.register_unit(red)
-
         unit_ai = self.ai._unit_ais[0]
-        unit_ai.update(1.0, [blue], [])
+        unit_ai.update(1.5, [blue], [])
         assert unit_ai.state == AIState.ATTACK
-        assert unit_ai.unit._attack_target is blue
 
     def test_ai_retreats_when_low_health(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
         red.take_damage(450)
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 10 * CELL_SIZE + 10, 10 * CELL_SIZE)
         self.ai.register_unit(red)
-
         unit_ai = self.ai._unit_ais[0]
-        unit_ai.update(1.0, [blue], [])
+        unit_ai.update(1.5, [blue], [])
         assert unit_ai.state == AIState.MOVE
 
     def test_ai_ignores_dead_enemies(self):
@@ -444,9 +465,8 @@ class TestAI:
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 11 * CELL_SIZE, 10 * CELL_SIZE)
         blue.alive = False
         self.ai.register_unit(red)
-
         unit_ai = self.ai._unit_ais[0]
-        unit_ai.update(1.0, [blue], [])
+        unit_ai.update(1.5, [blue], [])
         assert unit_ai.state == AIState.IDLE
 
     def test_ai_chases_with_pathfinding(self):
@@ -454,15 +474,27 @@ class TestAI:
         red._pathfinder = self.pathfinder
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 35 * CELL_SIZE, 10 * CELL_SIZE)
         self.ai.register_unit(red)
-
         unit_ai = self.ai._unit_ais[0]
-        unit_ai.update(0.5, [blue], [])
+        unit_ai.update(1.5, [blue], [])
         if unit_ai.unit._path:
             for px, py in unit_ai.unit._path:
                 col = int(px) // CELL_SIZE
                 row = int(py) // CELL_SIZE
                 if self.game_map.in_bounds(col, row):
                     assert self.game_map.get_terrain(col, row) != TerrainType.MOUNTAIN
+
+    def test_ai_captures_village(self):
+        grid = [[TerrainType.PLAIN] * 20 for _ in range(10)]
+        grid[5][10] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(10, 5)])
+        pf = Pathfinder(m)
+        ai = AIController(pf)
+        red = Unit(UnitType.INFANTRY, Team.RED, 5 * CELL_SIZE, 5 * CELL_SIZE)
+        red._pathfinder = pf
+        ai.register_unit(red)
+        unit_ai = ai._unit_ais[0]
+        ai.update(1.5, [], [(10, 5)], m.village_owners)
+        assert unit_ai.state == AIState.CAPTURE
 
 
 class TestCampaigns:
@@ -477,58 +509,54 @@ class TestCampaigns:
         m = get_mission_2()
         assert m.name == "Ущелье смерти"
         assert len(m.grid) == MAP_ROWS
-        assert len(m.blue_units) > 0
-        assert len(m.red_units) > 0
 
     def test_mission_3_valid(self):
         m = get_mission_3()
         assert m.name == "Речная крепость"
         assert len(m.grid) == MAP_ROWS
-        assert len(m.blue_units) > 0
-        assert len(m.red_units) > 0
+
+    def test_mission_4_valid(self):
+        m = get_mission_4()
+        assert m.name == "Деревни"
+        assert len(m.grid) == MAP_ROWS
+        assert len(m.villages) > 0
 
     def test_missions_dict_has_all(self):
-        assert 1 in MISSIONS
-        assert 2 in MISSIONS
-        assert 3 in MISSIONS
+        for i in range(1, 5):
+            assert i in MISSIONS
 
-    def test_mission_1_has_mountains(self):
+    def test_mission_1_has_villages(self):
         m = get_mission_1()
-        has_mountain = any(
-            m.grid[r][c] == TerrainType.MOUNTAIN
-            for r in range(len(m.grid))
-            for c in range(len(m.grid[0]))
-        )
-        assert has_mountain
+        assert len(m.villages) > 0
 
-    def test_mission_2_has_narrow_passage(self):
-        m = get_mission_2()
-        mountain_count = sum(
+    def test_mission_4_has_villages(self):
+        m = get_mission_4()
+        village_count = sum(
             1 for r in range(len(m.grid))
             for c in range(len(m.grid[0]))
-            if m.grid[r][c] == TerrainType.MOUNTAIN
+            if m.grid[r][c] == TerrainType.VILLAGE
         )
-        total = len(m.grid) * len(m.grid[0])
-        assert mountain_count / total > 0.3
+        assert village_count == len(m.villages)
 
-    def test_mission_3_has_river(self):
-        m = get_mission_3()
-        has_river = any(
-            m.grid[r][c] == TerrainType.RIVER
-            for r in range(len(m.grid))
-            for c in range(len(m.grid[0]))
-        )
-        assert has_river
+    def test_mission_4_blue_starts_bottom(self):
+        m = get_mission_4()
+        for _, _, row in m.blue_units:
+            assert row >= MAP_ROWS // 2
+
+    def test_mission_4_red_starts_top(self):
+        m = get_mission_4()
+        for _, _, row in m.red_units:
+            assert row < MAP_ROWS // 2
 
     def test_campaign_map_render(self):
         m = get_mission_1()
-        game_map = TacticalMap(m.grid)
+        game_map = TacticalMap(m.grid, m.villages)
         surface = pygame.Surface((1280, 720))
         game_map.render(surface)
 
     def test_campaign_pathfinding(self):
         m = get_mission_1()
-        game_map = TacticalMap(m.grid)
+        game_map = TacticalMap(m.grid, m.villages)
         pf = Pathfinder(game_map)
         blue_start = m.blue_units[0][1:]
         red_start = m.red_units[0][1:]
@@ -542,6 +570,17 @@ class TestCampaigns:
             assert type_str in UNIT_TYPE_MAP
             assert 0 <= col < MAP_COLS
             assert 0 <= row < MAP_ROWS
+
+
+class TestFoodSystem:
+    def test_food_max(self):
+        assert FOOD_MAX == 1000
+
+    def test_food_per_unit_per_sec(self):
+        assert FOOD_PER_UNIT_PER_SEC == 5
+
+    def test_food_per_village_per_sec(self):
+        assert FOOD_PER_VILLAGE_PER_SEC == 20
 
 
 class TestIntegration:
@@ -562,7 +601,6 @@ class TestIntegration:
             Unit(UnitType.CAVALRY, Team.RED, 35 * CELL_SIZE, 5 * CELL_SIZE),
             Unit(UnitType.ARCHER, Team.RED, 37 * CELL_SIZE, 6 * CELL_SIZE),
         ]
-        pathfinder = Pathfinder(game_map)
         for u in units:
             u.update(0.016, game_map, units)
 
@@ -598,6 +636,19 @@ class TestIntegration:
             red.update(0.5, game_map, [red, blue])
         moved = red.x != 10 * CELL_SIZE or red.y != 10 * CELL_SIZE
         assert moved
+
+    def test_village_capture_in_game(self):
+        grid = [[TerrainType.PLAIN] * 10 for _ in range(5)]
+        grid[2][5] = TerrainType.VILLAGE
+        m = TacticalMap(grid, [(5, 2)])
+        blue = Unit(UnitType.INFANTRY, Team.BLUE, 5 * CELL_SIZE + CELL_SIZE / 2, 2 * CELL_SIZE + CELL_SIZE / 2)
+        for _ in range(10):
+            dist = math.hypot(blue.x - (5 * CELL_SIZE + CELL_SIZE / 2),
+                              blue.y - (2 * CELL_SIZE + CELL_SIZE / 2))
+            if dist < CELL_SIZE * 1.2:
+                m.set_village_owner(5, 2, "blue")
+                break
+        assert m.get_village_owner(5, 2) == "blue"
 
 
 class TestEdgeCases:

@@ -153,19 +153,21 @@ class Unit:
             ]
             self._path_index = 0
 
-    MIN_SEPARATION = CELL_SIZE * 0.55
+    MIN_SEPARATION = CELL_SIZE * 0.6
 
     def _resolve_collisions(self, all_units: List["Unit"]):
         for other in all_units:
             if other is self or not other.alive:
+                continue
+            if other is self._attack_target:
                 continue
             dx = self.x - other.x
             dy = self.y - other.y
             dist = math.hypot(dx, dy)
             if dist < self.MIN_SEPARATION and dist > 0.1:
                 overlap = self.MIN_SEPARATION - dist
-                push_x = (dx / dist) * overlap * 0.5
-                push_y = (dy / dist) * overlap * 0.5
+                push_x = (dx / dist) * overlap * 0.8
+                push_y = (dy / dist) * overlap * 0.8
                 self.x += push_x
                 self.y += push_y
 

@@ -2,7 +2,7 @@
 
 # Tactic Battle
 
-Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pathfinding, type-advantage combat, and modular AI architecture. Built with Python 3 + Pygame.
+Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pathfinding, type-advantage combat, village capture, and modular AI architecture. Built with Python 3 + Pygame.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![Pygame](https://img.shields.io/badge/Pygame_CE-2.5-4172B5)
@@ -18,32 +18,42 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 ### Game Modes
 - **Main Menu** — stylish launch screen with mode selection
 - **Skirmish** — quick battle on the default tactical map
-- **Campaign** — 3 handcrafted missions with unique terrain and objectives
+- **Campaign** — 4 handcrafted missions with unique terrain and objectives
 - **Online** — planned (placeholder)
 
 ### Campaign Missions
 1. **Битва у моста** — defend/attack a strategic bridge crossing over a river with mountain flanks
 2. **Ущелье смерти** — navigate through a narrow mountain canyon with chokepoints
 3. **Речная крепость** — assault an enemy fortress behind a river and mountain defenses
+4. **Деревни** — capture and hold 6 villages to build an economic advantage
 
 ### Gameplay
-- **RTS Controls** — left-click to select a unit, right-click to issue move or attack orders
+- **Multi-Select** — select up to 6 units with Shift+click, box drag, or `A` to select all
+- **RTS Controls** — left-click to select, right-click to move or attack
 - **3 Unit Types** — Infantry (circles), Cavalry (squares), Archers (triangles)
 - **Type Advantage System** — Cavalry beats Archers, Archers damage Infantry, Infantry holds against Cavalry
 - **Soldier Count** — each unit represents a regiment (500 soldiers), numbers decrease during combat
 - **Combat Range** — Archers fire from 5 tiles away, melee units close the distance automatically
 - **Unit Collision** — units cannot overlap, they push apart and pathfind around each other
 
+### Village Capture System
+- **Capture** — move a unit onto a village to capture it for your team
+- **Food Economy** — each captured village produces 20 food/sec, each unit consumes 5 food/sec
+- **Recruit** — every 3 minutes a free Infantry spawns at a captured village
+- **Max Food** — supply is capped at 1000 food
+
 ### Terrain
 - **Grass Plains** — multiple green tones with procedural grass blades and flowers
 - **Mountains** — impassable with 3D peak shading and shadows
 - **Rivers** — animated flowing water with highlights, waves and depth
 - **Bridges** — the only way to cross rivers at normal speed
+- **Villages** — capturable buildings that produce food and spawn units
 
 ### AI
-- **Proactive Aggression** — enemies advance toward you from the start, no more standing still
+- **Village Capture** — AI prioritizes capturing neutral/enemy villages
+- **Proactive Aggression** — enemies advance toward you from the start
 - **A\* Pathfinding Chase** — AI units navigate around terrain when pursuing targets
-- **State Machine** — Idle / Move / Attack states with decision ticks
+- **State Machine** — Idle / Move / Attack / Capture / Retreat states
 - **Retreat Logic** — units flee when below 20% health
 - **Modular Design** — swap the AI controller with an ML agent via the `AIController` interface
 
@@ -61,8 +71,8 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 | Language | Python 3.10+ |
 | Graphics | Pygame-CE 2.5 |
 | Pathfinding | A\* with terrain cost weighting |
-| AI | Finite State Machine (Idle/Move/Attack/Retreat) |
-| Testing | pytest (83 tests) |
+| AI | Finite State Machine (Idle/Move/Attack/Capture/Retreat) |
+| Testing | pytest (93 tests) |
 | Container | Docker + docker-compose |
 
 ---
@@ -97,7 +107,10 @@ docker compose --profile headless up --build
 | Key | Action |
 |---|---|
 | **Left Click** | Select a Blue unit |
-| **Right Click** | Move selected unit / Attack enemy unit |
+| **Shift + Left Click** | Add unit to selection (up to 6) |
+| **Drag (Left Mouse)** | Box-select multiple units |
+| **A** | Select all friendly units |
+| **Right Click** | Move selected units / Attack enemy unit |
 | **ESC** | Deselect unit / Quit game |
 | **SPACE** | Toggle range indicators on/off |
 | **R** | Restart the battle |
@@ -109,16 +122,16 @@ docker compose --profile headless up --build
 ```
 My_mvp_game/
 ├── config.py            # Constants, enums, colors, unit stats, combat matrix
-├── map.py               # TacticalMap — 40x22 tile grid with terrain generation
+├── map.py               # TacticalMap — tile grid with terrain generation and villages
 ├── pathfinding.py       # A* pathfinding with terrain cost awareness
 ├── units.py             # Unit class with collision, pathfinder, combat
-├── ai.py                # State-machine AI (UnitAI + AIController)
-├── engine.py            # Game loop, event handling, rendering pipeline, HUD
+├── ai.py                # State-machine AI (UnitAI + AIController) with village capture
+├── engine.py            # Game loop, multi-select, food system, village capture, HUD
 ├── main.py              # Entry point with menu
 ├── menu.py              # Main menu + campaign selection screens
-├── campaigns.py         # 3 campaign mission definitions and maps
+├── campaigns.py         # 4 campaign mission definitions and maps
 ├── requirements.txt     # pygame-ce dependency
-├── test_tactics.py      # 83 unit, integration, and edge-case tests
+├── test_tactics.py      # 93 unit, integration, and edge-case tests
 ├── Dockerfile           # Docker image (X11 + dummy driver support)
 ├── docker-compose.yml   # Compose profiles: gui + headless
 └── README.md
@@ -139,19 +152,21 @@ My_mvp_game/
 ## Testing
 
 ```bash
-# Run all 83 tests
+# Run all 93 tests
 python -m pytest test_tactics.py -v
 
 # Test categories:
-# - TestConfig (12)            — constants, enums, combat matrix, new colors
-# - TestTacticalMap (13)       — terrain grid, bounds, passability, grass rendering
-# - TestPathfinding (8)        — A* routing, obstacles, bridges
-# - TestUnit (17)              — creation, damage, combat, rendering
-# - TestUnitCollision (5)      — unit separation, overlap prevention
-# - TestAI (8)                 — state machine, targeting, proactive advance
-# - TestCampaigns (10)         — mission validation, map generation
-# - TestIntegration (5)        — full-scene, multi-unit, AI engagement
-# - TestEdgeCases (5)          — boundary conditions, overkill
+# - TestConfig (9)              — constants, enums, combat matrix, food constants
+# - TestTacticalMap (13)        — terrain grid, bounds, passability, grass rendering
+# - TestVillages (8)            — village ownership, passability, rendering
+# - TestPathfinding (6)         — A* routing, obstacles, bridges, villages
+# - TestUnit (17)               — creation, damage, combat, rendering
+# - TestUnitCollision (5)       — unit separation, overlap prevention
+# - TestAI (9)                  — state machine, targeting, village capture
+# - TestCampaigns (12)          — mission validation, village placement, map generation
+# - TestFoodSystem (3)          — food cap, consumption, production
+# - TestIntegration (6)         — full-scene, multi-unit, AI engagement, village capture
+# - TestEdgeCases (5)           — boundary conditions, overkill
 ```
 
 ---
@@ -166,7 +181,7 @@ python -m pytest test_tactics.py -v
 
 ### Adding a New Campaign
 1. Create a `get_mission_N()` function in `campaigns.py`
-2. Define the grid, blue_units, red_units
+2. Define the grid, blue_units, red_units, village_positions
 3. Add to `MISSIONS` dict in `campaigns.py`
 4. Engine auto-loads it when `mission=N` is passed
 

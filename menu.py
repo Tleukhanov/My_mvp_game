@@ -170,10 +170,11 @@ class CampaignSelect:
         btn_x = SCREEN_WIDTH // 2 - btn_w // 2
 
         self.buttons = [
-            MenuButton(btn_x, 180, btn_w, btn_h, "1. БИТВА У МОСТА"),
-            MenuButton(btn_x, 290, btn_w, btn_h, "2. УЩЕЛЬЕ СМЕРТИ"),
-            MenuButton(btn_x, 400, btn_w, btn_h, "3. РЕЧНАЯ КРЕПОСТЬ"),
-            MenuButton(btn_x, 520, btn_w, 50, "НАЗАД"),
+            MenuButton(btn_x, 150, btn_w, btn_h, "1. БИТВА У МОСТА"),
+            MenuButton(btn_x, 250, btn_w, btn_h, "2. УЩЕЛЬЕ СМЕРТИ"),
+            MenuButton(btn_x, 350, btn_w, btn_h, "3. РЕЧНАЯ КРЕПОСТЬ"),
+            MenuButton(btn_x, 450, btn_w, btn_h, "4. ДЕРЕВНИ"),
+            MenuButton(btn_x, 560, btn_w, 50, "НАЗАД"),
         ]
 
     def run(self) -> Optional[str]:
@@ -206,6 +207,9 @@ class CampaignSelect:
                     self.result = "campaign_3"
                     self.running = False
                 elif self.buttons[3].is_clicked(mx, my):
+                    self.result = "campaign_4"
+                    self.running = False
+                elif self.buttons[4].is_clicked(mx, my):
                     self.result = "back"
                     self.running = False
 
@@ -220,8 +224,9 @@ class CampaignSelect:
             "Удержите стратегический мост через реку",
             "Пройдите через узкое горное ущелье",
             "Штурмуйте вражескую крепость у реки",
+            "Захватите деревни и удержите территорию",
         ]
-        for i, btn in enumerate(self.buttons[:3]):
+        for i, btn in enumerate(self.buttons[:4]):
             if i < len(descs):
                 d = self.font_desc.render(descs[i], True, COLOR_MENU_SUBTITLE)
                 dx = btn.rect.centerx - d.get_width() // 2

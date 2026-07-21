@@ -1,6 +1,7 @@
 import pygame
 import sys
-from typing import Optional, List, Tuple
+import math
+from typing import Optional, List, Tuple, Set
 from config import (
     SCREEN_WIDTH, SCREEN_HEIGHT, HUD_HEIGHT, CELL_SIZE,
     MAP_COLS, MAP_ROWS, FPS, Team, UnitType,
@@ -8,6 +9,10 @@ from config import (
     COLOR_WHITE, COLOR_BLACK, COLOR_BLUE, COLOR_RED,
     FONT_NAME, FONT_SIZE_HUD, FONT_SIZE_TITLE,
     COLOR_MOVE_RANGE, COLOR_ATTACK_RANGE,
+    COLOR_SELECT_RECT, COLOR_SELECT_RECT_BORDER,
+    MAX_SELECTION, SELECT_CLICK_RADIUS,
+    FOOD_MAX, FOOD_PER_UNIT_PER_SEC, FOOD_PER_VILLAGE_PER_SEC,
+    RECRUIT_INTERVAL, TerrainType,
 )
 from map import TacticalMap
 from units import Unit
@@ -37,7 +42,7 @@ class GameEngine:
         self.all_units: List[Unit] = []
         self.blue_units: List[Unit] = []
         self.red_units: List[Unit] = []
-        self.selected_unit: Optional[Unit] = None
+        self.selected_units: List[Unit] = []
 
         self._setup_units()
 
@@ -48,13 +53,21 @@ class GameEngine:
         self._game_over = False
         self._winner: Optional[str] = None
 
+        self._drag_start: Optional[Tuple[int, int]] = None
+        self._drag_end: Optional[Tuple[int, int]] = None
+        self._dragging = False
+
+        self._blue_food = FOOD_MAX
+        self._red_food = FOOD_MAX
+        self._recruit_timer = 0.0
+
     def _setup_map(self):
         if self.mission:
             from campaigns import MISSIONS
             mission_fn = MISSIONS.get(self.mission)
             if mission_fn:
                 config = mission_fn()
-                self.game_map = TacticalMap(config.grid)
+                self.game_map = TacticalMap(config.grid, config.villages)
                 self._mission_config = config
                 return
         self.game_map = TacticalMap()
@@ -119,15 +132,18 @@ class GameEngine:
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    if self.selected_unit:
-                        self.selected_unit.selected = False
-                        self.selected_unit = None
+                    if self.selected_units:
+                        for u in self.selected_units:
+                            u.selected = False
+                        self.selected_units.clear()
                     else:
                         self.running = False
                 elif event.key == pygame.K_SPACE:
                     self._toggle_orders()
                 elif event.key == pygame.K_r:
                     self._restart()
+                elif event.key == pygame.K_a:
+                    self._select_all_blue()
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
@@ -135,25 +151,92 @@ class GameEngine:
                     continue
 
                 if event.button == 1:
-                    self._handle_left_click(mx, my)
+                    keys = pygame.key.get_pressed()
+                    if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+                        self._shift_click_select(mx, my)
+                    else:
+                        self._drag_start = (mx, my)
+                        self._dragging = False
                 elif event.button == 3:
                     self._handle_right_click(mx, my)
 
-    def _handle_left_click(self, mx: int, my: int):
-        if self.selected_unit:
-            self.selected_unit.selected = False
-            self.selected_unit = None
+            elif event.type == pygame.MOUSEBUTTONUP:
+                mx, my = event.pos
+                if event.button == 1:
+                    if self._drag_start is not None:
+                        dx = mx - self._drag_start[0]
+                        dy = my - self._drag_start[1]
+                        if abs(dx) > 5 or abs(dy) > 5:
+                            self._box_select(self._drag_start[0], self._drag_start[1], mx, my)
+                        else:
+                            self._single_click_select(mx, my)
+                        self._drag_start = None
+                        self._dragging = False
+
+            elif event.type == pygame.MOUSEMOTION:
+                if self._drag_start is not None:
+                    mx, my = event.pos
+                    dx = mx - self._drag_start[0]
+                    dy = my - self._drag_start[1]
+                    if abs(dx) > 5 or abs(dy) > 5:
+                        self._dragging = True
+                        self._drag_end = (mx, my)
+
+    def _single_click_select(self, mx: int, my: int):
+        for u in self.selected_units:
+            u.selected = False
+        self.selected_units.clear()
 
         for unit in self.blue_units:
             if not unit.alive:
                 continue
-            if unit.distance_to_point(mx, my) < CELL_SIZE:
-                self.selected_unit = unit
+            if unit.distance_to_point(mx, my) < SELECT_CLICK_RADIUS:
                 unit.selected = True
+                self.selected_units.append(unit)
                 return
 
+    def _shift_click_select(self, mx: int, my: int):
+        for unit in self.blue_units:
+            if not unit.alive:
+                continue
+            if unit.distance_to_point(mx, my) < SELECT_CLICK_RADIUS:
+                if unit in self.selected_units:
+                    unit.selected = False
+                    self.selected_units.remove(unit)
+                elif len(self.selected_units) < MAX_SELECTION:
+                    unit.selected = True
+                    self.selected_units.append(unit)
+                return
+
+    def _box_select(self, x1: int, y1: int, x2: int, y2: int):
+        for u in self.selected_units:
+            u.selected = False
+        self.selected_units.clear()
+
+        left = min(x1, x2)
+        right = max(x1, x2)
+        top = min(y1, y2)
+        bottom = max(y1, y2)
+
+        for unit in self.blue_units:
+            if not unit.alive:
+                continue
+            if left <= unit.x <= right and top <= unit.y <= bottom:
+                if len(self.selected_units) < MAX_SELECTION:
+                    unit.selected = True
+                    self.selected_units.append(unit)
+
+    def _select_all_blue(self):
+        for u in self.selected_units:
+            u.selected = False
+        self.selected_units.clear()
+        for unit in self.blue_units:
+            if unit.alive and len(self.selected_units) < MAX_SELECTION:
+                unit.selected = True
+                self.selected_units.append(unit)
+
     def _handle_right_click(self, mx: int, my: int):
-        if not self.selected_unit or not self.selected_unit.alive:
+        if not self.selected_units:
             return
 
         target_unit = None
@@ -162,15 +245,34 @@ class GameEngine:
                 target_unit = unit
                 break
 
+        village_at = self.game_map.get_village_at(
+            mx // CELL_SIZE, my // CELL_SIZE
+        )
+
         if target_unit:
-            self.selected_unit.set_attack_target(target_unit)
-        else:
-            pixel_path = self.pathfinder.find_path_pixels(
-                self.selected_unit.x, self.selected_unit.y, mx, my
-            )
-            if pixel_path:
-                self.selected_unit.clear_orders()
-                self.selected_unit.set_move_path(pixel_path)
+            for su in self.selected_units:
+                if su.alive:
+                    su.clear_orders()
+                    su.set_attack_target(target_unit)
+        elif self.selected_units:
+            base_x = mx
+            base_y = my
+            offsets = [
+                (0, 0), (-CELL_SIZE, 0), (CELL_SIZE, 0),
+                (0, -CELL_SIZE), (0, CELL_SIZE),
+                (-CELL_SIZE, -CELL_SIZE),
+            ]
+            for i, su in enumerate(self.selected_units):
+                if su.alive:
+                    ox, oy = offsets[i % len(offsets)]
+                    tx = base_x + ox
+                    ty = base_y + oy
+                    pixel_path = self.pathfinder.find_path_pixels(
+                        su.x, su.y, tx, ty
+                    )
+                    if pixel_path:
+                        su.clear_orders()
+                        su.set_move_path(pixel_path)
 
     def _toggle_orders(self):
         self._show_orders = not self._show_orders
@@ -178,10 +280,13 @@ class GameEngine:
     def _restart(self):
         self._game_over = False
         self._winner = None
-        self.selected_unit = None
+        self.selected_units.clear()
         self.all_units.clear()
         self.blue_units.clear()
         self.red_units.clear()
+        self._blue_food = FOOD_MAX
+        self._red_food = FOOD_MAX
+        self._recruit_timer = 0.0
         self._setup_map()
         self.pathfinder = Pathfinder(self.game_map)
         self.ai_controller = AIController(self.pathfinder)
@@ -191,10 +296,92 @@ class GameEngine:
         for unit in self.all_units:
             unit.update(dt, self.game_map, self.all_units)
 
-        self.ai_controller.update(dt, [u for u in self.blue_units if u.alive])
+        villages = self.game_map.get_all_villages()
+        v_owners = self.game_map.village_owners
+
+        self.ai_controller.update(
+            dt,
+            [u for u in self.blue_units if u.alive],
+            villages, v_owners
+        )
         self.ai_controller.remove_dead()
 
+        self._update_villages(dt)
+        self._update_food(dt)
+        self._update_recruit(dt)
         self._check_game_over()
+
+    def _update_villages(self, dt: float):
+        for col, row in self.game_map.get_all_villages():
+            owner = self.game_map.get_village_owner(col, row)
+            tx = col * CELL_SIZE + CELL_SIZE / 2
+            ty = row * CELL_SIZE + CELL_SIZE / 2
+            controlling_unit = None
+            for unit in self.all_units:
+                if not unit.alive:
+                    continue
+                dist = math.hypot(unit.x - tx, unit.y - ty)
+                if dist < CELL_SIZE * 1.2:
+                    controlling_unit = unit
+                    break
+            if controlling_unit:
+                new_owner = controlling_unit.team.value
+                if owner != new_owner:
+                    self.game_map.set_village_owner(col, row, new_owner)
+
+    def _update_food(self, dt: float):
+        blue_count = sum(1 for u in self.blue_units if u.alive)
+        red_count = sum(1 for u in self.red_units if u.alive)
+        self._blue_food -= blue_count * FOOD_PER_UNIT_PER_SEC * dt
+        self._red_food -= red_count * FOOD_PER_UNIT_PER_SEC * dt
+
+        for col, row in self.game_map.get_all_villages():
+            owner = self.game_map.get_village_owner(col, row)
+            if owner == "blue":
+                self._blue_food += FOOD_PER_VILLAGE_PER_SEC * dt
+            elif owner == "red":
+                self._red_food += FOOD_PER_VILLAGE_PER_SEC * dt
+
+        self._blue_food = max(0, min(FOOD_MAX, self._blue_food))
+        self._red_food = max(0, min(FOOD_MAX, self._red_food))
+
+    def _update_recruit(self, dt: float):
+        self._recruit_timer += dt
+        if self._recruit_timer >= RECRUIT_INTERVAL:
+            self._recruit_timer -= RECRUIT_INTERVAL
+            self._recruit_unit("blue")
+            self._recruit_unit("red")
+
+    def _recruit_unit(self, team_str: str):
+        food = self._blue_food if team_str == "blue" else self._red_food
+        if food <= 0:
+            return
+
+        team = Team.BLUE if team_str == "blue" else Team.RED
+        units = self.blue_units if team_str == "blue" else self.red_units
+        villages = [
+            (c, r) for c, r in self.game_map.get_all_villages()
+            if self.game_map.get_village_owner(c, r) == team_str
+        ]
+        if not villages:
+            return
+
+        spawn_col, spawn_row = villages[0]
+        sx = spawn_col * CELL_SIZE + CELL_SIZE / 2
+        sy = spawn_row * CELL_SIZE + CELL_SIZE / 2
+
+        offset_x = (len(units) % 3) * CELL_SIZE
+        offset_y = (len(units) // 3) * CELL_SIZE
+        sx += offset_x - CELL_SIZE
+        sy += offset_y - CELL_SIZE
+
+        new_unit = Unit(UnitType.INFANTRY, team, sx, sy, health=500)
+        new_unit._pathfinder = self.pathfinder
+        units.append(new_unit)
+        self.all_units.append(new_unit)
+
+        if team == Team.RED:
+            self.ai_controller.register_unit(new_unit)
 
     def _check_game_over(self):
         blue_alive = any(u.alive for u in self.blue_units)
@@ -210,15 +397,19 @@ class GameEngine:
             self._game_over = True
             self._winner = "RED WINS"
 
-        if self.selected_unit and not self.selected_unit.alive:
-            self.selected_unit.selected = False
-            self.selected_unit = None
+        for su in list(self.selected_units):
+            if not su.alive:
+                su.selected = False
+                self.selected_units.remove(su)
 
     def _render(self):
         self.game_map.render(self.screen)
 
-        if self.selected_unit and self._show_orders:
+        if self._show_orders and self.selected_units:
             self._render_move_indicators()
+
+        if self._dragging and self._drag_start and self._drag_end:
+            self._render_selection_rect()
 
         for unit in self.all_units:
             unit.render(self.screen)
@@ -230,28 +421,33 @@ class GameEngine:
 
         pygame.display.flip()
 
-    def _render_move_indicators(self):
-        unit = self.selected_unit
-        if not unit:
-            return
+    def _render_selection_rect(self):
+        x1, y1 = self._drag_start
+        x2, y2 = self._drag_end
+        rect = pygame.Rect(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+        sel_surface = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+        sel_surface.fill(COLOR_SELECT_RECT)
+        pygame.draw.rect(sel_surface, COLOR_SELECT_RECT_BORDER, sel_surface.get_rect(), 2)
+        self.screen.blit(sel_surface, rect.topleft)
 
+    def _render_move_indicators(self):
         indicator_surface = pygame.Surface(
             (SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT), pygame.SRCALPHA
         )
-
-        range_r = int(unit.attack_range)
-        if range_r > 0:
+        for unit in self.selected_units:
+            if not unit.alive:
+                continue
+            range_r = int(unit.attack_range)
+            if range_r > 0:
+                pygame.draw.circle(
+                    indicator_surface, COLOR_ATTACK_RANGE,
+                    (int(unit.x), int(unit.y)), range_r, 2
+                )
+            move_range = int(unit.speed * CELL_SIZE * 10)
             pygame.draw.circle(
-                indicator_surface, COLOR_ATTACK_RANGE,
-                (int(unit.x), int(unit.y)), range_r, 2
+                indicator_surface, COLOR_MOVE_RANGE,
+                (int(unit.x), int(unit.y)), move_range, 1
             )
-
-        move_range = int(unit.speed * CELL_SIZE * 10)
-        pygame.draw.circle(
-            indicator_surface, COLOR_MOVE_RANGE,
-            (int(unit.x), int(unit.y)), move_range, 1
-        )
-
         self.screen.blit(indicator_surface, (0, 0))
 
     def _render_hud(self):
@@ -270,27 +466,47 @@ class GameEngine:
         red_alive = sum(1 for u in self.red_units if u.alive)
 
         blue_text = self.font_hud.render(
-            f"BLUE: {blue_alive} units | {total_blue} soldiers", True, COLOR_BLUE
+            f"BLUE: {blue_alive} | HP:{total_blue} | Food:{int(self._blue_food)}", True, COLOR_BLUE
         )
         red_text = self.font_hud.render(
-            f"RED: {red_alive} units | {total_red} soldiers", True, COLOR_RED
+            f"RED: {red_alive} | HP:{total_red} | Food:{int(self._red_food)}", True, COLOR_RED
         )
         y_off = 20 if self._mission_config else 6
         self.screen.blit(blue_text, (12, hud_y + y_off))
         self.screen.blit(red_text, (SCREEN_WIDTH - red_text.get_width() - 12, hud_y + y_off))
 
-        if self.selected_unit:
-            u = self.selected_unit
-            info = (
-                f"SELECTED: {u.unit_type.value.upper()} | "
-                f"HP: {u.health}/{u.max_health} | "
-                f"DMG: {u.damage} | SPD: {u.speed}"
-            )
+        villages_info = []
+        for col, row in self.game_map.get_all_villages():
+            owner = self.game_map.get_village_owner(col, row)
+            if owner:
+                villages_info.append(owner)
+        blue_v = villages_info.count("blue")
+        red_v = villages_info.count("red")
+        v_text = self.font_hud.render(
+            f"Villages: B:{blue_v} R:{red_v}", True, COLOR_HUD_TEXT_DIM
+        )
+        self.screen.blit(v_text, (SCREEN_WIDTH // 2 - v_text.get_width() // 2, hud_y + 2))
+
+        if self.selected_units:
+            if len(self.selected_units) == 1:
+                u = self.selected_units[0]
+                info = (
+                    f"SEL: {u.unit_type.value.upper()} | "
+                    f"HP: {u.health}/{u.max_health} | "
+                    f"DMG: {u.damage}"
+                )
+            else:
+                types_count = {}
+                for su in self.selected_units:
+                    t = su.unit_type.value
+                    types_count[t] = types_count.get(t, 0) + 1
+                parts = [f"{v}x{k}" for k, v in types_count.items()]
+                info = f"SELECTED: {len(self.selected_units)} units ({', '.join(parts)})"
             info_text = self.font_hud.render(info, True, COLOR_HUD_TEXT)
             self.screen.blit(info_text, (SCREEN_WIDTH // 2 - info_text.get_width() // 2, hud_y + 6))
 
         controls = self.font_hud.render(
-            "LMB: Select | RMB: Move/Attack | ESC: Deselect/Quit | SPACE: Toggle UI | R: Restart",
+            "LMB: Select | Shift+LMB: Multi | Drag: Box | RMB: Move/Attack | A: Select All | ESC: Quit",
             True, COLOR_HUD_TEXT_DIM,
         )
         self.screen.blit(controls, (SCREEN_WIDTH // 2 - controls.get_width() // 2, hud_y + 28))
