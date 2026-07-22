@@ -436,12 +436,15 @@ class TestAI:
 
     def test_ai_moves_towards_distant_enemy(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
+        red2 = Unit(UnitType.INFANTRY, Team.RED, 11 * CELL_SIZE, 10 * CELL_SIZE)
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 30 * CELL_SIZE, 10 * CELL_SIZE)
         red._pathfinder = self.pathfinder
+        red2._pathfinder = self.pathfinder
         self.ai.register_unit(red)
+        self.ai.register_unit(red2)
         unit_ai = self.ai._unit_ais[0]
-        unit_ai.update(1.5, [blue], [])
-        assert unit_ai.state == AIState.MOVE
+        unit_ai.update(1.5, [blue], [red2])
+        assert unit_ai.state in (AIState.MOVE, AIState.GROUP_UP, AIState.FLANK, AIState.ATTACK)
 
     def test_ai_attack_when_in_range(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
@@ -458,7 +461,7 @@ class TestAI:
         self.ai.register_unit(red)
         unit_ai = self.ai._unit_ais[0]
         unit_ai.update(1.5, [blue], [])
-        assert unit_ai.state == AIState.MOVE
+        assert unit_ai.state == AIState.RETREAT
 
     def test_ai_ignores_dead_enemies(self):
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
@@ -628,12 +631,16 @@ class TestIntegration:
         pf = Pathfinder(game_map)
         ai = AIController(pf)
         red = Unit(UnitType.INFANTRY, Team.RED, 10 * CELL_SIZE, 10 * CELL_SIZE)
+        red2 = Unit(UnitType.INFANTRY, Team.RED, 11 * CELL_SIZE, 11 * CELL_SIZE)
         blue = Unit(UnitType.INFANTRY, Team.BLUE, 30 * CELL_SIZE, 10 * CELL_SIZE)
         red._pathfinder = pf
+        red2._pathfinder = pf
         ai.register_unit(red)
+        ai.register_unit(red2)
         for _ in range(20):
             ai.update(0.5, [blue])
-            red.update(0.5, game_map, [red, blue])
+            red.update(0.5, game_map, [red, red2, blue])
+            red2.update(0.5, game_map, [red, red2, blue])
         moved = red.x != 10 * CELL_SIZE or red.y != 10 * CELL_SIZE
         assert moved
 

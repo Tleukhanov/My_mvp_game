@@ -50,15 +50,19 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 - **Villages** — capturable buildings that produce food and spawn units
 
 ### AI
+- **Tactical Grouping** — infantry waits for allies before attacking (GROUP_UP state)
+- **Flanking** — cavalry approaches from the side, not head-on
+- **Hold Position** — archers stay in place and shoot, don't chase enemies
 - **Village Capture** — AI prioritizes capturing neutral/enemy villages
-- **Proactive Aggression** — enemies advance toward you from the start
-- **A\* Pathfinding Chase** — AI units navigate around terrain when pursuing targets
-- **State Machine** — Idle / Move / Attack / Capture / Retreat states
-- **Retreat Logic** — units flee when below 20% health
+- **Retreat Logic** — units flee when below 35% health
+- **A\* Pathfinding** — AI navigates around terrain when pursuing targets
+- **State Machine** — Idle / Group Up / Move / Hold / Attack / Flank / Capture / Retreat
 - **Modular Design** — swap the AI controller with an ML agent via the `AIController` interface
 
 ### Architecture
 - **A\* Pathfinding** — respects terrain costs, diagonal movement, mountain avoidance
+- **Tactical AI** — unit-type-specific behavior (infantry groups up, cavalry flanks, archers hold)
+- **Command Modes** — player issues Attack/Hold/Defend orders that change unit behavior
 - **MVC Separation** — config, map, units, AI, engine, pathfinding are independent modules
 - **Extensible** — add new unit types, maps, game modes, or ML agents by swapping single files
 
@@ -71,7 +75,7 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 | Language | Python 3.10+ |
 | Graphics | Pygame-CE 2.5 |
 | Pathfinding | A\* with terrain cost weighting |
-| AI | Finite State Machine (Idle/Move/Attack/Capture/Retreat) |
+| AI | Finite State Machine (Idle/GroupUp/Move/Hold/Attack/Flank/Capture/Retreat) |
 | Testing | pytest (93 tests) |
 | Container | Docker + docker-compose |
 
@@ -111,9 +115,13 @@ docker compose --profile headless up --build
 | **Drag (Left Mouse)** | Box-select multiple units |
 | **A** | Select all friendly units |
 | **Right Click** | Move selected units / Attack enemy unit |
+| **G** | Attack mode — units aggressively pursue enemies |
+| **H** | Hold mode — units move to position then hold ground |
+| **F** | Defend mode — units move to position and engage nearby enemies |
 | **ESC** | Deselect unit / Quit game |
 | **SPACE** | Toggle range indicators on/off |
 | **R** | Restart the battle |
+| **N** | Next mission (after victory in campaign) |
 
 ---
 

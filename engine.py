@@ -4,7 +4,7 @@ import math
 from typing import Optional, List, Tuple, Set
 from config import (
     SCREEN_WIDTH, SCREEN_HEIGHT, HUD_HEIGHT, CELL_SIZE,
-    MAP_COLS, MAP_ROWS, FPS, Team, UnitType,
+    MAP_COLS, MAP_ROWS, FPS, Team, UnitType, CommandMode,
     COLOR_HUD_BG, COLOR_HUD_TEXT, COLOR_HUD_TEXT_DIM,
     COLOR_WHITE, COLOR_BLACK, COLOR_BLUE, COLOR_RED,
     FONT_NAME, FONT_SIZE_HUD, FONT_SIZE_TITLE,
@@ -24,6 +24,8 @@ UNIT_TYPE_MAP = {
     "cavalry": UnitType.CAVALRY,
     "archer": UnitType.ARCHER,
 }
+
+FORMATION_SPACING = CELL_SIZE * 1.2
 
 
 class GameEngine:
@@ -60,6 +62,9 @@ class GameEngine:
         self._blue_food = FOOD_MAX
         self._red_food = FOOD_MAX
         self._recruit_timer = 0.0
+
+        self._command_mode = CommandMode.ATTACK
+        self._victory_next_mission: Optional[int] = None
 
     def _setup_map(self):
         if self.mission:
@@ -123,7 +128,7 @@ class GameEngine:
                 self._update(dt)
             self._render()
         pygame.quit()
-        sys.exit()
+        return self._victory_next_mission
 
     def _handle_events(self):
         for event in pygame.event.get():
@@ -144,6 +149,12 @@ class GameEngine:
                     self._restart()
                 elif event.key == pygame.K_a:
                     self._select_all_blue()
+                elif event.key == pygame.K_h:
+                    self._command_mode = CommandMode.HOLD
+                elif event.key == pygame.K_f:
+                    self._command_mode = CommandMode.DEFEND
+                elif event.key == pygame.K_g:
+                    self._command_mode = CommandMode.ATTACK
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
@@ -245,34 +256,71 @@ class GameEngine:
                 target_unit = unit
                 break
 
-        village_at = self.game_map.get_village_at(
-            mx // CELL_SIZE, my // CELL_SIZE
-        )
-
         if target_unit:
+            self._issue_attack_order(target_unit)
+        elif self.selected_units:
+            self._issue_formation_move(mx, my)
+
+    def _issue_attack_order(self, target: Unit):
+        if self._command_mode == CommandMode.HOLD:
             for su in self.selected_units:
                 if su.alive:
                     su.clear_orders()
-                    su.set_attack_target(target_unit)
-        elif self.selected_units:
-            base_x = mx
-            base_y = my
-            offsets = [
-                (0, 0), (-CELL_SIZE, 0), (CELL_SIZE, 0),
-                (0, -CELL_SIZE), (0, CELL_SIZE),
-                (-CELL_SIZE, -CELL_SIZE),
-            ]
-            for i, su in enumerate(self.selected_units):
+                    su.set_attack_target(target)
+            return
+
+        if self._command_mode == CommandMode.DEFEND:
+            for su in self.selected_units:
                 if su.alive:
-                    ox, oy = offsets[i % len(offsets)]
-                    tx = base_x + ox
-                    ty = base_y + oy
-                    pixel_path = self.pathfinder.find_path_pixels(
-                        su.x, su.y, tx, ty
-                    )
-                    if pixel_path:
-                        su.clear_orders()
+                    su.clear_orders()
+                    su.set_attack_target(target)
+            return
+
+        for su in self.selected_units:
+            if su.alive:
+                su.clear_orders()
+                su.set_attack_target(target)
+
+    def _issue_formation_move(self, mx: int, my: int):
+        n = len(self.selected_units)
+        if n == 0:
+            return
+
+        if n == 1:
+            su = self.selected_units[0]
+            if su.alive:
+                pixel_path = self.pathfinder.find_path_pixels(su.x, su.y, mx, my)
+                if pixel_path:
+                    su.clear_orders()
+                    if self._command_mode == CommandMode.HOLD:
                         su.set_move_path(pixel_path)
+                    elif self._command_mode == CommandMode.DEFEND:
+                        su.set_move_path(pixel_path)
+                    else:
+                        su.set_move_path(pixel_path)
+            return
+
+        angle = 0
+        cols = min(n, 3)
+        for i, su in enumerate(self.selected_units):
+            if not su.alive:
+                continue
+            row_idx = i // cols
+            col_idx = i % cols
+            offset_x = (col_idx - (cols - 1) / 2) * FORMATION_SPACING
+            offset_y = row_idx * FORMATION_SPACING
+            tx = mx + offset_x
+            ty = my + offset_y
+
+            pixel_path = self.pathfinder.find_path_pixels(su.x, su.y, tx, ty)
+            if pixel_path:
+                su.clear_orders()
+                if self._command_mode == CommandMode.HOLD:
+                    su.set_move_path(pixel_path)
+                elif self._command_mode == CommandMode.DEFEND:
+                    su.set_move_path(pixel_path)
+                else:
+                    su.set_move_path(pixel_path)
 
     def _toggle_orders(self):
         self._show_orders = not self._show_orders
@@ -287,6 +335,7 @@ class GameEngine:
         self._blue_food = FOOD_MAX
         self._red_food = FOOD_MAX
         self._recruit_timer = 0.0
+        self._command_mode = CommandMode.ATTACK
         self._setup_map()
         self.pathfinder = Pathfinder(self.game_map)
         self.ai_controller = AIController(self.pathfinder)
@@ -393,6 +442,8 @@ class GameEngine:
         elif not red_alive:
             self._game_over = True
             self._winner = "BLUE WINS"
+            if self.mission and self.mission < 4:
+                self._victory_next_mission = self.mission + 1
         elif not blue_alive:
             self._game_over = True
             self._winner = "RED WINS"
@@ -505,8 +556,17 @@ class GameEngine:
             info_text = self.font_hud.render(info, True, COLOR_HUD_TEXT)
             self.screen.blit(info_text, (SCREEN_WIDTH // 2 - info_text.get_width() // 2, hud_y + 6))
 
+        cmd_name = self._command_mode.value.upper()
+        cmd_color = COLOR_ATTACK_RANGE if self._command_mode == CommandMode.ATTACK else (
+            COLOR_MOVE_RANGE if self._command_mode == CommandMode.HOLD else (180, 180, 100)
+        )
+        cmd_text = self.font_hud.render(
+            f"[{cmd_name}] G:Attack H:Hold F:Defend", True, cmd_color
+        )
+        self.screen.blit(cmd_text, (SCREEN_WIDTH - cmd_text.get_width() - 12, hud_y + 2))
+
         controls = self.font_hud.render(
-            "LMB: Select | Shift+LMB: Multi | Drag: Box | RMB: Move/Attack | A: Select All | ESC: Quit",
+            "LMB: Select | Shift+LMB: Multi | Drag: Box | RMB: Move/Attack | A: All | ESC: Quit",
             True, COLOR_HUD_TEXT_DIM,
         )
         self.screen.blit(controls, (SCREEN_WIDTH // 2 - controls.get_width() // 2, hud_y + 28))
@@ -525,10 +585,39 @@ class GameEngine:
 
         title = self.font_title.render(self._winner, True, color)
         tx = SCREEN_WIDTH // 2 - title.get_width() // 2
-        ty = SCREEN_HEIGHT // 2 - title.get_height() // 2 - 20
+        ty = SCREEN_HEIGHT // 2 - title.get_height() // 2 - 40
         self.screen.blit(title, (tx, ty))
 
-        restart_text = self.font_hud.render("Press R to restart | ESC to quit", True, COLOR_WHITE)
-        rx = SCREEN_WIDTH // 2 - restart_text.get_width() // 2
+        if self._winner == "BLUE WINS" and self.mission and self.mission < 4:
+            next_text = self.font_hud.render(
+                f"Press N for next mission (Mission {self.mission + 1}) | R: Restart | ESC: Menu",
+                True, COLOR_WHITE
+            )
+        elif self._winner == "BLUE WINS" and self.mission == 4:
+            next_text = self.font_hud.render(
+                "CAMPAIGN COMPLETE! Press R: Restart | ESC: Menu",
+                True, COLOR_WHITE
+            )
+        else:
+            next_text = self.font_hud.render(
+                "Press R to restart | ESC to quit",
+                True, COLOR_WHITE
+            )
+        rx = SCREEN_WIDTH // 2 - next_text.get_width() // 2
         ry = ty + title.get_height() + 16
-        self.screen.blit(restart_text, (rx, ry))
+        self.screen.blit(next_text, (rx, ry))
+
+        self._handle_game_over_keys()
+
+    def _handle_game_over_keys(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_r:
+                    self._restart()
+                elif event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif event.key == pygame.K_n:
+                    if self._winner == "BLUE WINS" and self._victory_next_mission:
+                        self.running = False

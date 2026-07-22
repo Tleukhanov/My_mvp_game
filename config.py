@@ -25,6 +25,16 @@ class AIState(Enum):
     MOVE = auto()
     ATTACK = auto()
     CAPTURE = auto()
+    GROUP_UP = auto()
+    HOLD = auto()
+    FLANK = auto()
+    RETREAT = auto()
+
+
+class CommandMode(Enum):
+    ATTACK = auto()
+    HOLD = auto()
+    DEFEND = auto()
 
 
 CELL_SIZE = 32

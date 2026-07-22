@@ -150,6 +150,88 @@ class MainMenu:
         pygame.display.flip()
 
 
+class VictoryScreen:
+    def __init__(self, completed_mission: int, next_mission: int):
+        pygame.init()
+        pygame.display.set_caption("Tactic Battle - Victory!")
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.running = True
+
+        self.font_title = pygame.font.SysFont(FONT_NAME, 42, bold=True)
+        self.font_subtitle = pygame.font.SysFont(FONT_NAME, 20)
+        self.font_button = pygame.font.SysFont(FONT_NAME, 22, bold=True)
+        self.font_small = pygame.font.SysFont(FONT_NAME, 14)
+
+        self.completed_mission = completed_mission
+        self.next_mission = next_mission
+
+        btn_w = 300
+        btn_h = 55
+        btn_x = SCREEN_WIDTH // 2 - btn_w // 2
+
+        self.buttons = [
+            MenuButton(btn_x, SCREEN_HEIGHT // 2 + 20, btn_w, btn_h,
+                       f"NEXT: MISSION {next_mission}"),
+            MenuButton(btn_x, SCREEN_HEIGHT // 2 + 90, btn_w, btn_h, "CAMPAIGN MENU"),
+        ]
+
+        self.result: Optional[str] = None
+
+    def run(self) -> Optional[str]:
+        while self.running:
+            dt = self.clock.tick(60) / 1000.0
+            self._handle_events()
+            self._render()
+        return self.result
+
+    def _handle_events(self):
+        mx, my = pygame.mouse.get_pos()
+        for btn in self.buttons:
+            btn.check_hover(mx, my)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.result = "menu"
+                    self.running = False
+                elif event.key == pygame.K_n:
+                    self.result = "next"
+                    self.running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.buttons[0].is_clicked(mx, my):
+                    self.result = "next"
+                    self.running = False
+                elif self.buttons[1].is_clicked(mx, my):
+                    self.result = "menu"
+                    self.running = False
+
+    def _render(self):
+        self.screen.fill(COLOR_MENU_BG)
+
+        title = self.font_title.render("VICTORY!", True, (220, 200, 80))
+        tx = SCREEN_WIDTH // 2 - title.get_width() // 2
+        self.screen.blit(title, (tx, SCREEN_HEIGHT // 2 - 80))
+
+        subtitle = self.font_subtitle.render(
+            f"Mission {self.completed_mission} completed!", True, COLOR_MENU_SUBTITLE
+        )
+        sx = SCREEN_WIDTH // 2 - subtitle.get_width() // 2
+        self.screen.blit(subtitle, (sx, SCREEN_HEIGHT // 2 - 30))
+
+        for btn in self.buttons:
+            btn.draw(self.screen, self.font_button)
+
+        controls = self.font_small.render(
+            "N: Next Mission | ESC: Campaign Menu", True, COLOR_MENU_SUBTITLE
+        )
+        self.screen.blit(controls, (12, SCREEN_HEIGHT - 28))
+
+        pygame.display.flip()
+
+
 class CampaignSelect:
     def __init__(self):
         pygame.init()
