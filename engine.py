@@ -556,7 +556,7 @@ class GameEngine:
             info_text = self.font_hud.render(info, True, COLOR_HUD_TEXT)
             self.screen.blit(info_text, (SCREEN_WIDTH // 2 - info_text.get_width() // 2, hud_y + 6))
 
-        cmd_name = self._command_mode.value.upper()
+        cmd_name = self._command_mode.name
         cmd_color = COLOR_ATTACK_RANGE if self._command_mode == CommandMode.ATTACK else (
             COLOR_MOVE_RANGE if self._command_mode == CommandMode.HOLD else (180, 180, 100)
         )
