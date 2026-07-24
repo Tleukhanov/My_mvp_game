@@ -13,7 +13,7 @@ from world_data import (
     COLOR_HUD_TEXT_DIM, COLOR_WHITE, COLOR_BLACK,
     COLOR_GENERAL_SELECTED, COLOR_GENERAL_MOVABLE, COLOR_GENERAL_DONE,
     WORLD_NATIONS, WORLD_REGIONS, WORLD_GENERALS, PLAYER_NATION,
-    RegionType, General,
+    RegionType, Region, General,
 )
 from diplomacy import DiplomacyManager, Relation
 

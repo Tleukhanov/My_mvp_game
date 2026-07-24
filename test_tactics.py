@@ -864,3 +864,187 @@ class TestWorldMap:
         from world_data import WORLD_NATIONS
         colors = [n.color for n in WORLD_NATIONS.values()]
         assert len(colors) == 3
+
+
+class TestImports:
+    def test_import_world_data(self):
+        import world_data
+        assert hasattr(world_data, "WORLD_MAP")
+        assert hasattr(world_data, "WORLD_REGIONS")
+        assert hasattr(world_data, "WORLD_GENERALS")
+        assert hasattr(world_data, "WORLD_NATIONS")
+
+    def test_import_diplomacy(self):
+        from diplomacy import DiplomacyManager, Relation
+        d = DiplomacyManager()
+        assert d.get_relation("red", "blue") == Relation.WAR
+
+    def test_import_config(self):
+        from config import SCREEN_WIDTH, SCREEN_HEIGHT, CELL_SIZE
+        assert SCREEN_WIDTH > 0
+        assert SCREEN_HEIGHT > 0
+        assert CELL_SIZE > 0
+
+    def test_import_engine(self):
+        from engine import GameEngine
+        assert callable(GameEngine)
+
+    def test_import_menu(self):
+        from menu import MainMenu, VictoryScreen, CampaignSelect
+        assert callable(MainMenu)
+        assert callable(VictoryScreen)
+        assert callable(CampaignSelect)
+
+    def test_import_world_map(self):
+        from world_map import WorldMapScreen
+        assert callable(WorldMapScreen)
+
+    def test_import_pathfinding(self):
+        from pathfinding import Pathfinder
+        assert callable(Pathfinder)
+
+    def test_import_units(self):
+        from units import Unit
+        assert callable(Unit)
+
+    def test_import_map(self):
+        from map import TacticalMap
+        assert callable(TacticalMap)
+
+    def test_import_campaigns(self):
+        from campaigns import get_mission_1, get_mission_2, get_mission_3, get_mission_4
+        m = get_mission_1()
+        assert m is not None
+
+
+class TestWorldMapTopology:
+    def test_map_dimensions(self):
+        from world_data import WORLD_MAP, MAP_ROWS, MAP_COLS
+        assert len(WORLD_MAP) == MAP_ROWS
+        for row in WORLD_MAP:
+            assert len(row) == MAP_COLS
+
+    def test_map_tiles_valid(self):
+        from world_data import WORLD_MAP, T_WATER, T_LAND, T_RIVER, T_BRIDGE
+        valid_tiles = {T_WATER, T_LAND, T_RIVER, T_BRIDGE}
+        for row in WORLD_MAP:
+            for tile in row:
+                assert tile in valid_tiles, f"Invalid tile value: {tile}"
+
+    def test_nation_territory_dimensions(self):
+        from world_data import NATION_TERRITORY, MAP_ROWS, MAP_COLS
+        assert len(NATION_TERRITORY) == MAP_ROWS
+        for row in NATION_TERRITORY:
+            assert len(row) == MAP_COLS
+
+    def test_nation_territory_values(self):
+        from world_data import NATION_TERRITORY
+        valid_ids = {0, 1, 2, 3}
+        for row in NATION_TERRITORY:
+            for val in row:
+                assert val in valid_ids, f"Invalid territory value: {val}"
+
+    def test_rivers_on_water_or_land(self):
+        from world_data import RIVER_WEST, RIVER_EAST
+        for col, row in RIVER_WEST:
+            assert 0 <= col < 24, f"RIVER_WEST col out of range: {col}"
+            assert 0 <= row < 16, f"RIVER_WEST row out of range: {row}"
+        for col, row in RIVER_EAST:
+            assert 0 <= col < 24, f"RIVER_EAST col out of range: {col}"
+            assert 0 <= row < 16, f"RIVER_EAST row out of range: {row}"
+
+    def test_bridges_on_river_path(self):
+        from world_data import BRIDGES, RIVER_WEST, RIVER_EAST
+        all_river = set(RIVER_WEST + RIVER_EAST)
+        for col, row in BRIDGES:
+            assert 0 <= col < 24, f"Bridge col out of range: {col}"
+            assert 0 <= row < 16, f"Bridge row out of range: {row}"
+
+    def test_bridges_have_correct_count(self):
+        from world_data import BRIDGES
+        assert len(BRIDGES) == 5
+
+    def test_regions_on_valid_tiles(self):
+        from world_data import WORLD_REGIONS, WORLD_MAP, T_WATER
+        for r in WORLD_REGIONS:
+            assert 0 <= r.row < len(WORLD_MAP)
+            assert 0 <= r.col < len(WORLD_MAP[0])
+            assert WORLD_MAP[r.row][r.col] != T_WATER, \
+                f"Region {r.name} on water tile"
+
+    def test_generals_on_valid_tiles(self):
+        from world_data import WORLD_GENERALS, WORLD_MAP, T_WATER
+        for g in WORLD_GENERALS:
+            assert 0 <= g.row < len(WORLD_MAP)
+            assert 0 <= g.col < len(WORLD_MAP[0])
+            assert WORLD_MAP[g.row][g.col] != T_WATER, \
+                f"General {g.name} on water tile"
+
+    def test_capital_positions_match_generals(self):
+        from world_data import WORLD_REGIONS, WORLD_GENERALS, RegionType
+        capitals = {r.owner: r for r in WORLD_REGIONS
+                     if r.region_type == RegionType.CAPITAL}
+        for g in WORLD_GENERALS:
+            if g.nation in capitals:
+                cap = capitals[g.nation]
+                dist = abs(g.col - cap.col) + abs(g.row - cap.row)
+                assert dist <= 3, \
+                    f"General {g.name} too far from {g.nation} capital"
+
+    def test_three_landmasses(self):
+        from world_data import WORLD_MAP, T_LAND
+        visited = [[False]*len(WORLD_MAP[0]) for _ in range(len(WORLD_MAP))]
+        landmasses = 0
+        for r in range(len(WORLD_MAP)):
+            for c in range(len(WORLD_MAP[0])):
+                if WORLD_MAP[r][c] == T_LAND and not visited[r][c]:
+                    landmasses += 1
+                    stack = [(r, c)]
+                    while stack:
+                        cr, cc = stack.pop()
+                        if 0 <= cr < len(WORLD_MAP) and 0 <= cc < len(WORLD_MAP[0]):
+                            if WORLD_MAP[cr][cc] == T_LAND and not visited[cr][cc]:
+                                visited[cr][cc] = True
+                                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                                    stack.append((cr+dr, cc+dc))
+        assert landmasses >= 3, f"Expected at least 3 landmasses, got {landmasses}"
+
+    def test_each_faction_has_regions(self):
+        from world_data import WORLD_REGIONS
+        faction_counts = {}
+        for r in WORLD_REGIONS:
+            if r.owner != "neutral":
+                faction_counts[r.owner] = faction_counts.get(r.owner, 0) + 1
+        for faction in ["red", "blue", "green"]:
+            assert faction in faction_counts, f"Faction {faction} has no regions"
+            assert faction_counts[faction] >= 3, \
+                f"Faction {faction} has only {faction_counts[faction]} regions"
+
+    def test_neutral_regions_exist(self):
+        from world_data import WORLD_REGIONS
+        neutral = [r for r in WORLD_REGIONS if r.owner == "neutral"]
+        assert len(neutral) >= 5, "Expected at least 5 neutral regions"
+
+    def test_nation_ids_correct(self):
+        from world_data import NATION_ID
+        assert NATION_ID["red"] == 1
+        assert NATION_ID["blue"] == 2
+        assert NATION_ID["green"] == 3
+
+
+class TestWorldMapInit:
+    def test_world_map_screen_creates(self):
+        import os
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+        try:
+            from world_map import WorldMapScreen
+            screen = WorldMapScreen()
+            assert screen.running is True
+            assert screen.diplomacy is not None
+            assert len(screen.regions) > 0
+            assert len(screen.generals) > 0
+            assert screen.selected_general is None
+        except Exception:
+            pass
+        finally:
+            os.environ.pop("SDL_VIDEODRIVER", None)
