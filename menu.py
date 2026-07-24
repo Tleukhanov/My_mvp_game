@@ -66,7 +66,8 @@ class MainMenu:
             MenuButton(btn_x, start_y, btn_w, btn_h, "КАМПАНИЯ"),
             MenuButton(btn_x, start_y + 75, btn_w, btn_h, "СРАЖЕНИЕ"),
             MenuButton(btn_x, start_y + 150, btn_w, btn_h, "ГЛОБАЛЬНАЯ КАРТА"),
-            MenuButton(btn_x, start_y + 225, btn_w, btn_h, "ОНЛАЙН", locked=True),
+            MenuButton(btn_x, start_y + 225, btn_w, btn_h, "КАК ИГРАТЬ"),
+            MenuButton(btn_x, start_y + 300, btn_w, btn_h, "ОНЛАЙН", locked=True),
         ]
 
         self.result: Optional[str] = None
@@ -117,6 +118,9 @@ class MainMenu:
             self.result = "world_map"
             self.running = False
         elif self.buttons[3].is_clicked(mx, my):
+            self.result = "tutorial"
+            self.running = False
+        elif self.buttons[4].is_clicked(mx, my):
             self._show_message = "В РАЗРАБОТКЕ"
             self._message_timer = 2.0
 
@@ -323,5 +327,173 @@ class CampaignSelect:
 
         controls = self.font_small.render("ESC: Назад", True, COLOR_MENU_SUBTITLE)
         self.screen.blit(controls, (12, SCREEN_HEIGHT - 28))
+
+        pygame.display.flip()
+
+
+class TutorialScreen:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("Tactic Battle - How to Play")
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.running = True
+
+        self.font_title = pygame.font.SysFont(FONT_NAME, 32, bold=True)
+        self.font_section = pygame.font.SysFont(FONT_NAME, 18, bold=True)
+        self.font_body = pygame.font.SysFont(FONT_NAME, 14)
+        self.font_small = pygame.font.SysFont(FONT_NAME, 12)
+
+        self._page = 0
+        self._pages = self._build_pages()
+
+    def _build_pages(self):
+        return [
+            self._page_battle(),
+            self._page_world(),
+            self._page_diplomacy(),
+            self._page_tips(),
+        ]
+
+    def _page_battle(self):
+        return [
+            ("TACTICAL BATTLE", self.font_title, COLOR_MENU_TITLE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("CONTROLS", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("Left Click ........... Select unit", self.font_body, COLOR_HUD_TEXT),
+            ("Shift + Click ........ Add to selection (max 6)", self.font_body, COLOR_HUD_TEXT),
+            ("Drag (Left Mouse) .... Box select multiple units", self.font_body, COLOR_HUD_TEXT),
+            ("A .................... Select all friendly units", self.font_body, COLOR_HUD_TEXT),
+            ("Right Click .......... Move / Attack order", self.font_body, COLOR_HUD_TEXT),
+            ("ESC .................. Deselect / Quit", self.font_body, COLOR_HUD_TEXT),
+            ("SPACE ................ Toggle range indicators", self.font_body, COLOR_HUD_TEXT),
+            ("R .................... Restart battle", self.font_body, COLOR_HUD_TEXT),
+            ("N .................... Next mission (after victory)", self.font_body, COLOR_HUD_TEXT),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("COMMAND MODES (right-click behavior)", self.font_section, COLOR_WHITE),
+            ("G .................... ATTACK - units pursue enemies", self.font_body, COLOR_HUD_TEXT),
+            ("H .................... HOLD - move then hold position", self.font_body, COLOR_HUD_TEXT),
+            ("F .................... DEFEND - move then engage nearby", self.font_body, COLOR_HUD_TEXT),
+        ]
+
+    def _page_world(self):
+        return [
+            ("WORLD MAP", self.font_title, COLOR_MENU_TITLE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("You command Nordheim (blue). 3 nations fight for territory.", self.font_body, COLOR_HUD_TEXT),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("CONTROLS", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("Left Click ........... Select general", self.font_body, COLOR_HUD_TEXT),
+            ("Left Click ........... Move selected general (1-2 tiles)", self.font_body, COLOR_HUD_TEXT),
+            ("SPACE ................ End turn", self.font_body, COLOR_HUD_TEXT),
+            ("D .................... Open diplomacy panel", self.font_body, COLOR_HUD_TEXT),
+            ("ESC .................. Quit", self.font_body, COLOR_HUD_TEXT),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("HOW IT WORKS", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("1. Select a general by clicking on him", self.font_body, COLOR_HUD_TEXT),
+            ("2. Click a nearby tile to move (max 2 tiles)", self.font_body, COLOR_HUD_TEXT),
+            ("3. Moving onto enemy territory captures the region", self.font_body, COLOR_HUD_TEXT),
+            ("4. Colliding with enemy general triggers a battle", self.font_body, COLOR_HUD_TEXT),
+            ("5. Press SPACE to end your turn - AI moves next", self.font_body, COLOR_HUD_TEXT),
+            ("6. Win by eliminating all enemy generals", self.font_body, COLOR_HUD_TEXT),
+        ]
+
+    def _page_diplomacy(self):
+        return [
+            ("DIPLOMACY", self.font_title, COLOR_MENU_TITLE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("Press D on world map to open diplomacy.", self.font_body, COLOR_HUD_TEXT),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("RELATION TYPES", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("WAR ......... Red ... You fight on contact", self.font_body, (200, 60, 60)),
+            ("NEUTRAL ..... Gray .. Cannot move through territory", self.font_body, (180, 170, 150)),
+            ("FRIENDLY .... Green . Cannot enter their territory", self.font_body, (80, 180, 80)),
+            ("ALLIANCE .... Blue .. Share territory freely", self.font_body, (60, 120, 220)),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("HOW TO USE", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("N / P ........ Cycle target nation", self.font_body, COLOR_HUD_TEXT),
+            ("1 ........... Declare WAR", self.font_body, (200, 60, 60)),
+            ("2 ........... Propose peace (NEUTRAL)", self.font_body, (180, 170, 150)),
+            ("3 ........... Propose FRIENDLY (60% chance)", self.font_body, (80, 180, 80)),
+            ("4 ........... Propose ALLIANCE (need FRIENDLY first)", self.font_body, (60, 120, 220)),
+            ("ESC ......... Close panel", self.font_body, COLOR_HUD_TEXT),
+        ]
+
+    def _page_tips(self):
+        return [
+            ("TIPS & STRATEGY", self.font_title, COLOR_MENU_TITLE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("TACTICAL BATTLE", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("- Infantry groups up before attacking - don't send alone", self.font_body, COLOR_HUD_TEXT),
+            ("- Cavalry flanks from the side - great for ambushes", self.font_body, COLOR_HUD_TEXT),
+            ("- Archers hold position and shoot - keep them safe", self.font_body, COLOR_HUD_TEXT),
+            ("- Capture villages for food + free recruits every 3 min", self.font_body, COLOR_HUD_TEXT),
+            ("- Use HOLD mode to set defensive positions", self.font_body, COLOR_HUD_TEXT),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("WORLD MAP", self.font_section, COLOR_WHITE),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("- Capture regions to expand your territory", self.font_body, COLOR_HUD_TEXT),
+            ("- Make alliances before attacking strong enemies", self.font_body, COLOR_HUD_TEXT),
+            ("- AI generals move toward enemies each turn", self.font_body, COLOR_HUD_TEXT),
+            ("- Generals that moved cannot move again this turn", self.font_body, COLOR_HUD_TEXT),
+            ("", self.font_body, COLOR_MENU_SUBTITLE),
+            ("GOOD LUCK, COMMANDER!", self.font_section, COLOR_WHITE),
+        ]
+
+    def run(self) -> Optional[str]:
+        while self.running:
+            dt = self.clock.tick(60) / 1000.0
+            self._handle_events()
+            self._render()
+        return "done"
+
+    def _handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif event.key == pygame.K_RIGHT or event.key == pygame.K_n:
+                    self._page = min(self._page + 1, len(self._pages) - 1)
+                elif event.key == pygame.K_LEFT or event.key == pygame.K_p:
+                    self._page = max(self._page - 1, 0)
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    mx, my = event.pos
+                    if my > SCREEN_HEIGHT - 40:
+                        self.running = False
+                    elif mx > SCREEN_WIDTH // 2:
+                        self._page = min(self._page + 1, len(self._pages) - 1)
+                    else:
+                        self._page = max(self._page - 1, 0)
+
+    def _render(self):
+        self.screen.fill(COLOR_MENU_BG)
+
+        lines = self._pages[self._page]
+        y = 30
+        for text, font, color in lines:
+            if text == "":
+                y += 8
+                continue
+            rendered = font.render(text, True, color)
+            x = 40
+            if font == self.font_title:
+                x = SCREEN_WIDTH // 2 - rendered.get_width() // 2
+            self.screen.blit(rendered, (x, y))
+            y += font.get_height() + 3
+
+        page_text = self.font_small.render(
+            f"Page {self._page + 1}/{len(self._pages)}  |  Left/Right arrows to navigate  |  Click or ESC to close",
+            True, COLOR_MENU_SUBTITLE
+        )
+        self.screen.blit(page_text, (12, SCREEN_HEIGHT - 28))
 
         pygame.display.flip()

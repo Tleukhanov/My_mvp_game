@@ -1,4 +1,4 @@
-from menu import MainMenu, CampaignSelect, VictoryScreen
+from menu import MainMenu, CampaignSelect, VictoryScreen, TutorialScreen
 from campaigns import MISSIONS
 
 
@@ -49,6 +49,9 @@ def main():
             from world_map import WorldMapScreen
             world_screen = WorldMapScreen()
             world_screen.run()
+        elif result == "tutorial":
+            tutorial = TutorialScreen()
+            tutorial.run()
         else:
             break
 
