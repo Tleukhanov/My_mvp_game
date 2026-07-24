@@ -2,7 +2,7 @@
 
 # Tactic Battle
 
-Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pathfinding, type-advantage combat, village capture, and modular AI architecture. Built with Python 3 + Pygame.
+Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pathfinding, type-advantage combat, village capture, world map with diplomacy, and modular AI architecture. Built with Python 3 + Pygame.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![Pygame](https://img.shields.io/badge/Pygame_CE-2.5-4172B5)
@@ -19,6 +19,7 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 - **Main Menu** — stylish launch screen with mode selection
 - **Skirmish** — quick battle on the default tactical map
 - **Campaign** — 4 handcrafted missions with unique terrain and objectives
+- **World Map** — grand strategy layer with nations, diplomacy, and territory control
 - **Online** — planned (placeholder)
 
 ### Campaign Missions
@@ -49,6 +50,14 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 - **Bridges** — the only way to cross rivers at normal speed
 - **Villages** — capturable buildings that produce food and spawn units
 
+### World Map
+- **3 Nations** — Nordheim (blue), Valoria (red), Drakoria (green)
+- **18 Regions** — capitals, cities, villages, fortresses across a 24×16 grid
+- **6 Generals** — move on the world map, capture regions, fight enemy generals
+- **Territory System** — capturing a region expands your borders
+- **Diplomacy** — propose War / Neutral / Friendly / Alliance to other nations
+- **AI Opponents** — enemy generals move and attack autonomously each turn
+
 ### AI
 - **Tactical Grouping** — infantry waits for allies before attacking (GROUP_UP state)
 - **Flanking** — cavalry approaches from the side, not head-on
@@ -75,7 +84,8 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 | Language | Python 3.10+ |
 | Graphics | Pygame-CE 2.5 |
 | Pathfinding | A\* with terrain cost weighting |
-| AI | Finite State Machine (Idle/GroupUp/Move/Hold/Attack/Flank/Capture/Retreat) |
+| AI | Finite State Machine (tactical combat + world map) |
+| Diplomacy | WAR / NEUTRAL / FRIENDLY / ALLIANCE with accept/reject |
 | Testing | pytest (93 tests) |
 | Container | Docker + docker-compose |
 
@@ -108,6 +118,7 @@ docker compose --profile headless up --build
 
 ## Controls
 
+### Tactical Battle
 | Key | Action |
 |---|---|
 | **Left Click** | Select a Blue unit |
@@ -123,6 +134,16 @@ docker compose --profile headless up --build
 | **R** | Restart the battle |
 | **N** | Next mission (after victory in campaign) |
 
+### World Map
+| Key | Action |
+|---|---|
+| **Left Click** | Select general / Move selected general |
+| **SPACE** | End turn |
+| **D** | Open diplomacy panel |
+| **N/P** | Cycle diplomacy target nation |
+| **1-4** | War / Neutral / Friendly / Alliance proposal |
+| **ESC** | Close panel / Quit |
+
 ---
 
 ## Project Structure
@@ -133,11 +154,14 @@ My_mvp_game/
 ├── map.py               # TacticalMap — tile grid with terrain generation and villages
 ├── pathfinding.py       # A* pathfinding with terrain cost awareness
 ├── units.py             # Unit class with collision, pathfinder, combat
-├── ai.py                # State-machine AI (UnitAI + AIController) with village capture
+├── ai.py                # State-machine AI (UnitAI + AIController) with tactical behavior
 ├── engine.py            # Game loop, multi-select, food system, village capture, HUD
 ├── main.py              # Entry point with menu
-├── menu.py              # Main menu + campaign selection screens
+├── menu.py              # Main menu, campaign select, victory screen
 ├── campaigns.py         # 4 campaign mission definitions and maps
+├── world_data.py        # World map nations, regions, generals, territory grid
+├── world_map.py         # World map screen with movement, capture, battles
+├── diplomacy.py         # WAR/NEUTRAL/FRIENDLY/ALLIANCE diplomacy system
 ├── requirements.txt     # pygame-ce dependency
 ├── test_tactics.py      # 93 unit, integration, and edge-case tests
 ├── Dockerfile           # Docker image (X11 + dummy driver support)
