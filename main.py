@@ -45,6 +45,10 @@ def main():
                 continue
             else:
                 break
+        elif result == "world_map":
+            from world_map import WorldMapScreen
+            world_screen = WorldMapScreen()
+            world_screen.run()
         else:
             break
 

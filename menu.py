@@ -65,7 +65,8 @@ class MainMenu:
         self.buttons = [
             MenuButton(btn_x, start_y, btn_w, btn_h, "КАМПАНИЯ"),
             MenuButton(btn_x, start_y + 75, btn_w, btn_h, "СРАЖЕНИЕ"),
-            MenuButton(btn_x, start_y + 150, btn_w, btn_h, "ОНЛАЙН", locked=True),
+            MenuButton(btn_x, start_y + 150, btn_w, btn_h, "ГЛОБАЛЬНАЯ КАРТА"),
+            MenuButton(btn_x, start_y + 225, btn_w, btn_h, "ОНЛАЙН", locked=True),
         ]
 
         self.result: Optional[str] = None
@@ -113,6 +114,9 @@ class MainMenu:
             self.result = "battle"
             self.running = False
         elif self.buttons[2].is_clicked(mx, my):
+            self.result = "world_map"
+            self.running = False
+        elif self.buttons[3].is_clicked(mx, my):
             self._show_message = "В РАЗРАБОТКЕ"
             self._message_timer = 2.0
 
