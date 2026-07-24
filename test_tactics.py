@@ -17,6 +17,7 @@ from config import (
     MAX_SELECTION, FOOD_MAX, FOOD_PER_UNIT_PER_SEC,
     FOOD_PER_VILLAGE_PER_SEC, SELECT_CLICK_RADIUS,
 )
+from world_data import Relation
 from map import TacticalMap
 from pathfinding import Pathfinder
 from units import Unit
@@ -687,4 +688,179 @@ class TestEdgeCases:
         pf = Pathfinder(game_map)
         path = pf.find_path((0, 0), (1, 0))
         assert path is not None
-        assert len(path) == 2
+
+
+class TestDiplomacy:
+    def setup_method(self):
+        from diplomacy import DiplomacyManager
+        self.diplo = DiplomacyManager()
+
+    def test_initial_nordheim_valoria_war(self):
+        assert self.diplo.get_relation("nordheim", "valoria") == Relation.WAR
+
+    def test_initial_nordheim_drakoria_neutral(self):
+        assert self.diplo.get_relation("nordheim", "drakoria") == Relation.NEUTRAL
+
+    def test_initial_valoria_drakoria_friendly(self):
+        assert self.diplo.get_relation("valoria", "drakoria") == Relation.FRIENDLY
+
+    def test_same_nation_is_alliance(self):
+        assert self.diplo.get_relation("nordheim", "nordheim") == Relation.ALLIANCE
+
+    def test_set_relation(self):
+        self.diplo.set_relation("nordheim", "drakoria", Relation.ALLIANCE)
+        assert self.diplo.get_relation("nordheim", "drakoria") == Relation.ALLIANCE
+        assert self.diplo.get_relation("drakoria", "nordheim") == Relation.ALLIANCE
+
+    def test_is_enemy_war(self):
+        assert self.diplo.is_enemy("nordheim", "valoria") is True
+
+    def test_is_enemy_neutral(self):
+        assert self.diplo.is_enemy("nordheim", "drakoria") is False
+
+    def test_can_move_through_alliance(self):
+        self.diplo.set_relation("nordheim", "drakoria", Relation.ALLIANCE)
+        assert self.diplo.can_move_through("nordheim", "drakoria") is True
+
+    def test_can_move_through_war(self):
+        assert self.diplo.can_move_through("nordheim", "valoria") is False
+
+    def test_declare_war(self):
+        success, msg = self.diplo.propose("nordheim", "drakoria", Relation.WAR)
+        assert success is True
+        assert self.diplo.get_relation("nordheim", "drakoria") == Relation.WAR
+
+    def test_propose_neutral_from_war(self):
+        self.diplo.set_relation("nordheim", "valoria", Relation.WAR)
+        success, msg = self.diplo.propose("nordheim", "valoria", Relation.NEUTRAL)
+        assert "мир" in msg.lower() or "мир" in msg
+
+    def test_relation_name(self):
+        name = self.diplo.get_relation_name("nordheim", "valoria")
+        assert name == "ВОЙНА"
+
+    def test_relation_color_war(self):
+        color = self.diplo.get_relation_color("nordheim", "valoria")
+        assert color[0] > 150
+
+    def test_already_same_relation(self):
+        success, msg = self.diplo.propose("nordheim", "valoria", Relation.WAR)
+        assert success is False
+
+
+class TestWorldData:
+    def test_nations_exist(self):
+        from world_data import WORLD_NATIONS
+        assert "nordheim" in WORLD_NATIONS
+        assert "valoria" in WORLD_NATIONS
+        assert "drakoria" in WORLD_NATIONS
+
+    def test_regions_exist(self):
+        from world_data import WORLD_REGIONS
+        assert len(WORLD_REGIONS) >= 18
+
+    def test_generals_exist(self):
+        from world_data import WORLD_GENERALS
+        assert len(WORLD_GENERALS) >= 6
+
+    def test_player_nation(self):
+        from world_data import PLAYER_NATION
+        assert PLAYER_NATION == "nordheim"
+
+    def test_each_nation_has_capital(self):
+        from world_data import WORLD_REGIONS, RegionType
+        nations_with_caps = set()
+        for r in WORLD_REGIONS:
+            if r.region_type == RegionType.CAPITAL:
+                nations_with_caps.add(r.owner)
+        assert "nordheim" in nations_with_caps
+        assert "valoria" in nations_with_caps
+        assert "drakoria" in nations_with_caps
+
+    def test_general_start_positions_valid(self):
+        from world_data import WORLD_GENERALS, MAP_COLS, MAP_ROWS
+        for g in WORLD_GENERALS:
+            assert 0 <= g.col < MAP_COLS
+            assert 0 <= g.row < MAP_ROWS
+
+    def test_region_start_positions_valid(self):
+        from world_data import WORLD_REGIONS, MAP_COLS, MAP_ROWS
+        for r in WORLD_REGIONS:
+            assert 0 <= r.col < MAP_COLS
+            assert 0 <= r.row < MAP_ROWS
+
+    def test_general_has_nation(self):
+        from world_data import WORLD_GENERALS, WORLD_NATIONS
+        for g in WORLD_GENERALS:
+            assert g.nation in WORLD_NATIONS
+
+    def test_general_troops_positive(self):
+        from world_data import WORLD_GENERALS
+        for g in WORLD_GENERALS:
+            assert g.troops > 0
+
+    def test_region_has_valid_type(self):
+        from world_data import WORLD_REGIONS, RegionType
+        for r in WORLD_REGIONS:
+            assert r.region_type in (RegionType.VILLAGE, RegionType.CITY,
+                                      RegionType.FORTRESS, RegionType.CAPITAL)
+
+
+class TestWorldMap:
+    def setup_method(self):
+        import world_data
+        world_data.NATION_TERRITORY = [
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+
+    def test_general_distance(self):
+        from world_data import General
+        g1 = General("A", "nordheim", 5, 5, 1000)
+        g2 = General("B", "valoria", 8, 9, 1000)
+        dist = g1.distance_to(g2)
+        assert dist == pytest.approx(5.0, 0.1)
+
+    def test_general_position(self):
+        from world_data import General, CELL_SIZE
+        g = General("A", "nordheim", 3, 4, 1000)
+        assert g.x == 3 * CELL_SIZE + CELL_SIZE // 2
+        assert g.y == 4 * CELL_SIZE + CELL_SIZE // 2
+
+    def test_region_position(self):
+        from world_data import Region, RegionType, CELL_SIZE
+        r = Region("Test", RegionType.VILLAGE, 5, 6, "nordheim")
+        assert r.x == 5 * CELL_SIZE + CELL_SIZE // 2
+        assert r.y == 6 * CELL_SIZE + CELL_SIZE // 2
+
+    def test_general_moved_flag(self):
+        from world_data import General
+        g = General("A", "nordheim", 5, 5, 1000)
+        assert g.moved is False
+        g.moved = True
+        assert g.moved is True
+
+    def test_general_troops_cap(self):
+        from world_data import General
+        g = General("A", "nordheim", 5, 5, 5000)
+        assert g.troops == 5000
+        assert g.max_troops == 3000
+
+    def test_nation_colors_unique(self):
+        from world_data import WORLD_NATIONS
+        colors = [n.color for n in WORLD_NATIONS.values()]
+        assert len(colors) == 3

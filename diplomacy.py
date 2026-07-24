@@ -57,7 +57,7 @@ class DiplomacyManager:
 
         if proposal == Relation.FRIENDLY:
             if current == Relation.NEUTRAL:
-                if self._accept Friendship(target, proposer):
+                if self._accept_friendship(target, proposer):
                     self.set_relation(proposer, target, Relation.FRIENDLY)
                     return True, f"{WORLD_NATIONS[target].name} приняла дружбу!"
                 else:
