@@ -1,61 +1,21 @@
 import pygame
 import sys
 import math
+import random
 from typing import Optional, List, Tuple
 from world_data import (
     CELL_SIZE, MAP_COLS, MAP_ROWS, SCREEN_WIDTH, SCREEN_HEIGHT,
-    COLOR_OCEAN, COLOR_OCEAN_LIGHT, COLOR_LAND, COLOR_LAND_DARK,
-    COLOR_BORDER, COLOR_GRID, COLOR_NEUTRAL_REGION,
-    COLOR_FORTRESS, COLOR_CAPITAL, COLOR_HUD_BG, COLOR_HUD_TEXT,
+    T_WATER, T_LAND, T_RIVER, T_BRIDGE,
+    WORLD_MAP, RIVER_WEST, RIVER_EAST, BRIDGES,
+    NATION_TERRITORY, NATION_ID,
+    COLOR_OCEAN, COLOR_OCEAN_LIGHT, COLOR_LAND, COLOR_RIVER,
+    COLOR_BRIDGE, COLOR_NEUTRAL, COLOR_HUD_BG, COLOR_HUD_TEXT,
     COLOR_HUD_TEXT_DIM, COLOR_WHITE, COLOR_BLACK,
     COLOR_GENERAL_SELECTED, COLOR_GENERAL_MOVABLE, COLOR_GENERAL_DONE,
-    COLOR_MENU_BG, COLOR_MENU_TITLE, COLOR_MENU_BUTTON,
-    COLOR_MENU_BUTTON_HOVER, COLOR_MENU_BUTTON_TEXT, COLOR_MENU_SUBTITLE,
-    WORLD_NATIONS, WORLD_REGIONS, WORLD_GENERALS,
-    PLAYER_NATION, RegionType, General, Nation, Region,
+    WORLD_NATIONS, WORLD_REGIONS, WORLD_GENERALS, PLAYER_NATION,
+    RegionType, General,
 )
 from diplomacy import DiplomacyManager, Relation
-
-
-WORLD_MAP = [
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-]
-
-NATION_TERRITORY = [
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-]
-
-NATION_ID = {"nordheim": 1, "valoria": 2, "drakoria": 3}
 
 
 class WorldMapScreen:
@@ -72,23 +32,19 @@ class WorldMapScreen:
         self.font_region = pygame.font.SysFont(None, 12)
 
         self.diplomacy = DiplomacyManager()
-        self.regions: List[Region] = [Region(r.name, r.region_type, r.col, r.row, r.owner)
-                                       for r in WORLD_REGIONS]
-        self.generals: List[General] = [General(g.name, g.nation, g.col, g.row, g.troops)
-                                         for g in WORLD_GENERALS]
+        self.regions = [Region(r.name, r.region_type, r.col, r.row, r.owner)
+                        for r in WORLD_REGIONS]
+        self.generals = [General(g.name, g.nation, g.col, g.row, g.troops)
+                         for g in WORLD_GENERALS]
 
         self.selected_general: Optional[General] = None
         self._turn = 1
-        self._phase = "player"
         self._show_diplomacy = False
         self._diplomacy_target: Optional[str] = None
         self._battle_result: Optional[str] = None
         self._battle_timer = 0.0
         self._game_over = False
         self._winner: Optional[str] = None
-
-        self._camera_x = 0
-        self._camera_y = 0
 
     def run(self) -> Optional[str]:
         while self.running:
@@ -140,40 +96,31 @@ class WorldMapScreen:
         col = mx // CELL_SIZE
         row = my // CELL_SIZE
 
-        for g in self.generals:
-            if g.nation == PLAYER_NATION and not g.moved:
-                if abs(g.col - col) <= 0 and abs(g.row - row) <= 0:
-                    self.selected_general = g
-                    return
-
         if self.selected_general:
-            dist = math.hypot(self.selected_general.col - col,
-                              self.selected_general.row - row)
-            if dist <= 2:
-                self._move_general(self.selected_general, col, row)
+            g = self.selected_general
+            dist = math.hypot(g.col - col, g.row - row)
+            if dist <= 2 and not g.moved:
+                self._move_general(g, col, row)
                 self.selected_general = None
+            else:
+                for gen in self.generals:
+                    if gen.nation == PLAYER_NATION and not gen.moved:
+                        if gen.col == col and gen.row == row:
+                            self.selected_general = gen
+                            return
+                self.selected_general = None
+        else:
+            for gen in self.generals:
+                if gen.nation == PLAYER_NATION and not gen.moved:
+                    if gen.col == col and gen.row == row:
+                        self.selected_general = gen
+                        return
 
     def _move_general(self, general: General, col: int, row: int):
         if not (0 <= col < MAP_COLS and 0 <= row < MAP_ROWS):
             return
-        if WORLD_MAP[row][col] == 0:
+        if WORLD_MAP[row][col] == T_WATER:
             return
-
-        territory = NATION_TERRITORY[row][col]
-        owner_nation = None
-        for n, nid in NATION_ID.items():
-            if nid == territory:
-                owner_nation = n
-                break
-
-        if owner_nation and owner_nation != general.nation:
-            rel = self.diplomacy.get_relation(general.nation, owner_nation)
-            if rel == Relation.WAR:
-                pass
-            elif rel in (Relation.FRIENDLY, Relation.ALLIANCE):
-                return
-            else:
-                return
 
         for g in self.generals:
             if g is not general and g.nation != general.nation:
@@ -186,18 +133,19 @@ class WorldMapScreen:
         general.col = col
         general.row = row
         general.moved = True
-
         self._try_capture_region(general)
 
     def _try_capture_region(self, general: General):
         for region in self.regions:
             if region.col == general.col and region.row == general.row:
-                if region.owner != general.nation:
+                if region.owner != general.nation and region.owner != "neutral":
                     rel = self.diplomacy.get_relation(general.nation, region.owner)
-                    if rel == Relation.WAR or region.owner == "neutral":
-                        region.owner = general.nation
-                        NATION_TERRITORY[region.row][region.col] = NATION_ID[general.nation]
-                        self._expand_territory(general.nation, region.col, region.row)
+                    if rel != Relation.WAR:
+                        return
+                if region.owner != general.nation:
+                    region.owner = general.nation
+                    NATION_TERRITORY[region.row][region.col] = NATION_ID[general.nation]
+                    self._expand_territory(general.nation, region.col, region.row)
 
     def _expand_territory(self, nation: str, center_col: int, center_row: int):
         nid = NATION_ID[nation]
@@ -205,14 +153,13 @@ class WorldMapScreen:
             for dc in range(-1, 2):
                 r, c = center_row + dr, center_col + dc
                 if 0 <= r < MAP_ROWS and 0 <= c < MAP_COLS:
-                    if WORLD_MAP[r][c] == 1 and NATION_TERRITORY[r][c] == 0:
+                    if WORLD_MAP[r][c] == T_LAND and NATION_TERRITORY[r][c] == 0:
                         NATION_TERRITORY[r][c] = nid
 
     def _start_battle(self, attacker: General, defender: General):
         a_power = attacker.troops * (attacker.health / 100)
         d_power = defender.troops * (defender.health / 100)
 
-        import random
         a_roll = a_power * random.uniform(0.7, 1.3)
         d_roll = d_power * random.uniform(0.7, 1.3)
 
@@ -223,19 +170,18 @@ class WorldMapScreen:
             defender.troops = max(0, defender.troops - int(defender.troops * 0.7))
             if defender.troops <= 0:
                 self.generals.remove(defender)
-                self._battle_result = f"{attacker.name} победил {defender.name}!"
+                self._battle_result = f"{attacker.name} defeated {defender.name}!"
             else:
-                self._battle_result = f"{attacker.name} отбил атаку, потери: {losses}"
+                self._battle_result = f"{attacker.name} repelled, lost {losses}"
             defender.health = max(0, defender.health - 20)
         else:
-            ratio = a_roll / d_roll if d_roll > 0 else 0
             losses = int(attacker.troops * 0.5)
             attacker.troops = max(0, attacker.troops - losses)
             if attacker.troops <= 0:
                 self.generals.remove(attacker)
-                self._battle_result = f"{defender.name} разбил {attacker.name}!"
+                self._battle_result = f"{defender.name} destroyed {attacker.name}!"
             else:
-                self._battle_result = f"{attacker.name} отступил, потери: {losses}"
+                self._battle_result = f"{attacker.name} retreated, lost {losses}"
 
         self._battle_timer = 3.0
 
@@ -263,7 +209,6 @@ class WorldMapScreen:
         self._turn += 1
         for g in self.generals:
             g.moved = False
-
         self._ai_turn()
 
     def _ai_turn(self):
@@ -275,28 +220,39 @@ class WorldMapScreen:
         enemies = [e for e in self.generals
                    if e.nation != general.nation
                    and self.diplomacy.is_enemy(general.nation, e.nation)]
-        if enemies:
-            nearest = min(enemies, key=lambda e: general.distance_to(e))
-            if general.distance_to(nearest) <= 3:
-                dx = nearest.col - general.col
-                dy = nearest.row - general.row
-                dist = math.hypot(dx, dy)
-                if dist > 0:
-                    move_col = general.col + round(dx / dist)
-                    move_row = general.row + round(dy / dist)
-                    if 0 <= move_col < MAP_COLS and 0 <= move_row < MAP_ROWS:
-                        if WORLD_MAP[move_row][move_col] == 1:
-                            for eg in self.generals:
-                                if eg is not general and eg.nation != general.nation:
-                                    if abs(eg.col - move_col) <= 1 and abs(eg.row - move_row) <= 1:
-                                        if self.diplomacy.is_enemy(general.nation, eg.nation):
-                                            self._start_battle(general, eg)
-                                            general.moved = True
-                                            return
-                            general.col = move_col
-                            general.row = move_row
-                            general.moved = True
-                            self._try_capture_region(general)
+        if not enemies:
+            return
+
+        nearest = min(enemies, key=lambda e: general.distance_to(e))
+        if general.distance_to(nearest) > 4:
+            return
+
+        dx = nearest.col - general.col
+        dy = nearest.row - general.row
+        dist = math.hypot(dx, dy)
+        if dist == 0:
+            return
+
+        move_col = general.col + round(dx / dist)
+        move_row = general.row + round(dy / dist)
+
+        if not (0 <= move_col < MAP_COLS and 0 <= move_row < MAP_ROWS):
+            return
+        if WORLD_MAP[move_row][move_col] == T_WATER:
+            return
+
+        for eg in self.generals:
+            if eg is not general and eg.nation != general.nation:
+                if abs(eg.col - move_col) <= 1 and abs(eg.row - move_row) <= 1:
+                    if self.diplomacy.is_enemy(general.nation, eg.nation):
+                        self._start_battle(general, eg)
+                        general.moved = True
+                        return
+
+        general.col = move_col
+        general.row = move_row
+        general.moved = True
+        self._try_capture_region(general)
 
     def _update(self, dt: float):
         if self._battle_timer > 0:
@@ -320,32 +276,47 @@ class WorldMapScreen:
             for col in range(MAP_COLS):
                 x = col * CELL_SIZE
                 y = row * CELL_SIZE
+                tile = WORLD_MAP[row][col]
 
-                if WORLD_MAP[row][col] == 0:
+                if tile == T_WATER:
                     shade = ((row + col) % 2) * 5
-                    color = (COLOR_OCEAN_LIGHT[0] + shade,
-                             COLOR_OCEAN_LIGHT[1] + shade,
-                             COLOR_OCEAN_LIGHT[2] + shade)
-                    pygame.draw.rect(self.screen, color, (x, y, CELL_SIZE, CELL_SIZE))
-                    continue
+                    c = (COLOR_OCEAN_LIGHT[0] + shade,
+                         COLOR_OCEAN_LIGHT[1] + shade,
+                         COLOR_OCEAN_LIGHT[2] + shade)
+                    pygame.draw.rect(self.screen, c, (x, y, CELL_SIZE, CELL_SIZE))
+                elif tile == T_RIVER:
+                    pygame.draw.rect(self.screen, COLOR_RIVER, (x, y, CELL_SIZE, CELL_SIZE))
+                    wave = math.sin((row + col) * 0.8 + pygame.time.get_ticks() * 0.003) * 15
+                    wc = (COLOR_RIVER[0] + int(wave), COLOR_RIVER[1] + int(wave), COLOR_RIVER[2] + int(wave))
+                    pygame.draw.rect(self.screen, wc, (x + 4, y + 4, CELL_SIZE - 8, CELL_SIZE - 8))
+                elif tile == T_BRIDGE:
+                    pygame.draw.rect(self.screen, COLOR_RIVER, (x, y, CELL_SIZE, CELL_SIZE))
+                    bw = CELL_SIZE - 8
+                    bh = CELL_SIZE - 8
+                    pygame.draw.rect(self.screen, COLOR_BRIDGE, (x + 4, y + 4, bw, bh))
+                    pygame.draw.rect(self.screen, COLOR_WHITE, (x + 4, y + 4, bw, bh), 2)
+                    for i in range(3):
+                        lx = x + 8 + i * (bw // 3)
+                        pygame.draw.line(self.screen, COLOR_BLACK, (lx, y + 4), (lx, y + CELL_SIZE - 4), 1)
+                elif tile == T_LAND:
+                    territory = NATION_TERRITORY[row][col]
+                    if territory == 1:
+                        base = WORLD_NATIONS["red"].color
+                    elif territory == 2:
+                        base = WORLD_NATIONS["blue"].color
+                    elif territory == 3:
+                        base = WORLD_NATIONS["green"].color
+                    else:
+                        base = COLOR_LAND
 
-                territory = NATION_TERRITORY[row][col]
-                if territory == 1:
-                    base = WORLD_NATIONS["nordheim"].color
-                elif territory == 2:
-                    base = WORLD_NATIONS["valoria"].color
-                elif territory == 3:
-                    base = WORLD_NATIONS["drakoria"].color
-                else:
-                    base = COLOR_LAND
-
-                shade = ((row + col) % 2) * 8
-                land_color = (base[0] + shade, base[1] + shade, base[2] + shade)
-                pygame.draw.rect(self.screen, land_color, (x, y, CELL_SIZE, CELL_SIZE))
-                pygame.draw.rect(self.screen, COLOR_GRID, (x, y, CELL_SIZE, CELL_SIZE), 1)
+                    shade = ((row + col) % 2) * 8
+                    c = (base[0] + shade, base[1] + shade, base[2] + shade)
+                    pygame.draw.rect(self.screen, c, (x, y, CELL_SIZE, CELL_SIZE))
+                    pygame.draw.rect(self.screen, COLOR_NEUTRAL, (x, y, CELL_SIZE, CELL_SIZE), 1)
 
         for region in self.regions:
-            self._render_region(region)
+            if WORLD_MAP[region.row][region.col] != T_WATER:
+                self._render_region(region)
 
         for general in self.generals:
             self._render_general(general)
@@ -370,24 +341,20 @@ class WorldMapScreen:
         nation = WORLD_NATIONS.get(region.owner)
         if nation:
             color = nation.light_color
+        elif region.owner == "neutral":
+            color = COLOR_NEUTRAL
         else:
-            color = COLOR_NEUTRAL_REGION
+            color = COLOR_LAND
 
         if region.region_type == RegionType.CAPITAL:
             size = 10
             pygame.draw.circle(self.screen, color, (x, y), size)
             pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), size, 2)
-            inner = 6
-            pygame.draw.circle(self.screen, (255, 220, 100), (x, y), inner)
+            pygame.draw.circle(self.screen, (255, 220, 100), (x, y), 6)
         elif region.region_type == RegionType.CITY:
             size = 8
             pygame.draw.circle(self.screen, color, (x, y), size)
             pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), size, 1)
-        elif region.region_type == RegionType.FORTRESS:
-            half = 7
-            rect = pygame.Rect(x - half, y - half, half * 2, half * 2)
-            pygame.draw.rect(self.screen, color, rect)
-            pygame.draw.rect(self.screen, COLOR_WHITE, rect, 1)
         else:
             size = 5
             pygame.draw.circle(self.screen, color, (x, y), size)
@@ -418,17 +385,13 @@ class WorldMapScreen:
         pygame.draw.circle(self.screen, color, (x, y), 10)
         pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), 10, 1)
 
-        star_points = []
         for i in range(5):
             angle = math.radians(i * 72 - 90)
             sx = x + math.cos(angle) * 5
             sy = y + math.sin(angle) * 5
-            star_points.append((sx, sy))
             angle2 = math.radians(i * 72 + 36 - 90)
             sx2 = x + math.cos(angle2) * 2.5
             sy2 = y + math.sin(angle2) * 2.5
-            star_points.append((sx2, sy2))
-        pygame.draw.polygon(self.screen, COLOR_WHITE, star_points)
 
         label = self.font_region.render(f"{general.name} ({general.troops})", True, COLOR_WHITE)
         lx = x - label.get_width() // 2
@@ -467,7 +430,7 @@ class WorldMapScreen:
         for r in self.regions:
             regions_count[r.owner] = regions_count.get(r.owner, 0) + 1
         rx = SCREEN_WIDTH - 12
-        for nation_key in ["nordheim", "valoria", "drakoria"]:
+        for nation_key in ["red", "blue", "green"]:
             count = regions_count.get(nation_key, 0)
             n = WORLD_NATIONS[nation_key]
             rt = self.font_hud.render(f"{n.name}: {count}", True, n.color)
@@ -493,7 +456,7 @@ class WorldMapScreen:
         pygame.draw.rect(self.screen, (40, 35, 30), (px, py, pw, ph), border_radius=8)
         pygame.draw.rect(self.screen, COLOR_WHITE, (px, py, pw, ph), 2, border_radius=8)
 
-        title = self.font_title.render("DIPLOMACY", True, COLOR_MENU_TITLE)
+        title = self.font_title.render("DIPLOMACY", True, (220, 200, 160))
         self.screen.blit(title, (px + pw // 2 - title.get_width() // 2, py + 10))
 
         if self._diplomacy_target:
@@ -528,7 +491,7 @@ class WorldMapScreen:
             no_target = self.font_hud.render("Press N/P to select target", True, COLOR_HUD_TEXT_DIM)
             self.screen.blit(no_target, (px + 20, py + 60))
 
-        hint = self.font_small.render("N: next | P: prev | 1-4: action | ESC: close", True, COLOR_MENU_SUBTITLE)
+        hint = self.font_small.render("N: next | P: prev | 1-4: action | ESC: close", True, (170, 155, 130))
         self.screen.blit(hint, (px + 20, py + ph - 30))
 
     def _render_battle_result(self):

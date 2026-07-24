@@ -695,65 +695,65 @@ class TestDiplomacy:
         from diplomacy import DiplomacyManager
         self.diplo = DiplomacyManager()
 
-    def test_initial_nordheim_valoria_war(self):
-        assert self.diplo.get_relation("nordheim", "valoria") == Relation.WAR
+    def test_initial_red_blue_war(self):
+        assert self.diplo.get_relation("red", "blue") == Relation.WAR
 
-    def test_initial_nordheim_drakoria_neutral(self):
-        assert self.diplo.get_relation("nordheim", "drakoria") == Relation.NEUTRAL
+    def test_initial_red_green_neutral(self):
+        assert self.diplo.get_relation("red", "green") == Relation.NEUTRAL
 
-    def test_initial_valoria_drakoria_friendly(self):
-        assert self.diplo.get_relation("valoria", "drakoria") == Relation.FRIENDLY
+    def test_initial_blue_green_friendly(self):
+        assert self.diplo.get_relation("blue", "green") == Relation.FRIENDLY
 
     def test_same_nation_is_alliance(self):
-        assert self.diplo.get_relation("nordheim", "nordheim") == Relation.ALLIANCE
+        assert self.diplo.get_relation("red", "red") == Relation.ALLIANCE
 
     def test_set_relation(self):
-        self.diplo.set_relation("nordheim", "drakoria", Relation.ALLIANCE)
-        assert self.diplo.get_relation("nordheim", "drakoria") == Relation.ALLIANCE
-        assert self.diplo.get_relation("drakoria", "nordheim") == Relation.ALLIANCE
+        self.diplo.set_relation("red", "green", Relation.ALLIANCE)
+        assert self.diplo.get_relation("red", "green") == Relation.ALLIANCE
+        assert self.diplo.get_relation("green", "red") == Relation.ALLIANCE
 
     def test_is_enemy_war(self):
-        assert self.diplo.is_enemy("nordheim", "valoria") is True
+        assert self.diplo.is_enemy("red", "blue") is True
 
     def test_is_enemy_neutral(self):
-        assert self.diplo.is_enemy("nordheim", "drakoria") is False
+        assert self.diplo.is_enemy("red", "green") is False
 
     def test_can_move_through_alliance(self):
-        self.diplo.set_relation("nordheim", "drakoria", Relation.ALLIANCE)
-        assert self.diplo.can_move_through("nordheim", "drakoria") is True
+        self.diplo.set_relation("red", "green", Relation.ALLIANCE)
+        assert self.diplo.can_move_through("red", "green") is True
 
     def test_can_move_through_war(self):
-        assert self.diplo.can_move_through("nordheim", "valoria") is False
+        assert self.diplo.can_move_through("red", "blue") is False
 
     def test_declare_war(self):
-        success, msg = self.diplo.propose("nordheim", "drakoria", Relation.WAR)
+        success, msg = self.diplo.propose("red", "green", Relation.WAR)
         assert success is True
-        assert self.diplo.get_relation("nordheim", "drakoria") == Relation.WAR
+        assert self.diplo.get_relation("red", "green") == Relation.WAR
 
     def test_propose_neutral_from_war(self):
-        self.diplo.set_relation("nordheim", "valoria", Relation.WAR)
-        success, msg = self.diplo.propose("nordheim", "valoria", Relation.NEUTRAL)
+        self.diplo.set_relation("red", "blue", Relation.WAR)
+        success, msg = self.diplo.propose("red", "blue", Relation.NEUTRAL)
         assert "мир" in msg.lower() or "мир" in msg
 
     def test_relation_name(self):
-        name = self.diplo.get_relation_name("nordheim", "valoria")
+        name = self.diplo.get_relation_name("red", "blue")
         assert name == "ВОЙНА"
 
     def test_relation_color_war(self):
-        color = self.diplo.get_relation_color("nordheim", "valoria")
+        color = self.diplo.get_relation_color("red", "blue")
         assert color[0] > 150
 
     def test_already_same_relation(self):
-        success, msg = self.diplo.propose("nordheim", "valoria", Relation.WAR)
+        success, msg = self.diplo.propose("red", "blue", Relation.WAR)
         assert success is False
 
 
 class TestWorldData:
     def test_nations_exist(self):
         from world_data import WORLD_NATIONS
-        assert "nordheim" in WORLD_NATIONS
-        assert "valoria" in WORLD_NATIONS
-        assert "drakoria" in WORLD_NATIONS
+        assert "red" in WORLD_NATIONS
+        assert "blue" in WORLD_NATIONS
+        assert "green" in WORLD_NATIONS
 
     def test_regions_exist(self):
         from world_data import WORLD_REGIONS
@@ -765,7 +765,7 @@ class TestWorldData:
 
     def test_player_nation(self):
         from world_data import PLAYER_NATION
-        assert PLAYER_NATION == "nordheim"
+        assert PLAYER_NATION == "blue"
 
     def test_each_nation_has_capital(self):
         from world_data import WORLD_REGIONS, RegionType
@@ -773,9 +773,9 @@ class TestWorldData:
         for r in WORLD_REGIONS:
             if r.region_type == RegionType.CAPITAL:
                 nations_with_caps.add(r.owner)
-        assert "nordheim" in nations_with_caps
-        assert "valoria" in nations_with_caps
-        assert "drakoria" in nations_with_caps
+        assert "red" in nations_with_caps
+        assert "blue" in nations_with_caps
+        assert "green" in nations_with_caps
 
     def test_general_start_positions_valid(self):
         from world_data import WORLD_GENERALS, MAP_COLS, MAP_ROWS
@@ -803,7 +803,7 @@ class TestWorldData:
         from world_data import WORLD_REGIONS, RegionType
         for r in WORLD_REGIONS:
             assert r.region_type in (RegionType.VILLAGE, RegionType.CITY,
-                                      RegionType.FORTRESS, RegionType.CAPITAL)
+                                      RegionType.CAPITAL)
 
 
 class TestWorldMap:
@@ -830,33 +830,33 @@ class TestWorldMap:
 
     def test_general_distance(self):
         from world_data import General
-        g1 = General("A", "nordheim", 5, 5, 1000)
-        g2 = General("B", "valoria", 8, 9, 1000)
+        g1 = General("A", "red", 5, 5, 1000)
+        g2 = General("B", "blue", 8, 9, 1000)
         dist = g1.distance_to(g2)
         assert dist == pytest.approx(5.0, 0.1)
 
     def test_general_position(self):
         from world_data import General, CELL_SIZE
-        g = General("A", "nordheim", 3, 4, 1000)
+        g = General("A", "red", 3, 4, 1000)
         assert g.x == 3 * CELL_SIZE + CELL_SIZE // 2
         assert g.y == 4 * CELL_SIZE + CELL_SIZE // 2
 
     def test_region_position(self):
         from world_data import Region, RegionType, CELL_SIZE
-        r = Region("Test", RegionType.VILLAGE, 5, 6, "nordheim")
+        r = Region("Test", RegionType.VILLAGE, 5, 6, "red")
         assert r.x == 5 * CELL_SIZE + CELL_SIZE // 2
         assert r.y == 6 * CELL_SIZE + CELL_SIZE // 2
 
     def test_general_moved_flag(self):
         from world_data import General
-        g = General("A", "nordheim", 5, 5, 1000)
+        g = General("A", "red", 5, 5, 1000)
         assert g.moved is False
         g.moved = True
         assert g.moved is True
 
     def test_general_troops_cap(self):
         from world_data import General
-        g = General("A", "nordheim", 5, 5, 5000)
+        g = General("A", "red", 5, 5, 5000)
         assert g.troops == 5000
         assert g.max_troops == 3000
 

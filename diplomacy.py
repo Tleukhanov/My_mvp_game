@@ -11,13 +11,13 @@ class DiplomacyManager:
         nations = list(WORLD_NATIONS.keys())
         for i, n1 in enumerate(nations):
             for n2 in nations[i + 1:]:
-                if n1 == "nordheim" and n2 == "valoria":
+                if n1 == "red" and n2 == "blue":
                     self._relations[(n1, n2)] = Relation.WAR
                     self._relations[(n2, n1)] = Relation.WAR
-                elif n1 == "nordheim" and n2 == "drakoria":
+                elif n1 == "red" and n2 == "green":
                     self._relations[(n1, n2)] = Relation.NEUTRAL
                     self._relations[(n2, n1)] = Relation.NEUTRAL
-                elif n1 == "valoria" and n2 == "drakoria":
+                elif n1 == "blue" and n2 == "green":
                     self._relations[(n1, n2)] = Relation.FRIENDLY
                     self._relations[(n2, n1)] = Relation.FRIENDLY
 

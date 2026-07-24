@@ -14,7 +14,6 @@ class Relation(Enum):
 class RegionType(Enum):
     VILLAGE = auto()
     CITY = auto()
-    FORTRESS = auto()
     CAPITAL = auto()
 
 
@@ -25,7 +24,6 @@ class Nation:
         self.color = color
         self.light_color = light_color
         self.gold = 500
-        self.army_size = 0
 
 
 class Region:
@@ -37,7 +35,6 @@ class Region:
         self.row = row
         self.owner = owner
         self.troops = 0
-        self.fortification = 0
 
     @property
     def x(self):
@@ -81,28 +78,136 @@ MAP_ROWS = 16
 SCREEN_WIDTH = MAP_COLS * CELL_SIZE
 SCREEN_HEIGHT = MAP_ROWS * CELL_SIZE + 80
 
+T_WATER = 0
+T_LAND = 1
+T_RIVER = 2
+T_BRIDGE = 3
+
+WORLD_MAP = [
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,1,1,1,1,0,0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
+    [0,1,1,1,1,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
+    [0,1,1,1,1,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0],
+    [0,0,1,1,1,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0],
+    [0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,0,0],
+    [0,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0],
+    [0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+]
+
+RIVER_WEST = [
+    (5,1),(5,2),(5,3),(5,4),(5,5),
+    (6,6),(6,7),
+    (7,8),(7,9),
+    (8,10),(8,11),(8,12),(8,13),(8,14),
+]
+RIVER_EAST = [
+    (17,1),(17,2),
+    (18,3),(18,4),
+    (19,5),(19,6),
+    (20,7),(20,8),(20,9),
+    (21,10),(21,11),(21,12),
+]
+
+BRIDGES = [
+    (5,4),
+    (7,8),
+    (8,13),
+    (18,4),
+    (20,11),
+]
+
+NATION_TERRITORY = [
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,3,3,3,3,0,0],
+    [0,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,3,3,3,3,0,0],
+    [0,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,3,0,0,0],
+    [0,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+]
+
+NATION_ID = {"red": 1, "blue": 2, "green": 3}
+
+WORLD_REGIONS = [
+    Region("Ironhold", RegionType.CAPITAL, 11, 3, "red"),
+    Region("Northwall", RegionType.VILLAGE, 10, 2, "red"),
+    Region("Warfield", RegionType.VILLAGE, 12, 2, "red"),
+    Region("Bloodkeep", RegionType.CITY, 10, 4, "red"),
+    Region("Scarforge", RegionType.VILLAGE, 13, 4, "red"),
+
+    Region("Silverhold", RegionType.CAPITAL, 3, 12, "blue"),
+    Region("Dawnreach", RegionType.VILLAGE, 2, 11, "blue"),
+    Region("Starport", RegionType.VILLAGE, 4, 11, "blue"),
+    Region("Tidewall", RegionType.CITY, 2, 12, "blue"),
+    Region("Mistwood", RegionType.VILLAGE, 3, 13, "blue"),
+    Region("Frostgate", RegionType.VILLAGE, 4, 12, "blue"),
+
+    Region("Verdant", RegionType.CAPITAL, 20, 10, "green"),
+    Region("Leafguard", RegionType.VILLAGE, 19, 9, "green"),
+    Region("Greenvale", RegionType.VILLAGE, 21, 9, "green"),
+    Region("Mosshollow", RegionType.CITY, 19, 11, "green"),
+    Region("Thornridge", RegionType.VILLAGE, 20, 12, "green"),
+
+    Region("Westmere", RegionType.VILLAGE, 2, 3, "neutral"),
+    Region("Ashford", RegionType.VILLAGE, 3, 5, "neutral"),
+    Region("Greywatch", RegionType.VILLAGE, 4, 2, "neutral"),
+    Region("Crossroads", RegionType.CITY, 3, 4, "neutral"),
+    Region("Oldgate", RegionType.VILLAGE, 2, 5, "neutral"),
+    Region("Ruinhold", RegionType.VILLAGE, 1, 3, "neutral"),
+    Region("Dusthollow", RegionType.VILLAGE, 4, 3, "neutral"),
+    Region("Barrowfield", RegionType.VILLAGE, 1, 4, "neutral"),
+
+    Region("Midway", RegionType.CITY, 9, 7, "neutral"),
+    Region("Fords", RegionType.VILLAGE, 8, 9, "neutral"),
+    Region("Clearfield", RegionType.VILLAGE, 10, 6, "neutral"),
+    Region("Stonebar", RegionType.VILLAGE, 12, 7, "neutral"),
+    Region("Eastreach", RegionType.VILLAGE, 14, 8, "neutral"),
+    Region("Marshpoint", RegionType.VILLAGE, 11, 9, "neutral"),
+    Region("Dirtford", RegionType.VILLAGE, 13, 6, "neutral"),
+    Region("Windswept", RegionType.VILLAGE, 15, 7, "neutral"),
+]
+
+WORLD_GENERALS = [
+    General("Volkov", "red", 11, 3, 1200),
+    General("Korzh", "red", 12, 4, 800),
+    General("Aldric", "blue", 3, 12, 1100),
+    General("Brenna", "blue", 2, 12, 900),
+    General("Theron", "green", 20, 10, 1000),
+    General("Lyra", "green", 19, 10, 800),
+]
+
+PLAYER_NATION = "blue"
 
 COLOR_OCEAN = (40, 70, 120)
 COLOR_OCEAN_LIGHT = (50, 85, 140)
 COLOR_LAND = (160, 150, 120)
-COLOR_LAND_DARK = (140, 130, 100)
-COLOR_BORDER = (200, 190, 170)
-COLOR_GRID = (150, 140, 115)
+COLOR_RIVER = (50, 100, 170)
+COLOR_BRIDGE = (200, 180, 60)
+COLOR_NEUTRAL = (120, 115, 105)
 
-COLOR_NATION_1 = (50, 80, 160)
-COLOR_NATION_1_LIGHT = (70, 100, 180)
-COLOR_NATION_2 = (170, 45, 40)
-COLOR_NATION_2_LIGHT = (190, 65, 60)
-COLOR_NATION_3 = (50, 130, 70)
-COLOR_NATION_3_LIGHT = (70, 150, 90)
-
-COLOR_NEUTRAL_REGION = (160, 150, 120)
-COLOR_FORTRESS = (180, 170, 150)
-COLOR_CAPITAL = (220, 200, 160)
-
-COLOR_GENERAL_SELECTED = (255, 255, 100)
-COLOR_GENERAL_MOVABLE = (100, 255, 100)
-COLOR_GENERAL_DONE = (150, 150, 150)
+COLOR_NATION_RED = (170, 45, 40)
+COLOR_NATION_RED_LIGHT = (190, 65, 60)
+COLOR_NATION_BLUE = (50, 80, 160)
+COLOR_NATION_BLUE_LIGHT = (70, 100, 180)
+COLOR_NATION_GREEN = (50, 130, 70)
+COLOR_NATION_GREEN_LIGHT = (70, 150, 90)
 
 COLOR_HUD_BG = (40, 35, 30)
 COLOR_HUD_TEXT = (220, 210, 190)
@@ -110,51 +215,12 @@ COLOR_HUD_TEXT_DIM = (160, 150, 130)
 COLOR_WHITE = (255, 255, 255)
 COLOR_BLACK = (0, 0, 0)
 
-COLOR_MENU_BG = (30, 25, 20)
-COLOR_MENU_TITLE = (220, 200, 160)
-COLOR_MENU_BUTTON = (80, 70, 55)
-COLOR_MENU_BUTTON_HOVER = (110, 95, 70)
-COLOR_MENU_BUTTON_TEXT = (230, 220, 200)
-COLOR_MENU_SUBTITLE = (170, 155, 130)
-
+COLOR_GENERAL_SELECTED = (255, 255, 100)
+COLOR_GENERAL_MOVABLE = (100, 255, 100)
+COLOR_GENERAL_DONE = (150, 150, 150)
 
 WORLD_NATIONS = {
-    "nordheim": Nation("Nordheim", COLOR_NATION_1, COLOR_NATION_1_LIGHT),
-    "valoria": Nation("Valoria", COLOR_NATION_2, COLOR_NATION_2_LIGHT),
-    "drakoria": Nation("Drakoria", COLOR_NATION_3, COLOR_NATION_3_LIGHT),
+    "red": Nation("Red Legion", COLOR_NATION_RED, COLOR_NATION_RED_LIGHT),
+    "blue": Nation("Blue Alliance", COLOR_NATION_BLUE, COLOR_NATION_BLUE_LIGHT),
+    "green": Nation("Green Dominion", COLOR_NATION_GREEN, COLOR_NATION_GREEN_LIGHT),
 }
-
-
-WORLD_REGIONS = [
-    Region("Frosthelm", RegionType.CAPITAL, 4, 2, "nordheim"),
-    Region("Ironvale", RegionType.CITY, 6, 3, "nordheim"),
-    Region("Snowmere", RegionType.VILLAGE, 3, 4, "nordheim"),
-    Region("Wolfstead", RegionType.VILLAGE, 7, 1, "nordheim"),
-    Region("Dawnport", RegionType.FORTRESS, 5, 5, "nordheim"),
-    Region("Glacier Keep", RegionType.FORTRESS, 2, 3, "nordheim"),
-
-    Region("Solis", RegionType.CAPITAL, 18, 11, "valoria"),
-    Region("Ember Keep", RegionType.CITY, 16, 12, "valoria"),
-    Region("Sandrift", RegionType.VILLAGE, 19, 13, "valoria"),
-    Region("Firewatch", RegionType.VILLAGE, 20, 10, "valoria"),
-    Region("Burning Gate", RegionType.FORTRESS, 17, 10, "valoria"),
-    Region("Ashford", RegionType.FORTRESS, 15, 11, "valoria"),
-
-    Region("Drakenholm", RegionType.CAPITAL, 11, 13, "drakoria"),
-    Region("Greenmire", RegionType.CITY, 9, 12, "drakoria"),
-    Region("Thornwall", RegionType.VILLAGE, 12, 14, "drakoria"),
-    Region("Mosshaven", RegionType.VILLAGE, 10, 14, "drakoria"),
-    Region("Dragon's Tooth", RegionType.FORTRESS, 8, 13, "drakoria"),
-    Region("Bogward", RegionType.FORTRESS, 13, 12, "drakoria"),
-]
-
-WORLD_GENERALS = [
-    General("Gustav", "nordheim", 5, 3, 1200),
-    General("Bjorn", "nordheim", 4, 5, 800),
-    General("Marcus", "valoria", 18, 12, 1100),
-    General("Helena", "valoria", 17, 11, 900),
-    General("Aldric", "drakoria", 11, 13, 1000),
-    General("Brenna", "drakoria", 10, 13, 700),
-]
-
-PLAYER_NATION = "nordheim"
