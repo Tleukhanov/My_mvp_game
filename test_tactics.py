@@ -931,38 +931,24 @@ class TestWorldMapTopology:
             for tile in row:
                 assert tile in valid_tiles, f"Invalid tile value: {tile}"
 
-    def test_nation_territory_dimensions(self):
-        from world_data import NATION_TERRITORY, MAP_ROWS, MAP_COLS
-        assert len(NATION_TERRITORY) == MAP_ROWS
-        for row in NATION_TERRITORY:
-            assert len(row) == MAP_COLS
-
-    def test_nation_territory_values(self):
-        from world_data import NATION_TERRITORY
-        valid_ids = {0, 1, 2, 3}
-        for row in NATION_TERRITORY:
-            for val in row:
-                assert val in valid_ids, f"Invalid territory value: {val}"
-
-    def test_rivers_on_water_or_land(self):
-        from world_data import RIVER_WEST, RIVER_EAST
+    def test_rivers_in_range(self):
+        from world_data import RIVER_WEST, RIVER_EAST, MAP_COLS, MAP_ROWS
         for col, row in RIVER_WEST:
-            assert 0 <= col < 24, f"RIVER_WEST col out of range: {col}"
-            assert 0 <= row < 16, f"RIVER_WEST row out of range: {row}"
+            assert 0 <= col < MAP_COLS, f"RIVER_WEST col out of range: {col}"
+            assert 0 <= row < MAP_ROWS, f"RIVER_WEST row out of range: {row}"
         for col, row in RIVER_EAST:
-            assert 0 <= col < 24, f"RIVER_EAST col out of range: {col}"
-            assert 0 <= row < 16, f"RIVER_EAST row out of range: {row}"
+            assert 0 <= col < MAP_COLS, f"RIVER_EAST col out of range: {col}"
+            assert 0 <= row < MAP_ROWS, f"RIVER_EAST row out of range: {row}"
 
-    def test_bridges_on_river_path(self):
-        from world_data import BRIDGES, RIVER_WEST, RIVER_EAST
-        all_river = set(RIVER_WEST + RIVER_EAST)
+    def test_bridges_in_range(self):
+        from world_data import BRIDGES, MAP_COLS, MAP_ROWS
         for col, row in BRIDGES:
-            assert 0 <= col < 24, f"Bridge col out of range: {col}"
-            assert 0 <= row < 16, f"Bridge row out of range: {row}"
+            assert 0 <= col < MAP_COLS, f"Bridge col out of range: {col}"
+            assert 0 <= row < MAP_ROWS, f"Bridge row out of range: {row}"
 
     def test_bridges_have_correct_count(self):
         from world_data import BRIDGES
-        assert len(BRIDGES) == 5
+        assert len(BRIDGES) == 6
 
     def test_regions_on_valid_tiles(self):
         from world_data import WORLD_REGIONS, WORLD_MAP, T_WATER
@@ -988,7 +974,7 @@ class TestWorldMapTopology:
             if g.nation in capitals:
                 cap = capitals[g.nation]
                 dist = abs(g.col - cap.col) + abs(g.row - cap.row)
-                assert dist <= 3, \
+                assert dist <= 5, \
                     f"General {g.name} too far from {g.nation} capital"
 
     def test_three_landmasses(self):
@@ -1030,6 +1016,27 @@ class TestWorldMapTopology:
         assert NATION_ID["red"] == 1
         assert NATION_ID["blue"] == 2
         assert NATION_ID["green"] == 3
+
+    def test_total_regions_51(self):
+        from world_data import WORLD_REGIONS
+        assert len(WORLD_REGIONS) == 51
+
+    def test_connections_exist(self):
+        from world_data import PROVINCE_CONNECTIONS, WORLD_REGIONS
+        assert len(PROVINCE_CONNECTIONS) > 0
+        for a, b in PROVINCE_CONNECTIONS:
+            assert 0 <= a < len(WORLD_REGIONS)
+            assert 0 <= b < len(WORLD_REGIONS)
+
+    def test_each_faction_has_6_regions(self):
+        from world_data import WORLD_REGIONS
+        counts = {}
+        for r in WORLD_REGIONS:
+            if r.owner != "neutral":
+                counts[r.owner] = counts.get(r.owner, 0) + 1
+        assert counts["red"] == 6
+        assert counts["blue"] == 6
+        assert counts["green"] == 6
 
 
 class TestWorldMapInit:

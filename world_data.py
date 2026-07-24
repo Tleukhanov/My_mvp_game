@@ -72,9 +72,9 @@ class General:
         return math.hypot(self.col - region.col, self.row - region.row)
 
 
-CELL_SIZE = 48
-MAP_COLS = 24
-MAP_ROWS = 16
+CELL_SIZE = 32
+MAP_COLS = 50
+MAP_ROWS = 30
 SCREEN_WIDTH = MAP_COLS * CELL_SIZE
 SCREEN_HEIGHT = MAP_ROWS * CELL_SIZE + 80
 
@@ -83,114 +83,108 @@ T_LAND = 1
 T_RIVER = 2
 T_BRIDGE = 3
 
-WORLD_MAP = [
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,1,1,1,1,2,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0],
-    [0,1,1,1,1,2,0,0,0,0,1,1,1,1,1,0,0,2,0,0,0,0,0,0],
-    [0,1,1,1,1,2,0,0,0,1,1,1,1,1,1,0,0,0,2,0,0,0,0,0],
-    [0,1,1,1,1,3,0,0,1,1,1,1,1,1,0,0,0,0,3,0,0,0,0,0],
-    [0,0,1,1,1,2,0,0,0,1,1,1,1,0,0,0,0,0,0,2,0,0,0,0],
-    [0,0,0,0,0,0,2,0,0,1,1,1,1,1,1,0,0,0,0,2,0,0,0,0],
-    [0,0,0,0,0,0,2,0,0,1,1,1,1,1,1,1,0,0,0,0,2,0,0,0],
-    [0,0,0,0,0,0,0,3,1,1,1,1,1,1,1,0,0,0,0,0,2,0,0,0],
-    [0,0,0,0,0,0,0,2,1,1,1,1,1,1,1,0,0,0,0,0,2,0,0,0],
-    [0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,1,1,1,1,1,2,0,0],
-    [0,1,1,1,1,1,0,0,2,0,0,0,0,0,0,0,0,1,1,1,3,2,0,0],
-    [0,1,1,1,1,0,0,0,2,0,0,0,0,0,0,0,0,0,1,1,0,2,0,0],
-    [0,1,1,1,0,0,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,1,1,0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-]
+WORLD_MAP = []
 
-RIVER_WEST = [
-    (5,1),(5,2),(5,3),(5,4),(5,5),
-    (6,6),(6,7),
-    (7,8),(7,9),
-    (8,10),(8,11),(8,12),(8,13),(8,14),
-]
-RIVER_EAST = [
-    (17,1),(17,2),
-    (18,3),(18,4),
-    (19,5),(19,6),
-    (20,7),(20,8),(20,9),
-    (21,10),(21,11),(21,12),
-]
+def _build_map():
+    grid = [[T_WATER] * MAP_COLS for _ in range(MAP_ROWS)]
 
-BRIDGES = [
-    (5,4),
-    (7,8),
-    (8,13),
-    (18,4),
-    (20,11),
-]
+    for row in range(1, MAP_ROWS - 1):
+        for col in range(1, 13):
+            grid[row][col] = T_LAND
+    for row in range(1, MAP_ROWS - 1):
+        grid[row][13] = T_RIVER
+    for row in range(1, MAP_ROWS - 1):
+        for col in range(14, 38):
+            grid[row][col] = T_LAND
+    for row in range(1, MAP_ROWS - 1):
+        grid[row][38] = T_RIVER
+    for row in range(1, MAP_ROWS - 1):
+        for col in range(39, MAP_COLS - 1):
+            grid[row][col] = T_LAND
 
-NATION_TERRITORY = [
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,3,3,3,3,0,0],
-    [0,2,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,3,3,3,3,0,0],
-    [0,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,3,0,0,0],
-    [0,2,2,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-    [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
-]
+    bridges_west = [8, 15, 24]
+    bridges_east = [10, 18, 25]
+    for b in bridges_west:
+        grid[b][13] = T_BRIDGE
+    for b in bridges_east:
+        grid[b][38] = T_BRIDGE
+
+    return grid
+
+WORLD_MAP = _build_map()
+
+RIVER_WEST = [(13, r) for r in range(1, MAP_ROWS - 1)]
+RIVER_EAST = [(38, r) for r in range(1, MAP_ROWS - 1)]
+BRIDGES = [(13, 8), (13, 15), (13, 24), (38, 10), (38, 18), (38, 25)]
 
 NATION_ID = {"red": 1, "blue": 2, "green": 3}
 
 WORLD_REGIONS = [
-    Region("Ironhold", RegionType.CAPITAL, 11, 3, "red"),
-    Region("Northwall", RegionType.VILLAGE, 10, 2, "red"),
-    Region("Warfield", RegionType.VILLAGE, 12, 2, "red"),
-    Region("Bloodkeep", RegionType.CITY, 10, 4, "red"),
-    Region("Scarforge", RegionType.VILLAGE, 13, 4, "red"),
+    Region("Frosthollow", RegionType.VILLAGE, 3, 7, "neutral"),
+    Region("Icewind", RegionType.VILLAGE, 7, 7, "neutral"),
+    Region("Snowmere", RegionType.VILLAGE, 10, 7, "neutral"),
+    Region("Greyvale", RegionType.VILLAGE, 5, 12, "neutral"),
+    Region("Stoneford", RegionType.VILLAGE, 3, 22, "neutral"),
+    Region("Dustkeep", RegionType.VILLAGE, 7, 22, "neutral"),
+    Region("Ashgate", RegionType.VILLAGE, 10, 22, "neutral"),
+    Region("Boneyard", RegionType.VILLAGE, 5, 17, "neutral"),
 
-    Region("Silverhold", RegionType.CAPITAL, 3, 12, "blue"),
-    Region("Dawnreach", RegionType.VILLAGE, 2, 11, "blue"),
-    Region("Starport", RegionType.VILLAGE, 4, 11, "blue"),
-    Region("Tidewall", RegionType.CITY, 2, 12, "blue"),
-    Region("Mistwood", RegionType.VILLAGE, 3, 13, "blue"),
-    Region("Frostgate", RegionType.VILLAGE, 4, 12, "blue"),
+    Region("Ironhold", RegionType.CAPITAL, 20, 4, "red"),
+    Region("Northwall", RegionType.VILLAGE, 24, 4, "red"),
+    Region("Warfield", RegionType.VILLAGE, 28, 4, "red"),
+    Region("Bloodkeep", RegionType.CITY, 20, 10, "red"),
+    Region("Scarforge", RegionType.VILLAGE, 24, 10, "red"),
+    Region("Razorspine", RegionType.VILLAGE, 28, 10, "red"),
 
-    Region("Verdant", RegionType.CAPITAL, 20, 10, "green"),
-    Region("Leafguard", RegionType.VILLAGE, 17, 10, "green"),
-    Region("Greenvale", RegionType.VILLAGE, 18, 10, "green"),
-    Region("Mosshollow", RegionType.CITY, 19, 11, "green"),
-    Region("Thornridge", RegionType.VILLAGE, 19, 12, "green"),
+    Region("Crossroads", RegionType.VILLAGE, 16, 14, "neutral"),
+    Region("Midway", RegionType.CITY, 20, 14, "neutral"),
+    Region("Stonebar", RegionType.VILLAGE, 24, 14, "neutral"),
+    Region("Eastreach", RegionType.VILLAGE, 28, 14, "neutral"),
+    Region("Windswept", RegionType.VILLAGE, 32, 14, "neutral"),
+    Region("Fords", RegionType.VILLAGE, 16, 18, "neutral"),
+    Region("Clearfield", RegionType.VILLAGE, 20, 18, "neutral"),
+    Region("Dirtford", RegionType.VILLAGE, 24, 18, "neutral"),
+    Region("Marshpoint", RegionType.VILLAGE, 28, 18, "neutral"),
+    Region("Ravengate", RegionType.VILLAGE, 32, 18, "neutral"),
+    Region("Barrowfield", RegionType.VILLAGE, 16, 21, "neutral"),
+    Region("Oldgate", RegionType.VILLAGE, 20, 21, "neutral"),
+    Region("Westmere", RegionType.VILLAGE, 24, 21, "neutral"),
+    Region("Dusthollow", RegionType.VILLAGE, 28, 21, "neutral"),
+    Region("Greywatch", RegionType.VILLAGE, 32, 21, "neutral"),
 
-    Region("Westmere", RegionType.VILLAGE, 2, 3, "neutral"),
-    Region("Ashford", RegionType.VILLAGE, 3, 5, "neutral"),
-    Region("Greywatch", RegionType.VILLAGE, 4, 2, "neutral"),
-    Region("Crossroads", RegionType.CITY, 3, 4, "neutral"),
-    Region("Oldgate", RegionType.VILLAGE, 2, 5, "neutral"),
-    Region("Ruinhold", RegionType.VILLAGE, 1, 3, "neutral"),
-    Region("Dusthollow", RegionType.VILLAGE, 4, 3, "neutral"),
-    Region("Barrowfield", RegionType.VILLAGE, 1, 4, "neutral"),
+    Region("Silverhold", RegionType.CAPITAL, 20, 24, "blue"),
+    Region("Dawnreach", RegionType.VILLAGE, 24, 24, "blue"),
+    Region("Starport", RegionType.VILLAGE, 28, 24, "blue"),
+    Region("Tidewall", RegionType.CITY, 20, 28, "blue"),
+    Region("Mistwood", RegionType.VILLAGE, 24, 28, "blue"),
+    Region("Frostgate", RegionType.VILLAGE, 28, 28, "blue"),
 
-    Region("Midway", RegionType.CITY, 9, 7, "neutral"),
-    Region("Fords", RegionType.VILLAGE, 8, 9, "neutral"),
-    Region("Clearfield", RegionType.VILLAGE, 10, 6, "neutral"),
-    Region("Stonebar", RegionType.VILLAGE, 12, 7, "neutral"),
-    Region("Eastreach", RegionType.VILLAGE, 14, 8, "neutral"),
-    Region("Marshpoint", RegionType.VILLAGE, 11, 9, "neutral"),
-    Region("Dirtford", RegionType.VILLAGE, 13, 6, "neutral"),
-    Region("Windswept", RegionType.VILLAGE, 15, 7, "neutral"),
+    Region("Verdant", RegionType.CAPITAL, 42, 10, "green"),
+    Region("Leafguard", RegionType.VILLAGE, 44, 10, "green"),
+    Region("Greenvale", RegionType.VILLAGE, 46, 10, "green"),
+    Region("Mosshollow", RegionType.CITY, 42, 20, "green"),
+    Region("Thornridge", RegionType.VILLAGE, 44, 20, "green"),
+    Region("Brightwood", RegionType.VILLAGE, 46, 20, "green"),
+
+    Region("Dawnmere", RegionType.VILLAGE, 42, 6, "neutral"),
+    Region("Sunward", RegionType.VILLAGE, 44, 6, "neutral"),
+    Region("Highpeak", RegionType.VILLAGE, 46, 6, "neutral"),
+    Region("Windrift", RegionType.VILLAGE, 42, 14, "neutral"),
+    Region("Skyfall", RegionType.VILLAGE, 44, 14, "neutral"),
+    Region("Lightvale", RegionType.VILLAGE, 46, 14, "neutral"),
+    Region("Goldkeep", RegionType.VILLAGE, 42, 25, "neutral"),
+    Region("Emberford", RegionType.VILLAGE, 44, 25, "neutral"),
+    Region("Starwatch", RegionType.VILLAGE, 46, 25, "neutral"),
+    Region("Brightgate", RegionType.VILLAGE, 48, 15, "neutral"),
 ]
 
 WORLD_GENERALS = [
-    General("Volkov", "red", 11, 3, 1200),
-    General("Korzh", "red", 12, 4, 800),
-    General("Aldric", "blue", 3, 12, 1100),
-    General("Brenna", "blue", 2, 12, 900),
-    General("Theron", "green", 20, 10, 1000),
-    General("Lyra", "green", 19, 10, 800),
+    General("Volkov", "red", 20, 4, 1200),
+    General("Korzh", "red", 24, 4, 800),
+    General("Aldric", "blue", 20, 24, 1100),
+    General("Brenna", "blue", 24, 24, 900),
+    General("Theron", "green", 42, 10, 1000),
+    General("Lyra", "green", 44, 10, 800),
 ]
 
 PLAYER_NATION = "blue"
@@ -224,3 +218,32 @@ WORLD_NATIONS = {
     "blue": Nation("Blue Alliance", COLOR_NATION_BLUE, COLOR_NATION_BLUE_LIGHT),
     "green": Nation("Green Dominion", COLOR_NATION_GREEN, COLOR_NATION_GREEN_LIGHT),
 }
+
+PROVINCE_CONNECTIONS = [
+    (0, 1), (1, 2), (0, 3), (1, 3), (2, 3),
+    (4, 5), (5, 6), (4, 7), (5, 7), (6, 7),
+    (0, 4), (1, 5), (2, 6), (3, 7),
+
+    (8, 9), (9, 10), (8, 11), (9, 12), (10, 13),
+    (11, 12), (12, 13),
+
+    (14, 15), (15, 16), (16, 17), (17, 18), (18, 19),
+    (14, 17), (15, 18), (16, 19),
+    (20, 21), (21, 22), (22, 23), (23, 24),
+    (20, 23), (21, 24),
+
+    (32, 33), (33, 34), (34, 35), (35, 36),
+    (32, 35), (33, 36),
+
+    (37, 38), (38, 39), (39, 40), (40, 41),
+    (37, 40), (38, 41),
+
+    (11, 14), (11, 20), (12, 15), (13, 16),
+    (23, 32), (24, 33),
+
+    (3, 8), (7, 11),
+    (19, 26), (24, 31),
+
+    (39, 42), (40, 43), (41, 44),
+    (39, 46), (40, 47), (41, 48),
+]
