@@ -51,17 +51,19 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 - **Villages** — capturable buildings that produce food and spawn units
 
 ### World Map
-- **3 Nations** — Red (Северный альянс), Blue (Южная конфедерация), Green (Восточный союз)
-- **51 Provinces** — capitals, cities, villages, fortresses across a 50×30 grid
-- **3 Continents** — separated by 2 rivers with 6 bridge crossings
+- **3 Nations** — Red Legion, Blue Alliance, Green Dominion
+- **50 Provinces** — irregular polygons filling 1600×960 map, no grid tiles
+- **3 Continents** — West (10 neutral), Center (25), East (15) separated by animated rivers
 - **6 Generals** — move 1 province per turn, capture neutrals, fight enemies
-- **Province System** — click-to-move generals between connected provinces
+- **Province-Graph** — each province is a polygon with neighbor connections (graph edges)
+- **Organic Borders** — irregular non-linear borders between provinces
 - **Auto-Capture** — moving into neutral territory captures it instantly
 - **Auto-Battle** — moving into enemy territory triggers combat resolution
-- **Territory System** — captured provinces produce troops and expand borders
+- **Territory Expansion** — captured provinces change color to your nation
 - **Diplomacy** — propose War / Neutral / Friendly / Alliance to other nations
 - **AI Opponents** — enemy generals move and attack autonomously each turn
 - **Camera Scrolling** — WASD/arrow keys, mouse wheel, middle-mouse drag to navigate
+- **Animated Rivers** — wavy decorative lines with bridge markers at crossings
 
 ### AI
 - **Tactical Grouping** — infantry waits for allies before attacking (GROUP_UP state)
@@ -167,8 +169,8 @@ My_mvp_game/
 ├── main.py              # Entry point with menu
 ├── menu.py              # Main menu, campaign select, victory screen
 ├── campaigns.py         # 4 campaign mission definitions and maps
-├── world_data.py        # World map: 50×30 grid, 51 provinces, 3 nations, rivers/bridges
-├── world_map.py         # World map screen: province movement, auto-capture/battle, camera scrolling
+├── world_data.py        # World map: 50 province polygons, 3 nations, rivers/bridges, graph connections
+├── world_map.py         # World map screen: polygon rendering, province movement, auto-capture/battle
 ├── diplomacy.py         # WAR/NEUTRAL/FRIENDLY/ALLIANCE diplomacy system
 ├── requirements.txt     # pygame-ce dependency
 ├── test_tactics.py      # 149 unit, integration, and edge-case tests
@@ -211,7 +213,7 @@ python -m pytest test_tactics.py -v
 # - TestWorldData (10)          — nations, regions, generals, validity checks
 # - TestWorldMap (6)            — general/region positions, troops, colors
 # - TestImports (10)            — all modules import cleanly
-# - TestWorldMapTopology (17)   — map dimensions, tiles, rivers, bridges, regions, connections
+# - TestWorldMapTopology (15)   — province count, polygons, centroids, rivers, bridges, connections
 # - TestWorldMapInit (1)        — WorldMapScreen creates without crash
 ```
 
