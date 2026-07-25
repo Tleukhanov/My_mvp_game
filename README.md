@@ -51,12 +51,17 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 - **Villages** — capturable buildings that produce food and spawn units
 
 ### World Map
-- **3 Nations** — Nordheim (blue), Valoria (red), Drakoria (green)
-- **18 Regions** — capitals, cities, villages, fortresses across a 24×16 grid
-- **6 Generals** — move on the world map, capture regions, fight enemy generals
-- **Territory System** — capturing a region expands your borders
+- **3 Nations** — Red (Северный альянс), Blue (Южная конфедерация), Green (Восточный союз)
+- **51 Provinces** — capitals, cities, villages, fortresses across a 50×30 grid
+- **3 Continents** — separated by 2 rivers with 6 bridge crossings
+- **6 Generals** — move 1 province per turn, capture neutrals, fight enemies
+- **Province System** — click-to-move generals between connected provinces
+- **Auto-Capture** — moving into neutral territory captures it instantly
+- **Auto-Battle** — moving into enemy territory triggers combat resolution
+- **Territory System** — captured provinces produce troops and expand borders
 - **Diplomacy** — propose War / Neutral / Friendly / Alliance to other nations
 - **AI Opponents** — enemy generals move and attack autonomously each turn
+- **Camera Scrolling** — WASD/arrow keys, mouse wheel, middle-mouse drag to navigate
 
 ### AI
 - **Tactical Grouping** — infantry waits for allies before attacking (GROUP_UP state)
@@ -86,7 +91,7 @@ Napoleonic-style top-down 2D tactical battle simulator with RTS controls, A\* pa
 | Pathfinding | A\* with terrain cost weighting |
 | AI | Finite State Machine (tactical combat + world map) |
 | Diplomacy | WAR / NEUTRAL / FRIENDLY / ALLIANCE with accept/reject |
-| Testing | pytest (93 tests) |
+| Testing | pytest (149 tests) |
 | Container | Docker + docker-compose |
 
 ---
@@ -139,9 +144,12 @@ docker compose --profile headless up --build
 |---|---|
 | **Left Click** | Select general / Move selected general |
 | **SPACE** | End turn |
-| **D** | Open diplomacy panel |
+| **TAB** | Open diplomacy panel |
 | **N/P** | Cycle diplomacy target nation |
 | **1-4** | War / Neutral / Friendly / Alliance proposal |
+| **WASD / Arrows** | Scroll the map |
+| **Mouse Wheel** | Scroll vertically |
+| **Middle Mouse Drag** | Free camera drag |
 | **ESC** | Close panel / Quit |
 
 ---
@@ -159,11 +167,11 @@ My_mvp_game/
 ├── main.py              # Entry point with menu
 ├── menu.py              # Main menu, campaign select, victory screen
 ├── campaigns.py         # 4 campaign mission definitions and maps
-├── world_data.py        # World map nations, regions, generals, territory grid
-├── world_map.py         # World map screen with movement, capture, battles
+├── world_data.py        # World map: 50×30 grid, 51 provinces, 3 nations, rivers/bridges
+├── world_map.py         # World map screen: province movement, auto-capture/battle, camera scrolling
 ├── diplomacy.py         # WAR/NEUTRAL/FRIENDLY/ALLIANCE diplomacy system
 ├── requirements.txt     # pygame-ce dependency
-├── test_tactics.py      # 93 unit, integration, and edge-case tests
+├── test_tactics.py      # 149 unit, integration, and edge-case tests
 ├── Dockerfile           # Docker image (X11 + dummy driver support)
 ├── docker-compose.yml   # Compose profiles: gui + headless
 └── README.md
@@ -184,7 +192,7 @@ My_mvp_game/
 ## Testing
 
 ```bash
-# Run all 93 tests
+# Run all 149 tests
 python -m pytest test_tactics.py -v
 
 # Test categories:
@@ -199,6 +207,12 @@ python -m pytest test_tactics.py -v
 # - TestFoodSystem (3)          — food cap, consumption, production
 # - TestIntegration (6)         — full-scene, multi-unit, AI engagement, village capture
 # - TestEdgeCases (5)           — boundary conditions, overkill
+# - TestDiplomacy (13)          — relations, war, neutral, friendly, alliance
+# - TestWorldData (10)          — nations, regions, generals, validity checks
+# - TestWorldMap (6)            — general/region positions, troops, colors
+# - TestImports (10)            — all modules import cleanly
+# - TestWorldMapTopology (17)   — map dimensions, tiles, rivers, bridges, regions, connections
+# - TestWorldMapInit (1)        — WorldMapScreen creates without crash
 ```
 
 ---

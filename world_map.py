@@ -33,6 +33,14 @@ class WorldMapScreen:
         self.font_region = pygame.font.SysFont(None, 11)
         self.font_troops = pygame.font.SysFont(None, 14, bold=True)
 
+        self.cam_x = 0
+        self.cam_y = 0
+        self._scroll_speed = 400
+        self._dragging = False
+        self._drag_start = (0, 0)
+        self._cam_start = (0, 0)
+        self._keys_held = set()
+
         self.diplomacy = DiplomacyManager()
         self.regions: List[Region] = [Region(r.name, r.region_type, r.col, r.row, r.owner)
                                        for r in WORLD_REGIONS]
@@ -63,6 +71,15 @@ class WorldMapScreen:
         for a, b in self.connections:
             self._conn_by_region.setdefault(a, set()).add(b)
             self._conn_by_region.setdefault(b, set()).add(a)
+
+    def _clamp_camera(self):
+        map_w = MAP_COLS * CELL_SIZE
+        map_h = MAP_ROWS * CELL_SIZE
+        self.cam_x = max(0, min(self.cam_x, map_w - SCREEN_WIDTH))
+        self.cam_y = max(0, min(self.cam_y, map_h - (SCREEN_HEIGHT - 80)))
+
+    def _screen_to_world(self, sx: int, sy: int) -> Tuple[int, int]:
+        return sx + self.cam_x, sy + self.cam_y
 
     def _region_index(self, col: int, row: int) -> Optional[int]:
         for i, r in enumerate(self.regions):
@@ -95,6 +112,7 @@ class WorldMapScreen:
                 self.running = False
 
             elif event.type == pygame.KEYDOWN:
+                self._keys_held.add(event.key)
                 if event.key == pygame.K_ESCAPE:
                     if self._show_diplomacy:
                         self._show_diplomacy = False
@@ -105,7 +123,7 @@ class WorldMapScreen:
                         self.running = False
                 elif event.key == pygame.K_SPACE:
                     self._end_turn()
-                elif event.key == pygame.K_d:
+                elif event.key == pygame.K_TAB:
                     self._show_diplomacy = not self._show_diplomacy
                 elif event.key == pygame.K_n and self._show_diplomacy:
                     self._cycle_diplomacy_target(1)
@@ -121,19 +139,44 @@ class WorldMapScreen:
                     elif event.key == pygame.K_4:
                         self._diplomacy_action(Relation.ALLIANCE)
 
+            elif event.type == pygame.KEYUP:
+                self._keys_held.discard(event.key)
+
+            elif event.type == pygame.MOUSEWHEEL:
+                self.cam_y -= event.y * CELL_SIZE * 2
+                self._clamp_camera()
+
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:
+                if event.button == 2:
+                    self._dragging = True
+                    self._drag_start = event.pos
+                    self._cam_start = (self.cam_x, self.cam_y)
+                elif event.button == 1:
                     mx, my = event.pos
                     if my < SCREEN_HEIGHT - 80:
                         self._handle_map_click(mx, my)
+
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 2:
+                    self._dragging = False
+
+            elif event.type == pygame.MOUSEMOTION:
+                if self._dragging:
+                    dx = event.pos[0] - self._drag_start[0]
+                    dy = event.pos[1] - self._drag_start[1]
+                    self.cam_x = self._cam_start[0] - dx
+                    self.cam_y = self._cam_start[1] - dy
+                    self._clamp_camera()
 
     def _handle_map_click(self, mx: int, my: int):
         if my >= SCREEN_HEIGHT - 80:
             return
 
+        wx, wy = self._screen_to_world(mx, my)
+
         clicked_region = None
         for i, r in enumerate(self.regions):
-            dist = math.hypot(r.x - mx, r.y - my)
+            dist = math.hypot(r.x - wx, r.y - wy)
             if dist < CELL_SIZE * 0.8:
                 clicked_region = i
                 break
@@ -347,6 +390,18 @@ class WorldMapScreen:
             general.moved = True
 
     def _update(self, dt: float):
+        if not self._show_diplomacy:
+            scroll = self._scroll_speed * dt
+            if pygame.K_w in self._keys_held or pygame.K_UP in self._keys_held:
+                self.cam_y -= scroll
+            if pygame.K_s in self._keys_held or pygame.K_DOWN in self._keys_held:
+                self.cam_y += scroll
+            if pygame.K_a in self._keys_held or pygame.K_LEFT in self._keys_held:
+                self.cam_x -= scroll
+            if pygame.K_d in self._keys_held or pygame.K_RIGHT in self._keys_held:
+                self.cam_x += scroll
+            self._clamp_camera()
+
         if self._battle_timer > 0:
             self._battle_timer -= dt
             if self._battle_timer <= 0:
@@ -371,9 +426,12 @@ class WorldMapScreen:
 
         for row in range(MAP_ROWS):
             for col in range(MAP_COLS):
-                x = col * CELL_SIZE
-                y = row * CELL_SIZE
+                x = col * CELL_SIZE - self.cam_x
+                y = row * CELL_SIZE - self.cam_y
                 tile = WORLD_MAP[row][col]
+
+                if x + CELL_SIZE < 0 or x > SCREEN_WIDTH or y + CELL_SIZE < 0 or y > SCREEN_HEIGHT - 80:
+                    continue
 
                 if tile == T_WATER:
                     shade = ((row + col) % 2) * 5
@@ -402,8 +460,10 @@ class WorldMapScreen:
 
         for a, b in self.connections:
             ra, rb = self.regions[a], self.regions[b]
-            ax, ay = ra.col * CELL_SIZE + CELL_SIZE // 2, ra.row * CELL_SIZE + CELL_SIZE // 2
-            bx, by = rb.col * CELL_SIZE + CELL_SIZE // 2, rb.row * CELL_SIZE + CELL_SIZE // 2
+            ax = ra.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
+            ay = ra.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
+            bx = rb.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
+            by = rb.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
             pygame.draw.line(self.screen, (80, 75, 65), (ax, ay), (bx, by), 1)
 
         for i, region in enumerate(self.regions):
@@ -419,8 +479,8 @@ class WorldMapScreen:
                 adj = self._adjacent_regions(g_idx)
                 for ai in adj:
                     r = self.regions[ai]
-                    cx = r.col * CELL_SIZE + CELL_SIZE // 2
-                    cy = r.row * CELL_SIZE + CELL_SIZE // 2
+                    cx = r.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
+                    cy = r.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
                     pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (cx, cy), CELL_SIZE // 3, 2)
 
         self._render_hud()
@@ -440,8 +500,8 @@ class WorldMapScreen:
         pygame.display.flip()
 
     def _render_region(self, region: Region, idx: int):
-        x = region.col * CELL_SIZE + CELL_SIZE // 2
-        y = region.row * CELL_SIZE + CELL_SIZE // 2
+        x = region.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
+        y = region.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
 
         nation = WORLD_NATIONS.get(region.owner)
         if nation:
@@ -483,8 +543,11 @@ class WorldMapScreen:
             self.screen.blit(ttext, (tx, ty))
 
     def _render_general(self, general: General):
-        x = general.col * CELL_SIZE + CELL_SIZE // 2
-        y = general.row * CELL_SIZE + CELL_SIZE // 2
+        x = general.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
+        y = general.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
+
+        if x < -30 or x > SCREEN_WIDTH + 30 or y < -30 or y > SCREEN_HEIGHT + 30:
+            return
 
         nation = WORLD_NATIONS.get(general.nation)
         color = nation.color if nation else (150, 150, 150)
@@ -517,7 +580,7 @@ class WorldMapScreen:
         pygame.draw.rect(self.screen, COLOR_HUD_BG, (0, hud_y, SCREEN_WIDTH, 80))
 
         turn_text = self.font_hud.render(
-            f"Turn: {self._turn} | SPACE: End Turn | D: Diplomacy | ESC: Menu",
+            f"Turn: {self._turn} | SPACE: End Turn | TAB: Diplomacy | WASD/Arrows: Scroll | ESC: Menu",
             True, COLOR_HUD_TEXT
         )
         self.screen.blit(turn_text, (12, hud_y + 4))
