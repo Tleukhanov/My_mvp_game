@@ -4,17 +4,16 @@ import math
 import random
 from typing import Optional, List, Tuple
 from world_data import (
-    CELL_SIZE, MAP_COLS, MAP_ROWS, SCREEN_WIDTH, SCREEN_HEIGHT,
-    T_WATER, T_LAND, T_RIVER, T_BRIDGE,
-    WORLD_MAP, RIVER_WEST, RIVER_EAST, BRIDGES,
-    NATION_ID,
+    SCREEN_WIDTH, SCREEN_HEIGHT,
     COLOR_OCEAN, COLOR_OCEAN_LIGHT, COLOR_LAND, COLOR_RIVER,
-    COLOR_BRIDGE, COLOR_NEUTRAL, COLOR_HUD_BG, COLOR_HUD_TEXT,
-    COLOR_HUD_TEXT_DIM, COLOR_WHITE, COLOR_BLACK,
+    COLOR_BRIDGE, COLOR_NEUTRAL, COLOR_PROVINCE_BORDER,
+    COLOR_HUD_BG, COLOR_HUD_TEXT, COLOR_HUD_TEXT_DIM,
+    COLOR_WHITE, COLOR_BLACK,
     COLOR_GENERAL_SELECTED, COLOR_GENERAL_MOVABLE, COLOR_GENERAL_DONE,
-    WORLD_NATIONS, WORLD_REGIONS, WORLD_GENERALS, PLAYER_NATION,
-    RegionType, Region, General,
-    PROVINCE_CONNECTIONS,
+    WORLD_NATIONS, WORLD_PROVINCES, PLAYER_NATION,
+    RegionType, Province, General,
+    PROVINCE_CONNECTIONS, BRIDGE_CONNECTIONS,
+    RIVER_WEST_X, RIVER_EAST_X,
 )
 from diplomacy import DiplomacyManager, Relation
 
@@ -42,12 +41,10 @@ class WorldMapScreen:
         self._keys_held = set()
 
         self.diplomacy = DiplomacyManager()
-        self.regions: List[Region] = [Region(r.name, r.region_type, r.col, r.row, r.owner)
-                                       for r in WORLD_REGIONS]
-        for orig, copy in zip(WORLD_REGIONS, self.regions):
-            copy.troops = orig.troops
-
-        self.generals: List[General] = [General(g.name, g.nation, g.col, g.row, g.troops)
+        self.provinces: List[Province] = [Province(p.name, p.owner, p.region_type,
+                                                    list(p.polygon), list(p.neighbors))
+                                           for p in WORLD_PROVINCES]
+        self.generals: List[General] = [General(g.name, g.nation, g.province_idx, g.troops)
                                          for g in WORLD_GENERALS]
         for orig, copy in zip(WORLD_GENERALS, self.generals):
             copy.health = orig.health
@@ -67,36 +64,22 @@ class WorldMapScreen:
         self._message_timer = 0.0
 
     def _build_connection_index(self):
-        self._conn_by_region = {}
+        self._conn_by_province = {}
         for a, b in self.connections:
-            self._conn_by_region.setdefault(a, set()).add(b)
-            self._conn_by_region.setdefault(b, set()).add(a)
+            self._conn_by_province.setdefault(a, set()).add(b)
+            self._conn_by_province.setdefault(b, set()).add(a)
+
+    def _adjacent_provinces(self, idx: int) -> List[int]:
+        return list(self._conn_by_province.get(idx, set()))
 
     def _clamp_camera(self):
-        map_w = MAP_COLS * CELL_SIZE
-        map_h = MAP_ROWS * CELL_SIZE
+        map_w = SCREEN_WIDTH
+        map_h = SCREEN_HEIGHT - 80
         self.cam_x = max(0, min(self.cam_x, map_w - SCREEN_WIDTH))
         self.cam_y = max(0, min(self.cam_y, map_h - (SCREEN_HEIGHT - 80)))
 
     def _screen_to_world(self, sx: int, sy: int) -> Tuple[int, int]:
         return sx + self.cam_x, sy + self.cam_y
-
-    def _region_index(self, col: int, row: int) -> Optional[int]:
-        for i, r in enumerate(self.regions):
-            if r.col == col and r.row == row:
-                return i
-        return None
-
-    def _adjacent_regions(self, idx: int) -> List[int]:
-        return list(self._conn_by_region.get(idx, set()))
-
-    def _is_bridge_connection(self, a: int, b: int) -> bool:
-        ra, rb = self.regions[a], self.regions[b]
-        col_a, row_a = ra.col, ra.row
-        col_b, row_b = rb.col, rb.row
-        if col_a == col_b and abs(row_a - row_b) > 3:
-            return True
-        return False
 
     def run(self) -> Optional[str]:
         while self.running:
@@ -143,7 +126,7 @@ class WorldMapScreen:
                 self._keys_held.discard(event.key)
 
             elif event.type == pygame.MOUSEWHEEL:
-                self.cam_y -= event.y * CELL_SIZE * 2
+                self.cam_y -= event.y * 40
                 self._clamp_camera()
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -174,46 +157,43 @@ class WorldMapScreen:
 
         wx, wy = self._screen_to_world(mx, my)
 
-        clicked_region = None
-        for i, r in enumerate(self.regions):
-            dist = math.hypot(r.x - wx, r.y - wy)
-            if dist < CELL_SIZE * 0.8:
-                clicked_region = i
+        clicked_province = None
+        for i, prov in enumerate(self.provinces):
+            if prov.contains_point(wx, wy):
+                clicked_province = i
                 break
 
         if self.selected_general:
             g = self.selected_general
-            g_idx = self._region_index(g.col, g.row)
+            g_prov = g.province_idx
 
-            if clicked_region is not None and clicked_region != g_idx:
-                adj = self._adjacent_regions(g_idx)
-                if clicked_region in adj:
-                    self._move_general_to_region(g, clicked_region)
+            if clicked_province is not None and clicked_province != g_prov:
+                adj = self._adjacent_provinces(g_prov)
+                if clicked_province in adj:
+                    self._move_general_to_province(g, clicked_province)
                     self.selected_general = None
                     return
 
-            if clicked_region is not None:
+            if clicked_province is not None:
                 for gen in self.generals:
                     if gen.nation == PLAYER_NATION and not gen.moved:
-                        gen_idx = self._region_index(gen.col, gen.row)
-                        if gen_idx == clicked_region:
+                        if gen.province_idx == clicked_province:
                             self.selected_general = gen
                             return
             self.selected_general = None
         else:
-            if clicked_region is not None:
+            if clicked_province is not None:
                 for gen in self.generals:
                     if gen.nation == PLAYER_NATION and not gen.moved:
-                        gen_idx = self._region_index(gen.col, gen.row)
-                        if gen_idx == clicked_region:
+                        if gen.province_idx == clicked_province:
                             self.selected_general = gen
                             return
 
-    def _move_general_to_region(self, general: General, target_idx: int):
-        target = self.regions[target_idx]
+    def _move_general_to_province(self, general: General, target_idx: int):
+        target = self.provinces[target_idx]
 
         for other in self.generals:
-            if other is not general and self._region_index(other.col, other.row) == target_idx:
+            if other is not general and other.province_idx == target_idx:
                 if self.diplomacy.is_enemy(general.nation, other.nation):
                     self._start_battle(general, other)
                     general.moved = True
@@ -232,14 +212,12 @@ class WorldMapScreen:
 
         if target.owner == "neutral":
             target.owner = general.nation
-            general.col = target.col
-            general.row = target.row
+            general.province_idx = target_idx
             general.moved = True
             self._show_msg(f"{target.name} захвачена!")
         elif target.owner == general.nation:
             target.troops += general.troops // 10
-            general.col = target.col
-            general.row = target.row
+            general.province_idx = target_idx
             general.moved = True
         else:
             rel = self.diplomacy.get_relation(general.nation, target.owner)
@@ -247,8 +225,7 @@ class WorldMapScreen:
                 if target.troops <= 0:
                     target.owner = general.nation
                     target.troops = 0
-                    general.col = target.col
-                    general.row = target.row
+                    general.province_idx = target_idx
                     general.moved = True
                     self._show_msg(f"{target.name} захвачена!")
                 else:
@@ -270,8 +247,6 @@ class WorldMapScreen:
             attacker.troops = max(100, attacker.troops - losses)
             defender.troops = max(0, defender.troops - int(defender.troops * 0.7))
             if defender.troops <= 0:
-                defender.col = attacker.col
-                defender.row = attacker.row
                 self.generals.remove(defender)
                 self._battle_result = f"{attacker.name} победил {defender.name}!"
             else:
@@ -287,7 +262,7 @@ class WorldMapScreen:
                 self._battle_result = f"{attacker.name} отступил, потеряно {losses}"
         self._battle_timer = 3.0
 
-    def _start_battle_with_region(self, general: General, region: Region):
+    def _start_battle_with_region(self, general: General, region: Province):
         a_power = general.troops * (general.health / 100)
         d_power = region.troops
         a_roll = a_power * random.uniform(0.7, 1.3)
@@ -298,8 +273,7 @@ class WorldMapScreen:
             general.troops = max(100, general.troops - losses)
             region.owner = general.nation
             region.troops = 0
-            general.col = region.col
-            general.row = region.row
+            general.province_idx = self.provinces.index(region)
             self._battle_result = f"{general.name} захватил {region.name}!"
         else:
             losses = int(general.troops * 0.4)
@@ -343,9 +317,7 @@ class WorldMapScreen:
                 self._ai_move_general(g)
 
     def _ai_move_general(self, general: General):
-        g_idx = self._region_index(general.col, general.row)
-        if g_idx is None:
-            return
+        g_idx = general.province_idx
 
         enemies = []
         for e in self.generals:
@@ -354,40 +326,33 @@ class WorldMapScreen:
 
         if enemies:
             nearest = min(enemies, key=lambda e: general.distance_to(e))
-            if general.distance_to(nearest) <= 6:
-                nearest_idx = self._region_index(nearest.col, nearest.row)
-                if nearest_idx is not None:
-                    adj = self._adjacent_regions(g_idx)
-                    if nearest_idx in adj:
-                        self._move_general_to_region(general, nearest_idx)
-                        general.moved = True
-                        return
+            if general.distance_to(nearest) <= 200:
+                for adj in self._adjacent_provinces(g_idx):
+                    for e in self.generals:
+                        if e is nearest and e.province_idx == adj:
+                            self._move_general_to_province(general, adj)
+                            general.moved = True
+                            return
 
         neutral_targets = []
-        for i, r in enumerate(self.regions):
-            if r.owner == "neutral":
-                if i in self._adjacent_regions(g_idx):
-                    neutral_targets.append(i)
+        for adj in self._adjacent_provinces(g_idx):
+            if self.provinces[adj].owner == "neutral":
+                neutral_targets.append(adj)
 
         if neutral_targets:
             target_idx = random.choice(neutral_targets)
-            self._move_general_to_region(general, target_idx)
+            self._move_general_to_province(general, target_idx)
             general.moved = True
             return
 
-        adj = self._adjacent_regions(g_idx)
-        enemy_territory = []
-        for i in adj:
-            r = self.regions[i]
-            if r.owner != general.nation and r.owner != "neutral":
-                rel = self.diplomacy.get_relation(general.nation, r.owner)
-                if rel == Relation.WAR and r.troops <= 0:
-                    enemy_territory.append(i)
-
-        if enemy_territory:
-            target_idx = random.choice(enemy_territory)
-            self._move_general_to_region(general, target_idx)
-            general.moved = True
+        for adj in self._adjacent_provinces(g_idx):
+            prov = self.provinces[adj]
+            if prov.owner != general.nation and prov.owner != "neutral":
+                rel = self.diplomacy.get_relation(general.nation, prov.owner)
+                if rel == Relation.WAR and prov.troops <= 0:
+                    self._move_general_to_province(general, adj)
+                    general.moved = True
+                    return
 
     def _update(self, dt: float):
         if not self._show_diplomacy:
@@ -424,64 +389,34 @@ class WorldMapScreen:
     def _render(self):
         self.screen.fill(COLOR_OCEAN)
 
-        for row in range(MAP_ROWS):
-            for col in range(MAP_COLS):
-                x = col * CELL_SIZE - self.cam_x
-                y = row * CELL_SIZE - self.cam_y
-                tile = WORLD_MAP[row][col]
+        for i, prov in enumerate(self.provinces):
+            screen_poly = [(x - self.cam_x, y - self.cam_y) for x, y in prov.polygon]
 
-                if x + CELL_SIZE < 0 or x > SCREEN_WIDTH or y + CELL_SIZE < 0 or y > SCREEN_HEIGHT - 80:
-                    continue
+            nation = WORLD_NATIONS.get(prov.owner)
+            if nation:
+                color = nation.color
+            elif prov.owner == "neutral":
+                color = COLOR_NEUTRAL
+            else:
+                color = COLOR_LAND
 
-                if tile == T_WATER:
-                    shade = ((row + col) % 2) * 5
-                    c = (COLOR_OCEAN_LIGHT[0] + shade,
-                         COLOR_OCEAN_LIGHT[1] + shade,
-                         COLOR_OCEAN_LIGHT[2] + shade)
-                    pygame.draw.rect(self.screen, c, (x, y, CELL_SIZE, CELL_SIZE))
-                elif tile == T_RIVER:
-                    pygame.draw.rect(self.screen, COLOR_RIVER, (x, y, CELL_SIZE, CELL_SIZE))
-                    wave = math.sin((row + col) * 0.8 + pygame.time.get_ticks() * 0.003) * 15
-                    wc = (COLOR_RIVER[0] + int(wave), COLOR_RIVER[1] + int(wave), COLOR_RIVER[2] + int(wave))
-                    pygame.draw.rect(self.screen, wc, (x + 4, y + 4, CELL_SIZE - 8, CELL_SIZE - 8))
-                elif tile == T_BRIDGE:
-                    pygame.draw.rect(self.screen, COLOR_RIVER, (x, y, CELL_SIZE, CELL_SIZE))
-                    bw = CELL_SIZE - 6
-                    bh = CELL_SIZE - 6
-                    pygame.draw.rect(self.screen, COLOR_BRIDGE, (x + 3, y + 3, bw, bh))
-                    pygame.draw.rect(self.screen, COLOR_WHITE, (x + 3, y + 3, bw, bh), 2)
-                    for i in range(3):
-                        lx = x + 7 + i * (bw // 3)
-                        pygame.draw.line(self.screen, COLOR_BLACK, (lx, y + 3), (lx, y + CELL_SIZE - 3), 1)
-                elif tile == T_LAND:
-                    shade = ((row + col) % 2) * 8
-                    c = (COLOR_LAND[0] + shade, COLOR_LAND[1] + shade, COLOR_LAND[2] + shade)
-                    pygame.draw.rect(self.screen, c, (x, y, CELL_SIZE, CELL_SIZE))
+            pygame.draw.polygon(self.screen, color, screen_poly)
+            pygame.draw.polygon(self.screen, COLOR_PROVINCE_BORDER, screen_poly, 1)
 
-        for a, b in self.connections:
-            ra, rb = self.regions[a], self.regions[b]
-            ax = ra.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
-            ay = ra.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
-            bx = rb.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
-            by = rb.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
-            pygame.draw.line(self.screen, (80, 75, 65), (ax, ay), (bx, by), 1)
-
-        for i, region in enumerate(self.regions):
-            if WORLD_MAP[region.row][region.col] != T_WATER:
-                self._render_region(region, i)
+        self._render_rivers()
 
         for general in self.generals:
             self._render_general(general)
 
         if self.selected_general:
-            g_idx = self._region_index(self.selected_general.col, self.selected_general.row)
-            if g_idx is not None:
-                adj = self._adjacent_regions(g_idx)
-                for ai in adj:
-                    r = self.regions[ai]
-                    cx = r.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
-                    cy = r.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
-                    pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (cx, cy), CELL_SIZE // 3, 2)
+            g_idx = self.selected_general.province_idx
+            adj = self._adjacent_provinces(g_idx)
+            for ai in adj:
+                prov = self.provinces[ai]
+                cx, cy = prov.centroid
+                sx = cx - self.cam_x
+                sy = cy - self.cam_y
+                pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (sx, sy), 20, 2)
 
         self._render_hud()
 
@@ -499,52 +434,52 @@ class WorldMapScreen:
 
         pygame.display.flip()
 
-    def _render_region(self, region: Region, idx: int):
-        x = region.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
-        y = region.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
+    def _render_rivers(self):
+        t = pygame.time.get_ticks() * 0.003
 
-        nation = WORLD_NATIONS.get(region.owner)
-        if nation:
-            color = nation.color
-            light = nation.light_color
-        elif region.owner == "neutral":
-            color = COLOR_NEUTRAL
-            light = (140, 135, 125)
-        else:
-            color = COLOR_LAND
-            light = COLOR_LAND
+        for river_x in [RIVER_WEST_X, RIVER_EAST_X]:
+            points = []
+            for y in range(-20, SCREEN_HEIGHT - 60, 4):
+                wy = y + self.cam_y
+                wave = math.sin(wy * 0.01 + t) * 12
+                sx = river_x + wave - self.cam_x
+                points.append((sx, y))
 
-        if region.region_type == RegionType.CAPITAL:
-            size = 9
-            pygame.draw.circle(self.screen, light, (x, y), size)
-            pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), size, 2)
-            pygame.draw.circle(self.screen, (255, 220, 100), (x, y), 5)
-        elif region.region_type == RegionType.CITY:
-            size = 7
-            pygame.draw.circle(self.screen, color, (x, y), size)
-            pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), size, 1)
-        else:
-            size = 6
-            pygame.draw.circle(self.screen, color, (x, y), size)
-            pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), size, 1)
+            if len(points) > 1:
+                for j in range(len(points) - 1):
+                    wave2 = math.sin((points[j][1] + self.cam_y) * 0.01 + t + 0.5) * 8
+                    width = 24 + int(wave2)
+                    pygame.draw.line(self.screen, COLOR_RIVER,
+                                     points[j], points[j + 1], width)
 
-        name = self.font_small.render(region.name[:8], True, COLOR_WHITE)
-        nx = x - name.get_width() // 2
-        ny = y + size + 2
-        bg = pygame.Surface((name.get_width() + 4, name.get_height() + 2), pygame.SRCALPHA)
-        bg.fill((0, 0, 0, 140))
-        self.screen.blit(bg, (nx - 2, ny - 1))
-        self.screen.blit(name, (nx, ny))
+            bridge_indices = []
+            for a, b in BRIDGE_CONNECTIONS:
+                pa = self.provinces[a]
+                pb = self.provinces[b]
+                cx_a, cy_a = pa.centroid
+                cx_b, cy_b = pb.centroid
+                if abs(cx_a - river_x) < 30 or abs(cx_b - river_x) < 30:
+                    bridge_y = (cy_a + cy_b) // 2
+                    bridge_indices.append(bridge_y)
 
-        if region.troops > 0:
-            ttext = self.font_troops.render(str(region.troops), True, (255, 200, 100))
-            tx = x - ttext.get_width() // 2
-            ty = y - size - ttext.get_height()
-            self.screen.blit(ttext, (tx, ty))
+            for by in bridge_indices:
+                sx = river_x - self.cam_x
+                sy = by - self.cam_y
+                bw, bh = 30, 14
+                pygame.draw.rect(self.screen, COLOR_BRIDGE,
+                                 (sx - bw // 2, sy - bh // 2, bw, bh))
+                pygame.draw.rect(self.screen, COLOR_WHITE,
+                                 (sx - bw // 2, sy - bh // 2, bw, bh), 2)
+                for k in range(3):
+                    lx = sx - bw // 2 + 6 + k * (bw // 3)
+                    pygame.draw.line(self.screen, COLOR_BLACK,
+                                     (lx, sy - bh // 2), (lx, sy + bh // 2), 1)
 
     def _render_general(self, general: General):
-        x = general.col * CELL_SIZE + CELL_SIZE // 2 - self.cam_x
-        y = general.row * CELL_SIZE + CELL_SIZE // 2 - self.cam_y
+        prov = self.provinces[general.province_idx]
+        cx, cy = prov.centroid
+        x = cx - self.cam_x
+        y = cy - self.cam_y
 
         if x < -30 or x > SCREEN_WIDTH + 30 or y < -30 or y > SCREEN_HEIGHT + 30:
             return
@@ -553,23 +488,18 @@ class WorldMapScreen:
         color = nation.color if nation else (150, 150, 150)
 
         if general is self.selected_general:
-            pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (x, y), 14, 3)
+            pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (int(x), int(y)), 14, 3)
         elif not general.moved:
-            pygame.draw.circle(self.screen, COLOR_GENERAL_MOVABLE, (x, y), 12, 2)
+            pygame.draw.circle(self.screen, COLOR_GENERAL_MOVABLE, (int(x), int(y)), 12, 2)
         else:
-            pygame.draw.circle(self.screen, COLOR_GENERAL_DONE, (x, y), 12, 2)
+            pygame.draw.circle(self.screen, COLOR_GENERAL_DONE, (int(x), int(y)), 12, 2)
 
-        pygame.draw.circle(self.screen, color, (x, y), 8)
-        pygame.draw.circle(self.screen, COLOR_WHITE, (x, y), 8, 1)
-
-        for i in range(5):
-            angle = math.radians(i * 72 - 90)
-            sx = x + math.cos(angle) * 4
-            sy = y + math.sin(angle) * 4
+        pygame.draw.circle(self.screen, color, (int(x), int(y)), 8)
+        pygame.draw.circle(self.screen, COLOR_WHITE, (int(x), int(y)), 8, 1)
 
         label = self.font_region.render(f"{general.name[:6]}({general.troops})", True, COLOR_WHITE)
-        lx = x - label.get_width() // 2
-        ly = y - 22
+        lx = int(x) - label.get_width() // 2
+        ly = int(y) - 22
         bg = pygame.Surface((label.get_width() + 4, label.get_height() + 2), pygame.SRCALPHA)
         bg.fill((0, 0, 0, 160))
         self.screen.blit(bg, (lx - 2, ly - 1))
@@ -600,12 +530,12 @@ class WorldMapScreen:
         )
         self.screen.blit(gen_text, (12, hud_y + 40))
 
-        regions_count = {}
-        for r in self.regions:
-            regions_count[r.owner] = regions_count.get(r.owner, 0) + 1
+        provinces_count = {}
+        for p in self.provinces:
+            provinces_count[p.owner] = provinces_count.get(p.owner, 0) + 1
         rx = SCREEN_WIDTH - 12
         for nation_key in ["red", "blue", "green"]:
-            count = regions_count.get(nation_key, 0)
+            count = provinces_count.get(nation_key, 0)
             n = WORLD_NATIONS[nation_key]
             rt = self.font_hud.render(f"{n.name}: {count}", True, n.color)
             rx -= rt.get_width() + 16
@@ -613,9 +543,8 @@ class WorldMapScreen:
 
         if self.selected_general:
             sel = self.selected_general
-            g_idx = self._region_index(sel.col, sel.row)
-            adj = self._adjacent_regions(g_idx) if g_idx is not None else []
-            adj_names = [self.regions[i].name[:6] for i in adj[:5]]
+            adj = self._adjacent_provinces(sel.province_idx)
+            adj_names = [self.provinces[i].name[:8] for i in adj[:5]]
             sel_text = self.font_hud.render(
                 f"Selected: {sel.name} | Adjacent: {', '.join(adj_names)}",
                 True, COLOR_GENERAL_SELECTED

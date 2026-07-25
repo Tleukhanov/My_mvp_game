@@ -1,5 +1,6 @@
 import pygame
 import math
+import random
 from typing import List, Tuple, Optional, Dict
 from enum import Enum, auto
 
@@ -26,6 +27,39 @@ class Nation:
         self.gold = 500
 
 
+class Province:
+    def __init__(self, name: str, owner: str, region_type: RegionType,
+                 polygon: List[Tuple[int, int]], neighbors: List[str] = None):
+        self.name = name
+        self.owner = owner
+        self.region_type = region_type
+        self.polygon = polygon
+        self.neighbors = neighbors or []
+        self.troops = 0
+        self._centroid = None
+
+    @property
+    def centroid(self) -> Tuple[int, int]:
+        if self._centroid is None:
+            n = len(self.polygon)
+            cx = sum(p[0] for p in self.polygon) // n
+            cy = sum(p[1] for p in self.polygon) // n
+            self._centroid = (cx, cy)
+        return self._centroid
+
+    def contains_point(self, px: int, py: int) -> bool:
+        n = len(self.polygon)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = self.polygon[i]
+            xj, yj = self.polygon[j]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+
 class Region:
     def __init__(self, name: str, region_type: RegionType,
                  col: int, row: int, owner: str):
@@ -46,37 +80,37 @@ class Region:
 
 
 class General:
-    def __init__(self, name: str, nation: str, col: int, row: int,
+    def __init__(self, name: str, nation: str, province_idx: int,
                  troops: int = 1000):
         self.name = name
         self.nation = nation
-        self.col = col
-        self.row = row
+        self.province_idx = province_idx
         self.troops = troops
         self.max_troops = 3000
         self.moved = False
         self.health = 100
 
     @property
-    def x(self):
-        return self.col * CELL_SIZE + CELL_SIZE // 2
+    def x(self) -> int:
+        return WORLD_PROVINCES[self.province_idx].centroid[0]
 
     @property
-    def y(self):
-        return self.row * CELL_SIZE + CELL_SIZE // 2
+    def y(self) -> int:
+        return WORLD_PROVINCES[self.province_idx].centroid[1]
 
     def distance_to(self, other: "General") -> float:
-        return math.hypot(self.col - other.col, self.row - other.row)
+        return math.hypot(self.x - other.x, self.y - other.y)
 
-    def distance_to_region(self, region: Region) -> float:
-        return math.hypot(self.col - region.col, self.row - region.row)
+    def distance_to_province(self, province: Province) -> float:
+        return math.hypot(self.x - province.centroid[0],
+                          self.y - province.centroid[1])
 
 
 CELL_SIZE = 32
 MAP_COLS = 50
 MAP_ROWS = 30
-SCREEN_WIDTH = MAP_COLS * CELL_SIZE
-SCREEN_HEIGHT = MAP_ROWS * CELL_SIZE + 80
+SCREEN_WIDTH = 1600
+SCREEN_HEIGHT = 1040
 
 T_WATER = 0
 T_LAND = 1
@@ -85,109 +119,7 @@ T_BRIDGE = 3
 
 WORLD_MAP = []
 
-def _build_map():
-    grid = [[T_WATER] * MAP_COLS for _ in range(MAP_ROWS)]
-
-    for row in range(1, MAP_ROWS - 1):
-        for col in range(1, 13):
-            grid[row][col] = T_LAND
-    for row in range(1, MAP_ROWS - 1):
-        grid[row][13] = T_RIVER
-    for row in range(1, MAP_ROWS - 1):
-        for col in range(14, 38):
-            grid[row][col] = T_LAND
-    for row in range(1, MAP_ROWS - 1):
-        grid[row][38] = T_RIVER
-    for row in range(1, MAP_ROWS - 1):
-        for col in range(39, MAP_COLS - 1):
-            grid[row][col] = T_LAND
-
-    bridges_west = [8, 15, 24]
-    bridges_east = [10, 18, 25]
-    for b in bridges_west:
-        grid[b][13] = T_BRIDGE
-    for b in bridges_east:
-        grid[b][38] = T_BRIDGE
-
-    return grid
-
-WORLD_MAP = _build_map()
-
-RIVER_WEST = [(13, r) for r in range(1, MAP_ROWS - 1)]
-RIVER_EAST = [(38, r) for r in range(1, MAP_ROWS - 1)]
-BRIDGES = [(13, 8), (13, 15), (13, 24), (38, 10), (38, 18), (38, 25)]
-
 NATION_ID = {"red": 1, "blue": 2, "green": 3}
-
-WORLD_REGIONS = [
-    Region("Frosthollow", RegionType.VILLAGE, 3, 7, "neutral"),
-    Region("Icewind", RegionType.VILLAGE, 7, 7, "neutral"),
-    Region("Snowmere", RegionType.VILLAGE, 10, 7, "neutral"),
-    Region("Greyvale", RegionType.VILLAGE, 5, 12, "neutral"),
-    Region("Stoneford", RegionType.VILLAGE, 3, 22, "neutral"),
-    Region("Dustkeep", RegionType.VILLAGE, 7, 22, "neutral"),
-    Region("Ashgate", RegionType.VILLAGE, 10, 22, "neutral"),
-    Region("Boneyard", RegionType.VILLAGE, 5, 17, "neutral"),
-
-    Region("Ironhold", RegionType.CAPITAL, 20, 4, "red"),
-    Region("Northwall", RegionType.VILLAGE, 24, 4, "red"),
-    Region("Warfield", RegionType.VILLAGE, 28, 4, "red"),
-    Region("Bloodkeep", RegionType.CITY, 20, 10, "red"),
-    Region("Scarforge", RegionType.VILLAGE, 24, 10, "red"),
-    Region("Razorspine", RegionType.VILLAGE, 28, 10, "red"),
-
-    Region("Crossroads", RegionType.VILLAGE, 16, 14, "neutral"),
-    Region("Midway", RegionType.CITY, 20, 14, "neutral"),
-    Region("Stonebar", RegionType.VILLAGE, 24, 14, "neutral"),
-    Region("Eastreach", RegionType.VILLAGE, 28, 14, "neutral"),
-    Region("Windswept", RegionType.VILLAGE, 32, 14, "neutral"),
-    Region("Fords", RegionType.VILLAGE, 16, 18, "neutral"),
-    Region("Clearfield", RegionType.VILLAGE, 20, 18, "neutral"),
-    Region("Dirtford", RegionType.VILLAGE, 24, 18, "neutral"),
-    Region("Marshpoint", RegionType.VILLAGE, 28, 18, "neutral"),
-    Region("Ravengate", RegionType.VILLAGE, 32, 18, "neutral"),
-    Region("Barrowfield", RegionType.VILLAGE, 16, 21, "neutral"),
-    Region("Oldgate", RegionType.VILLAGE, 20, 21, "neutral"),
-    Region("Westmere", RegionType.VILLAGE, 24, 21, "neutral"),
-    Region("Dusthollow", RegionType.VILLAGE, 28, 21, "neutral"),
-    Region("Greywatch", RegionType.VILLAGE, 32, 21, "neutral"),
-
-    Region("Silverhold", RegionType.CAPITAL, 20, 24, "blue"),
-    Region("Dawnreach", RegionType.VILLAGE, 24, 24, "blue"),
-    Region("Starport", RegionType.VILLAGE, 28, 24, "blue"),
-    Region("Tidewall", RegionType.CITY, 20, 28, "blue"),
-    Region("Mistwood", RegionType.VILLAGE, 24, 28, "blue"),
-    Region("Frostgate", RegionType.VILLAGE, 28, 28, "blue"),
-
-    Region("Verdant", RegionType.CAPITAL, 42, 10, "green"),
-    Region("Leafguard", RegionType.VILLAGE, 44, 10, "green"),
-    Region("Greenvale", RegionType.VILLAGE, 46, 10, "green"),
-    Region("Mosshollow", RegionType.CITY, 42, 20, "green"),
-    Region("Thornridge", RegionType.VILLAGE, 44, 20, "green"),
-    Region("Brightwood", RegionType.VILLAGE, 46, 20, "green"),
-
-    Region("Dawnmere", RegionType.VILLAGE, 42, 6, "neutral"),
-    Region("Sunward", RegionType.VILLAGE, 44, 6, "neutral"),
-    Region("Highpeak", RegionType.VILLAGE, 46, 6, "neutral"),
-    Region("Windrift", RegionType.VILLAGE, 42, 14, "neutral"),
-    Region("Skyfall", RegionType.VILLAGE, 44, 14, "neutral"),
-    Region("Lightvale", RegionType.VILLAGE, 46, 14, "neutral"),
-    Region("Goldkeep", RegionType.VILLAGE, 42, 25, "neutral"),
-    Region("Emberford", RegionType.VILLAGE, 44, 25, "neutral"),
-    Region("Starwatch", RegionType.VILLAGE, 46, 25, "neutral"),
-    Region("Brightgate", RegionType.VILLAGE, 48, 15, "neutral"),
-]
-
-WORLD_GENERALS = [
-    General("Volkov", "red", 20, 4, 1200),
-    General("Korzh", "red", 24, 4, 800),
-    General("Aldric", "blue", 20, 24, 1100),
-    General("Brenna", "blue", 24, 24, 900),
-    General("Theron", "green", 42, 10, 1000),
-    General("Lyra", "green", 44, 10, 800),
-]
-
-PLAYER_NATION = "blue"
 
 COLOR_OCEAN = (40, 70, 120)
 COLOR_OCEAN_LIGHT = (50, 85, 140)
@@ -195,6 +127,7 @@ COLOR_LAND = (160, 150, 120)
 COLOR_RIVER = (50, 100, 170)
 COLOR_BRIDGE = (200, 180, 60)
 COLOR_NEUTRAL = (120, 115, 105)
+COLOR_PROVINCE_BORDER = (80, 75, 65)
 
 COLOR_NATION_RED = (170, 45, 40)
 COLOR_NATION_RED_LIGHT = (190, 65, 60)
@@ -219,31 +152,256 @@ WORLD_NATIONS = {
     "green": Nation("Green Dominion", COLOR_NATION_GREEN, COLOR_NATION_GREEN_LIGHT),
 }
 
+PLAYER_NATION = "blue"
+
+
+def _perturb(p1, p2, jitter=12):
+    mx = (p1[0] + p2[0]) // 2 + random.randint(-jitter, jitter)
+    my = (p1[1] + p2[1]) // 2 + random.randint(-jitter, jitter)
+    return (mx, my)
+
+
+random.seed(42)
+
+W0 = (0, 0)
+W1 = (94, 8)
+W2 = (188, 0)
+W3 = (282, 10)
+W4 = (376, 0)
+W5 = (470, 5)
+WM0 = (0, 480)
+WM1 = (92, 488)
+WM2 = (190, 475)
+WM3 = (280, 492)
+WM4 = (378, 478)
+WM5 = (470, 485)
+WB0 = (0, 960)
+WB1 = (96, 955)
+WB2 = (186, 960)
+WB3 = (284, 958)
+WB4 = (374, 960)
+WB5 = (470, 958)
+
+CW0 = (500, 0)
+CW1 = (618, 6)
+CW2 = (736, 0)
+CW3 = (854, 8)
+CW4 = (972, 0)
+CW5 = (1090, 3)
+CR1_0 = (500, 192)
+CR1_1 = (620, 200)
+CR1_2 = (732, 188)
+CR1_3 = (856, 196)
+CR1_4 = (968, 190)
+CR1_5 = (1090, 194)
+CR2_0 = (500, 384)
+CR2_1 = (616, 378)
+CR2_2 = (738, 390)
+CR2_3 = (852, 382)
+CR2_4 = (974, 386)
+CR2_5 = (1090, 388)
+CR3_0 = (500, 576)
+CR3_1 = (622, 582)
+CR3_2 = (734, 570)
+CR3_3 = (858, 578)
+CR3_4 = (970, 574)
+CR3_5 = (1090, 576)
+CR4_0 = (500, 768)
+CR4_1 = (618, 762)
+CR4_2 = (736, 776)
+CR4_3 = (854, 768)
+CR4_4 = (976, 772)
+CR4_5 = (1090, 770)
+CB0 = (500, 960)
+CB1 = (620, 958)
+CB2 = (734, 960)
+CB3 = (856, 956)
+CB4 = (972, 960)
+CB5 = (1090, 958)
+
+EW0 = (1120, 0)
+EW1 = (1224, 7)
+EW2 = (1328, 0)
+EW3 = (1432, 5)
+EW4 = (1536, 0)
+EW5 = (1600, 2)
+EM0 = (1120, 320)
+EM1 = (1226, 328)
+EM2 = (1330, 318)
+EM3 = (1434, 326)
+EM4 = (1538, 322)
+EM5 = (1600, 320)
+EB0 = (1120, 640)
+EB1 = (1222, 636)
+EB2 = (1328, 644)
+EB3 = (1430, 638)
+EB4 = (1536, 642)
+EB5 = (1600, 640)
+EE0 = (1120, 960)
+EE1 = (1226, 956)
+EE2 = (1326, 960)
+EE3 = (1434, 958)
+EE4 = (1534, 960)
+EE5 = (1600, 958)
+
+WORLD_PROVINCES = [
+    Province("Frosthollow", "neutral", RegionType.VILLAGE,
+             [W0, W1, WM1, WM0]),
+    Province("Icewind", "neutral", RegionType.VILLAGE,
+             [W1, W2, WM2, WM1]),
+    Province("Snowmere", "neutral", RegionType.VILLAGE,
+             [W2, W3, WM3, WM2]),
+    Province("Greyvale", "neutral", RegionType.VILLAGE,
+             [W3, W4, WM4, WM3]),
+    Province("Stoneford", "neutral", RegionType.VILLAGE,
+             [W4, W5, WM5, WM4]),
+    Province("Dustkeep", "neutral", RegionType.VILLAGE,
+             [WM0, WM1, WB1, WB0]),
+    Province("Ashgate", "neutral", RegionType.VILLAGE,
+             [WM1, WM2, WB2, WB1]),
+    Province("Boneyard", "neutral", RegionType.VILLAGE,
+             [WM2, WM3, WB3, WB2]),
+    Province("Ironvale", "neutral", RegionType.VILLAGE,
+             [WM3, WM4, WB4, WB3]),
+    Province("Wolfden", "neutral", RegionType.VILLAGE,
+             [WM4, WM5, WB5, WB4]),
+
+    Province("Ironhold", "red", RegionType.CAPITAL,
+             [CW0, CW1, CR1_1, CR1_0]),
+    Province("Northwall", "red", RegionType.VILLAGE,
+             [CW1, CW2, CR1_2, CR1_1]),
+    Province("Warfield", "red", RegionType.CITY,
+             [CW2, CW3, CR1_3, CR1_2]),
+    Province("Bloodkeep", "red", RegionType.VILLAGE,
+             [CW3, CW4, CR1_4, CR1_3]),
+    Province("Windswept", "neutral", RegionType.VILLAGE,
+             [CW4, CW5, CR1_5, CR1_4]),
+
+    Province("Scarforge", "red", RegionType.VILLAGE,
+             [CR1_0, CR1_1, CR2_1, CR2_0]),
+    Province("Razorspine", "red", RegionType.CITY,
+             [CR1_1, CR1_2, CR2_2, CR2_1]),
+    Province("Embercrest", "red", RegionType.VILLAGE,
+             [CR1_2, CR1_3, CR2_3, CR2_2]),
+    Province("Crossroads", "neutral", RegionType.VILLAGE,
+             [CR1_3, CR1_4, CR2_4, CR2_3]),
+    Province("Midway", "neutral", RegionType.CITY,
+             [CR1_4, CR1_5, CR2_5, CR2_4]),
+
+    Province("Stonebar", "neutral", RegionType.VILLAGE,
+             [CR2_0, CR2_1, CR3_1, CR3_0]),
+    Province("Eastreach", "neutral", RegionType.VILLAGE,
+             [CR2_1, CR2_2, CR3_2, CR3_1]),
+    Province("Fords", "neutral", RegionType.VILLAGE,
+             [CR2_2, CR2_3, CR3_3, CR3_2]),
+    Province("Clearfield", "neutral", RegionType.CITY,
+             [CR2_3, CR2_4, CR3_4, CR3_3]),
+    Province("Dirtford", "neutral", RegionType.VILLAGE,
+             [CR2_4, CR2_5, CR3_5, CR3_4]),
+
+    Province("Barrowfield", "neutral", RegionType.VILLAGE,
+             [CR3_0, CR3_1, CR4_1, CR4_0]),
+    Province("Marshpoint", "blue", RegionType.VILLAGE,
+             [CR3_1, CR3_2, CR4_2, CR4_1]),
+    Province("Ravengate", "blue", RegionType.VILLAGE,
+             [CR3_2, CR3_3, CR4_3, CR4_2]),
+    Province("Oldgate", "blue", RegionType.CITY,
+             [CR3_3, CR3_4, CR4_4, CR4_3]),
+    Province("Westmere", "blue", RegionType.VILLAGE,
+             [CR3_4, CR3_5, CR4_5, CR4_4]),
+
+    Province("Dawnreach", "blue", RegionType.VILLAGE,
+             [CR4_0, CR4_1, CB1, CB0]),
+    Province("Starport", "blue", RegionType.VILLAGE,
+             [CR4_1, CR4_2, CB2, CB1]),
+    Province("Silverhold", "blue", RegionType.CAPITAL,
+             [CR4_2, CR4_3, CB3, CB2]),
+    Province("Dusthollow", "neutral", RegionType.VILLAGE,
+             [CR4_3, CR4_4, CB4, CB3]),
+    Province("Greywatch", "neutral", RegionType.VILLAGE,
+             [CR4_4, CR4_5, CB5, CB4]),
+
+    Province("Dawnmere", "neutral", RegionType.VILLAGE,
+             [EW0, EW1, EM1, EM0]),
+    Province("Highpeak", "neutral", RegionType.VILLAGE,
+             [EW1, EW2, EM2, EM1]),
+    Province("Windrift", "neutral", RegionType.VILLAGE,
+             [EW2, EW3, EM3, EM2]),
+    Province("Skyfall", "neutral", RegionType.VILLAGE,
+             [EW3, EW4, EM4, EM3]),
+    Province("Lightvale", "neutral", RegionType.VILLAGE,
+             [EW4, EW5, EM5, EM4]),
+
+    Province("Leafguard", "green", RegionType.VILLAGE,
+             [EM0, EM1, EB1, EB0]),
+    Province("Verdant", "green", RegionType.CITY,
+             [EM1, EM2, EB2, EB1]),
+    Province("Greenvale", "green", RegionType.CAPITAL,
+             [EM2, EM3, EB3, EB2]),
+    Province("Mosshollow", "green", RegionType.CITY,
+             [EM3, EM4, EB4, EB3]),
+    Province("Thornridge", "green", RegionType.VILLAGE,
+             [EM4, EM5, EB5, EB4]),
+
+    Province("Brightwood", "green", RegionType.VILLAGE,
+             [EB0, EB1, EE1, EE0]),
+    Province("Sunward", "green", RegionType.VILLAGE,
+             [EB1, EB2, EE2, EE1]),
+    Province("Goldkeep", "neutral", RegionType.VILLAGE,
+             [EB2, EB3, EE3, EE2]),
+    Province("Emberford", "neutral", RegionType.VILLAGE,
+             [EB3, EB4, EE4, EE3]),
+    Province("Starwatch", "neutral", RegionType.VILLAGE,
+             [EB4, EB5, EE5, EE4]),
+]
+
+WORLD_REGIONS = [Region(p.name, p.region_type, 0, 0, p.owner)
+                 for p in WORLD_PROVINCES]
+
 PROVINCE_CONNECTIONS = [
-    (0, 1), (1, 2), (0, 3), (1, 3), (2, 3),
-    (4, 5), (5, 6), (4, 7), (5, 7), (6, 7),
-    (0, 4), (1, 5), (2, 6), (3, 7),
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (5, 6), (6, 7), (7, 8), (8, 9),
+    (0, 5), (1, 6), (2, 7), (3, 8), (4, 9),
 
-    (8, 9), (9, 10), (8, 11), (9, 12), (10, 13),
-    (11, 12), (12, 13),
-
-    (14, 15), (15, 16), (16, 17), (17, 18), (18, 19),
-    (14, 17), (15, 18), (16, 19),
+    (10, 11), (11, 12), (12, 13), (13, 14),
+    (15, 16), (16, 17), (17, 18), (18, 19),
     (20, 21), (21, 22), (22, 23), (23, 24),
-    (20, 23), (21, 24),
+    (25, 26), (26, 27), (27, 28), (28, 29),
+    (30, 31), (31, 32), (32, 33), (33, 34),
 
-    (32, 33), (33, 34), (34, 35), (35, 36),
-    (32, 35), (33, 36),
+    (10, 15), (15, 20), (20, 25), (25, 30),
+    (11, 16), (16, 21), (21, 26), (26, 31),
+    (12, 17), (17, 22), (22, 27), (27, 32),
+    (13, 18), (18, 23), (23, 28), (28, 33),
+    (14, 19), (19, 24), (24, 29), (29, 34),
 
-    (37, 38), (38, 39), (39, 40), (40, 41),
-    (37, 40), (38, 41),
+    (35, 36), (36, 37), (37, 38), (38, 39),
+    (40, 41), (41, 42), (42, 43), (43, 44),
+    (45, 46), (46, 47), (47, 48), (48, 49),
 
-    (11, 14), (11, 20), (12, 15), (13, 16),
-    (23, 32), (24, 33),
+    (35, 40), (40, 45),
+    (36, 41), (41, 46),
+    (37, 42), (42, 47),
+    (38, 43), (43, 48),
+    (39, 44), (44, 49),
 
-    (3, 8), (7, 11),
-    (19, 26), (24, 31),
+    (4, 10), (7, 20), (9, 30),
+    (14, 35), (24, 40), (34, 45),
+]
 
-    (39, 42), (40, 43), (41, 44),
-    (39, 46), (40, 47), (41, 48),
+BRIDGE_CONNECTIONS = [
+    (4, 10), (7, 20), (9, 30),
+    (14, 35), (24, 40), (34, 45),
+]
+
+RIVER_WEST_X = 485
+RIVER_EAST_X = 1105
+
+WORLD_GENERALS = [
+    General("Volkov", "red", 10, 1200),
+    General("Korzh", "red", 11, 800),
+    General("Aldric", "blue", 32, 1100),
+    General("Brenna", "blue", 31, 900),
+    General("Theron", "green", 42, 1000),
+    General("Lyra", "green", 41, 800),
 ]

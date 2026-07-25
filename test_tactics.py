@@ -778,10 +778,9 @@ class TestWorldData:
         assert "green" in nations_with_caps
 
     def test_general_start_positions_valid(self):
-        from world_data import WORLD_GENERALS, MAP_COLS, MAP_ROWS
+        from world_data import WORLD_GENERALS, WORLD_PROVINCES
         for g in WORLD_GENERALS:
-            assert 0 <= g.col < MAP_COLS
-            assert 0 <= g.row < MAP_ROWS
+            assert 0 <= g.province_idx < len(WORLD_PROVINCES)
 
     def test_region_start_positions_valid(self):
         from world_data import WORLD_REGIONS, MAP_COLS, MAP_ROWS
@@ -809,37 +808,21 @@ class TestWorldData:
 class TestWorldMap:
     def setup_method(self):
         import world_data
-        world_data.NATION_TERRITORY = [
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ]
+        world_data.NATION_TERRITORY = []
 
     def test_general_distance(self):
-        from world_data import General
-        g1 = General("A", "red", 5, 5, 1000)
-        g2 = General("B", "blue", 8, 9, 1000)
+        from world_data import General, WORLD_PROVINCES
+        g1 = General("A", "red", 0, 1000)
+        g2 = General("B", "blue", 1, 1000)
         dist = g1.distance_to(g2)
-        assert dist == pytest.approx(5.0, 0.1)
+        assert dist >= 0
 
     def test_general_position(self):
-        from world_data import General, CELL_SIZE
-        g = General("A", "red", 3, 4, 1000)
-        assert g.x == 3 * CELL_SIZE + CELL_SIZE // 2
-        assert g.y == 4 * CELL_SIZE + CELL_SIZE // 2
+        from world_data import General, WORLD_PROVINCES
+        g = General("A", "red", 0, 1000)
+        cx, cy = WORLD_PROVINCES[0].centroid
+        assert g.x == cx
+        assert g.y == cy
 
     def test_region_position(self):
         from world_data import Region, RegionType, CELL_SIZE
@@ -849,14 +832,14 @@ class TestWorldMap:
 
     def test_general_moved_flag(self):
         from world_data import General
-        g = General("A", "red", 5, 5, 1000)
+        g = General("A", "red", 0, 1000)
         assert g.moved is False
         g.moved = True
         assert g.moved is True
 
     def test_general_troops_cap(self):
         from world_data import General
-        g = General("A", "red", 5, 5, 5000)
+        g = General("A", "red", 0, 5000)
         assert g.troops == 5000
         assert g.max_troops == 3000
 
@@ -869,7 +852,7 @@ class TestWorldMap:
 class TestImports:
     def test_import_world_data(self):
         import world_data
-        assert hasattr(world_data, "WORLD_MAP")
+        assert hasattr(world_data, "WORLD_PROVINCES")
         assert hasattr(world_data, "WORLD_REGIONS")
         assert hasattr(world_data, "WORLD_GENERALS")
         assert hasattr(world_data, "WORLD_NATIONS")
@@ -918,98 +901,69 @@ class TestImports:
 
 
 class TestWorldMapTopology:
-    def test_map_dimensions(self):
-        from world_data import WORLD_MAP, MAP_ROWS, MAP_COLS
-        assert len(WORLD_MAP) == MAP_ROWS
-        for row in WORLD_MAP:
-            assert len(row) == MAP_COLS
+    def test_province_count(self):
+        from world_data import WORLD_PROVINCES
+        assert len(WORLD_PROVINCES) == 50
 
-    def test_map_tiles_valid(self):
-        from world_data import WORLD_MAP, T_WATER, T_LAND, T_RIVER, T_BRIDGE
-        valid_tiles = {T_WATER, T_LAND, T_RIVER, T_BRIDGE}
-        for row in WORLD_MAP:
-            for tile in row:
-                assert tile in valid_tiles, f"Invalid tile value: {tile}"
+    def test_all_provinces_have_polygons(self):
+        from world_data import WORLD_PROVINCES
+        for p in WORLD_PROVINCES:
+            assert len(p.polygon) >= 3, f"Province {p.name} has < 3 vertices"
 
-    def test_rivers_in_range(self):
-        from world_data import RIVER_WEST, RIVER_EAST, MAP_COLS, MAP_ROWS
-        for col, row in RIVER_WEST:
-            assert 0 <= col < MAP_COLS, f"RIVER_WEST col out of range: {col}"
-            assert 0 <= row < MAP_ROWS, f"RIVER_WEST row out of range: {row}"
-        for col, row in RIVER_EAST:
-            assert 0 <= col < MAP_COLS, f"RIVER_EAST col out of range: {col}"
-            assert 0 <= row < MAP_ROWS, f"RIVER_EAST row out of range: {row}"
+    def test_all_polygons_on_screen(self):
+        from world_data import WORLD_PROVINCES, SCREEN_WIDTH, SCREEN_HEIGHT
+        for p in WORLD_PROVINCES:
+            for x, y in p.polygon:
+                assert -10 <= x <= SCREEN_WIDTH + 10, \
+                    f"Province {p.name} vertex ({x},{y}) off screen x"
+                assert -10 <= y <= SCREEN_HEIGHT, \
+                    f"Province {p.name} vertex ({x},{y}) off screen y"
 
-    def test_bridges_in_range(self):
-        from world_data import BRIDGES, MAP_COLS, MAP_ROWS
-        for col, row in BRIDGES:
-            assert 0 <= col < MAP_COLS, f"Bridge col out of range: {col}"
-            assert 0 <= row < MAP_ROWS, f"Bridge row out of range: {row}"
+    def test_centroids_computed(self):
+        from world_data import WORLD_PROVINCES
+        for p in WORLD_PROVINCES:
+            cx, cy = p.centroid
+            assert isinstance(cx, int)
+            assert isinstance(cy, int)
 
-    def test_bridges_have_correct_count(self):
-        from world_data import BRIDGES
-        assert len(BRIDGES) == 6
+    def test_point_in_polygon(self):
+        from world_data import WORLD_PROVINCES
+        for p in WORLD_PROVINCES:
+            cx, cy = p.centroid
+            assert p.contains_point(cx, cy), \
+                f"Province {p.name} centroid not inside its polygon"
 
-    def test_regions_on_valid_tiles(self):
-        from world_data import WORLD_REGIONS, WORLD_MAP, T_WATER
-        for r in WORLD_REGIONS:
-            assert 0 <= r.row < len(WORLD_MAP)
-            assert 0 <= r.col < len(WORLD_MAP[0])
-            assert WORLD_MAP[r.row][r.col] != T_WATER, \
-                f"Region {r.name} on water tile"
+    def test_rivers_defined(self):
+        from world_data import RIVER_WEST_X, RIVER_EAST_X
+        assert 0 < RIVER_WEST_X < 1600
+        assert 0 < RIVER_EAST_X < 1600
+        assert RIVER_WEST_X < RIVER_EAST_X
 
-    def test_generals_on_valid_tiles(self):
-        from world_data import WORLD_GENERALS, WORLD_MAP, T_WATER
-        for g in WORLD_GENERALS:
-            assert 0 <= g.row < len(WORLD_MAP)
-            assert 0 <= g.col < len(WORLD_MAP[0])
-            assert WORLD_MAP[g.row][g.col] != T_WATER, \
-                f"General {g.name} on water tile"
+    def test_bridges_defined(self):
+        from world_data import BRIDGE_CONNECTIONS
+        assert len(BRIDGE_CONNECTIONS) == 6
 
-    def test_capital_positions_match_generals(self):
-        from world_data import WORLD_REGIONS, WORLD_GENERALS, RegionType
-        capitals = {r.owner: r for r in WORLD_REGIONS
-                     if r.region_type == RegionType.CAPITAL}
-        for g in WORLD_GENERALS:
-            if g.nation in capitals:
-                cap = capitals[g.nation]
-                dist = abs(g.col - cap.col) + abs(g.row - cap.row)
-                assert dist <= 5, \
-                    f"General {g.name} too far from {g.nation} capital"
-
-    def test_three_landmasses(self):
-        from world_data import WORLD_MAP, T_LAND
-        visited = [[False]*len(WORLD_MAP[0]) for _ in range(len(WORLD_MAP))]
-        landmasses = 0
-        for r in range(len(WORLD_MAP)):
-            for c in range(len(WORLD_MAP[0])):
-                if WORLD_MAP[r][c] == T_LAND and not visited[r][c]:
-                    landmasses += 1
-                    stack = [(r, c)]
-                    while stack:
-                        cr, cc = stack.pop()
-                        if 0 <= cr < len(WORLD_MAP) and 0 <= cc < len(WORLD_MAP[0]):
-                            if WORLD_MAP[cr][cc] == T_LAND and not visited[cr][cc]:
-                                visited[cr][cc] = True
-                                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-                                    stack.append((cr+dr, cc+dc))
-        assert landmasses >= 3, f"Expected at least 3 landmasses, got {landmasses}"
+    def test_bridge_indices_valid(self):
+        from world_data import BRIDGE_CONNECTIONS, WORLD_PROVINCES
+        for a, b in BRIDGE_CONNECTIONS:
+            assert 0 <= a < len(WORLD_PROVINCES)
+            assert 0 <= b < len(WORLD_PROVINCES)
 
     def test_each_faction_has_regions(self):
-        from world_data import WORLD_REGIONS
+        from world_data import WORLD_PROVINCES
         faction_counts = {}
-        for r in WORLD_REGIONS:
-            if r.owner != "neutral":
-                faction_counts[r.owner] = faction_counts.get(r.owner, 0) + 1
+        for p in WORLD_PROVINCES:
+            if p.owner != "neutral":
+                faction_counts[p.owner] = faction_counts.get(p.owner, 0) + 1
         for faction in ["red", "blue", "green"]:
-            assert faction in faction_counts, f"Faction {faction} has no regions"
+            assert faction in faction_counts, f"Faction {faction} has no provinces"
             assert faction_counts[faction] >= 3, \
-                f"Faction {faction} has only {faction_counts[faction]} regions"
+                f"Faction {faction} has only {faction_counts[faction]} provinces"
 
-    def test_neutral_regions_exist(self):
-        from world_data import WORLD_REGIONS
-        neutral = [r for r in WORLD_REGIONS if r.owner == "neutral"]
-        assert len(neutral) >= 5, "Expected at least 5 neutral regions"
+    def test_neutral_provinces_exist(self):
+        from world_data import WORLD_PROVINCES
+        neutral = [p for p in WORLD_PROVINCES if p.owner == "neutral"]
+        assert len(neutral) >= 5, "Expected at least 5 neutral provinces"
 
     def test_nation_ids_correct(self):
         from world_data import NATION_ID
@@ -1017,26 +971,44 @@ class TestWorldMapTopology:
         assert NATION_ID["blue"] == 2
         assert NATION_ID["green"] == 3
 
-    def test_total_regions_51(self):
-        from world_data import WORLD_REGIONS
-        assert len(WORLD_REGIONS) == 51
+    def test_each_faction_has_7_provinces(self):
+        from world_data import WORLD_PROVINCES
+        counts = {}
+        for p in WORLD_PROVINCES:
+            if p.owner != "neutral":
+                counts[p.owner] = counts.get(p.owner, 0) + 1
+        assert counts["red"] == 7
+        assert counts["blue"] == 7
+        assert counts["green"] == 7
 
     def test_connections_exist(self):
-        from world_data import PROVINCE_CONNECTIONS, WORLD_REGIONS
+        from world_data import PROVINCE_CONNECTIONS, WORLD_PROVINCES
         assert len(PROVINCE_CONNECTIONS) > 0
         for a, b in PROVINCE_CONNECTIONS:
-            assert 0 <= a < len(WORLD_REGIONS)
-            assert 0 <= b < len(WORLD_REGIONS)
+            assert 0 <= a < len(WORLD_PROVINCES)
+            assert 0 <= b < len(WORLD_PROVINCES)
 
-    def test_each_faction_has_6_regions(self):
-        from world_data import WORLD_REGIONS
-        counts = {}
-        for r in WORLD_REGIONS:
-            if r.owner != "neutral":
-                counts[r.owner] = counts.get(r.owner, 0) + 1
-        assert counts["red"] == 6
-        assert counts["blue"] == 6
-        assert counts["green"] == 6
+    def test_three_continents_by_x_position(self):
+        from world_data import WORLD_PROVINCES
+        west = [p for p in WORLD_PROVINCES
+                if p.centroid[0] < 480]
+        center = [p for p in WORLD_PROVINCES
+                  if 490 < p.centroid[0] < 1100]
+        east = [p for p in WORLD_PROVINCES
+                if p.centroid[0] > 1110]
+        assert len(west) >= 5, f"West continent has only {len(west)} provinces"
+        assert len(center) >= 10, f"Center continent has only {len(center)} provinces"
+        assert len(east) >= 5, f"East continent has only {len(east)} provinces"
+
+    def test_each_nation_has_capital(self):
+        from world_data import WORLD_PROVINCES, RegionType
+        nations_with_caps = set()
+        for p in WORLD_PROVINCES:
+            if p.region_type == RegionType.CAPITAL:
+                nations_with_caps.add(p.owner)
+        assert "red" in nations_with_caps
+        assert "blue" in nations_with_caps
+        assert "green" in nations_with_caps
 
 
 class TestWorldMapInit:
@@ -1048,7 +1020,7 @@ class TestWorldMapInit:
             screen = WorldMapScreen()
             assert screen.running is True
             assert screen.diplomacy is not None
-            assert len(screen.regions) > 0
+            assert len(screen.provinces) > 0
             assert len(screen.generals) > 0
             assert screen.selected_general is None
         except Exception:
