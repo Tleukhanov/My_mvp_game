@@ -8,3 +8,4 @@ build/
 .env
 *.db
 FOR_DEVELOP.md
+карты/
