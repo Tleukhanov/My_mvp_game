@@ -16,6 +16,7 @@ from world_data import (
     RIVER_WEST_X, RIVER_EAST_X,
 )
 from diplomacy import DiplomacyManager, Relation
+from textures import TextureManager, GeneralIcon, RiverRenderer
 
 
 class WorldMapScreen:
@@ -63,11 +64,22 @@ class WorldMapScreen:
         self._message: Optional[str] = None
         self._message_timer = 0.0
 
+        self.tex_manager = TextureManager()
+        self._build_province_offsets()
+
     def _build_connection_index(self):
         self._conn_by_province = {}
         for a, b in self.connections:
             self._conn_by_province.setdefault(a, set()).add(b)
             self._conn_by_province.setdefault(b, set()).add(a)
+
+    def _build_province_offsets(self):
+        self._prov_offsets = []
+        for prov in self.provinces:
+            poly = prov.polygon
+            min_x = min(p[0] for p in poly)
+            min_y = min(p[1] for p in poly)
+            self._prov_offsets.append((min_x, min_y))
 
     def _adjacent_provinces(self, idx: int) -> List[int]:
         return list(self._conn_by_province.get(idx, set()))
@@ -387,20 +399,20 @@ class WorldMapScreen:
             self._winner = "VICTORY"
 
     def _render(self):
-        self.screen.fill(COLOR_OCEAN)
+        ocean = self.tex_manager.get_ocean_texture(SCREEN_WIDTH, SCREEN_HEIGHT - 80)
+        self.screen.blit(ocean, (0, 0))
 
         for i, prov in enumerate(self.provinces):
+            min_x, min_y = self._prov_offsets[i]
+            tex = self.tex_manager.get_province_texture(
+                i, prov.polygon, prov.owner, prov.region_type,
+                SCREEN_WIDTH, SCREEN_HEIGHT
+            )
+            sx = min_x - self.cam_x - 4
+            sy = min_y - self.cam_y - 4
+            self.screen.blit(tex, (sx, sy))
+
             screen_poly = [(x - self.cam_x, y - self.cam_y) for x, y in prov.polygon]
-
-            nation = WORLD_NATIONS.get(prov.owner)
-            if nation:
-                color = nation.color
-            elif prov.owner == "neutral":
-                color = COLOR_NEUTRAL
-            else:
-                color = COLOR_LAND
-
-            pygame.draw.polygon(self.screen, color, screen_poly)
             pygame.draw.polygon(self.screen, COLOR_PROVINCE_BORDER, screen_poly, 1)
 
         self._render_rivers()
@@ -416,7 +428,9 @@ class WorldMapScreen:
                 cx, cy = prov.centroid
                 sx = cx - self.cam_x
                 sy = cy - self.cam_y
-                pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (sx, sy), 20, 2)
+                pulse = abs(math.sin(pygame.time.get_ticks() * 0.004)) * 0.4 + 0.6
+                col = (int(255 * pulse), int(255 * pulse), int(80 * pulse))
+                pygame.draw.circle(self.screen, col, (sx, sy), 22, 2)
 
         self._render_hud()
 
@@ -435,22 +449,11 @@ class WorldMapScreen:
         pygame.display.flip()
 
     def _render_rivers(self):
-        t = pygame.time.get_ticks() * 0.003
+        t = pygame.time.get_ticks()
 
         for river_x in [RIVER_WEST_X, RIVER_EAST_X]:
-            points = []
-            for y in range(-20, SCREEN_HEIGHT - 60, 4):
-                wy = y + self.cam_y
-                wave = math.sin(wy * 0.01 + t) * 12
-                sx = river_x + wave - self.cam_x
-                points.append((sx, y))
-
-            if len(points) > 1:
-                for j in range(len(points) - 1):
-                    wave2 = math.sin((points[j][1] + self.cam_y) * 0.01 + t + 0.5) * 8
-                    width = 24 + int(wave2)
-                    pygame.draw.line(self.screen, COLOR_RIVER,
-                                     points[j], points[j + 1], width)
+            RiverRenderer.draw_river(self.screen, river_x, self.cam_x, self.cam_y,
+                                     SCREEN_HEIGHT, t)
 
             bridge_indices = []
             for a, b in BRIDGE_CONNECTIONS:
@@ -463,17 +466,7 @@ class WorldMapScreen:
                     bridge_indices.append(bridge_y)
 
             for by in bridge_indices:
-                sx = river_x - self.cam_x
-                sy = by - self.cam_y
-                bw, bh = 30, 14
-                pygame.draw.rect(self.screen, COLOR_BRIDGE,
-                                 (sx - bw // 2, sy - bh // 2, bw, bh))
-                pygame.draw.rect(self.screen, COLOR_WHITE,
-                                 (sx - bw // 2, sy - bh // 2, bw, bh), 2)
-                for k in range(3):
-                    lx = sx - bw // 2 + 6 + k * (bw // 3)
-                    pygame.draw.line(self.screen, COLOR_BLACK,
-                                     (lx, sy - bh // 2), (lx, sy + bh // 2), 1)
+                RiverRenderer.draw_bridge(self.screen, river_x, by, self.cam_x, self.cam_y)
 
     def _render_general(self, general: General):
         prov = self.provinces[general.province_idx]
@@ -487,19 +480,13 @@ class WorldMapScreen:
         nation = WORLD_NATIONS.get(general.nation)
         color = nation.color if nation else (150, 150, 150)
 
-        if general is self.selected_general:
-            pygame.draw.circle(self.screen, COLOR_GENERAL_SELECTED, (int(x), int(y)), 14, 3)
-        elif not general.moved:
-            pygame.draw.circle(self.screen, COLOR_GENERAL_MOVABLE, (int(x), int(y)), 12, 2)
-        else:
-            pygame.draw.circle(self.screen, COLOR_GENERAL_DONE, (int(x), int(y)), 12, 2)
-
-        pygame.draw.circle(self.screen, color, (int(x), int(y)), 8)
-        pygame.draw.circle(self.screen, COLOR_WHITE, (int(x), int(y)), 8, 1)
+        is_selected = general is self.selected_general
+        GeneralIcon.draw_shield(self.screen, int(x), int(y), color,
+                                selected=is_selected, moved=general.moved)
 
         label = self.font_region.render(f"{general.name[:6]}({general.troops})", True, COLOR_WHITE)
         lx = int(x) - label.get_width() // 2
-        ly = int(y) - 22
+        ly = int(y) - 24
         bg = pygame.Surface((label.get_width() + 4, label.get_height() + 2), pygame.SRCALPHA)
         bg.fill((0, 0, 0, 160))
         self.screen.blit(bg, (lx - 2, ly - 1))
