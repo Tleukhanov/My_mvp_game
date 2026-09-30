@@ -161,6 +161,75 @@ def _perturb(p1, p2, jitter=12):
     return (mx, my)
 
 
+def _make_organic_quads(quads, corner_jitter=10, edge_jitter=9, subdiv=3, seed=777):
+    """Делает границы неровными, но топологически корректными.
+
+    - углы двигаются один раз (общие углы остаются общими);
+    - каждое общее ребро делится одинаково для обоих соседей.
+    Возвращает список полигонов с ~4*(subdiv+1) вершинами.
+    """
+    import math as _math
+    rng = random.Random(seed)
+    # 1. собрать уникальные углы
+    uniq = {}
+    for q in quads:
+        for p in q:
+            uniq[p] = uniq.get(p, 0) + 1
+    jittered = {}
+    for p in uniq:
+        x, y = p
+        on_border = (x <= 2 or x >= SCREEN_WIDTH - 2 or y <= 2 or y >= 958 - 2)
+        if on_border:
+            jittered[p] = p
+        else:
+            jittered[p] = (
+                int(x + rng.uniform(-corner_jitter, corner_jitter)),
+                int(y + rng.uniform(-corner_jitter, corner_jitter)),
+            )
+    jquads = [[jittered[p] for p in q] for q in quads]
+
+    # 2. кэш подразбиения рёбер (ключ — отсортированная пара)
+    edge_cache = {}
+
+    def subdivide(a, b):
+        key = tuple(sorted([a, b]))
+        if key in edge_cache:
+            pts = edge_cache[key]
+        else:
+            pts = []
+            dx = b[0] - a[0]
+            dy = b[1] - a[1]
+            leng = _math.hypot(dx, dy) or 1.0
+            nx, ny = -dy / leng, dx / leng  # нормаль
+            for k in range(1, subdiv + 1):
+                t = k / (subdiv + 1)
+                mx = a[0] + dx * t
+                my = a[1] + dy * t
+                # меньше джиттер в середине длинных рёбер, больше — к краям
+                off = rng.uniform(-edge_jitter, edge_jitter)
+                mx += nx * off
+                my += ny * off
+                pts.append((int(mx), int(my)))
+            edge_cache[key] = pts
+        # ориентировать по направлению a->b
+        if key[0] == a:
+            return list(pts)
+        else:
+            return list(reversed(pts))
+
+    out = []
+    for q in jquads:
+        poly = []
+        n = len(q)
+        for i in range(n):
+            a = q[i]
+            b = q[(i + 1) % n]
+            poly.append(a)
+            poly.extend(subdivide(a, b))
+        out.append(poly)
+    return out
+
+
 random.seed(42)
 
 W0 = (0, 0)
@@ -354,6 +423,16 @@ WORLD_PROVINCES = [
     Province("Starwatch", "neutral", RegionType.VILLAGE,
              [EB4, EB5, EE5, EE4]),
 ]
+
+# --- Органические границы: один раз делим общие рёбра ---
+try:
+    _quads = [list(p.polygon) for p in WORLD_PROVINCES]
+    _organic = _make_organic_quads(_quads)
+    for _prov, _poly in zip(WORLD_PROVINCES, _organic):
+        _prov.polygon = _poly
+        _prov._centroid = None
+except Exception:
+    pass
 
 WORLD_REGIONS = [Region(p.name, p.region_type, 0, 0, p.owner)
                  for p in WORLD_PROVINCES]

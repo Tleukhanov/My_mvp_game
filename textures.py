@@ -45,14 +45,24 @@ def _blend_color(c1: Tuple[int, ...], c2: Tuple[int, ...], t: float) -> Tuple[in
     )
 
 
-GRASS_COLORS = [
-    (75, 120, 50), (85, 130, 55), (65, 110, 45),
-    (90, 135, 60), (70, 115, 48), (80, 125, 52),
+# Наполеоновский пергамент: оливково-хаки база как на референсе
+PARCHMENT_BASE = [
+    (118, 114, 72), (112, 108, 68), (124, 119, 76),
+    (106, 102, 64), (115, 111, 70), (121, 116, 74),
 ]
+PARCHMENT_DARK = (88, 86, 54)
+PARCHMENT_LIGHT = (138, 133, 88)
+
+GRASS_COLORS = PARCHMENT_BASE
 
 FOREST_COLORS = [
-    (40, 90, 35), (50, 100, 40), (35, 85, 30),
-    (45, 95, 38), (55, 105, 42),
+    (58, 62, 34), (66, 70, 38), (52, 56, 30),
+    (72, 74, 42), (60, 64, 36),
+]
+
+FIELD_COLORS = [
+    (130, 124, 80), (104, 100, 62), (136, 130, 84),
+    (96, 94, 58),
 ]
 
 MOUNTAIN_COLORS = [
@@ -60,20 +70,29 @@ MOUNTAIN_COLORS = [
     (145, 140, 130), (100, 95, 85),
 ]
 
-NEUTRAL_COLORS = [
-    (110, 105, 95), (120, 115, 100), (100, 98, 88),
-    (115, 110, 98), (105, 100, 90),
-]
+NEUTRAL_COLORS = PARCHMENT_BASE
 
-WATER_DEEP = (30, 55, 100)
-WATER_MID = (40, 70, 120)
-WATER_LIGHT = (55, 90, 145)
-WATER_FOAM = (140, 170, 200)
+# приглушённые оттенки владельцев — только лёгкий налёт поверх пергамента
+OWNER_TINT = {
+    "neutral": None,
+    "red": (150, 70, 55),
+    "blue": (80, 100, 150),
+    "green": (80, 125, 75),
+}
+
+WATER_DEEP = (52, 58, 44)
+WATER_MID = (72, 74, 56)
+WATER_LIGHT = (96, 96, 72)
+WATER_FOAM = (160, 155, 125)
+
+RIVER_COLOR = (120, 140, 170)
+RIVER_DARK = (90, 110, 145)
+RIVER_LIGHT = (165, 185, 210)
 
 
 class TextureManager:
     def __init__(self):
-        self._province_cache: Dict[int, pygame.Surface] = {}
+        self._province_cache: Dict[tuple, pygame.Surface] = {}
         self._water_surface: pygame.Surface = None
         self._water_size: Tuple[int, int] = (0, 0)
         self._ocean_cache: pygame.Surface = None
@@ -81,8 +100,10 @@ class TextureManager:
 
     def get_province_texture(self, province_idx: int, polygon: List[Tuple[int, int]],
                              owner: str, region_type, screen_w: int, screen_h: int) -> pygame.Surface:
-        if province_idx in self._province_cache:
-            return self._province_cache[province_idx]
+        # ключ включает владельца — иначе захват не меняет цвет
+        key = (province_idx, owner)
+        if key in self._province_cache:
+            return self._province_cache[key]
 
         min_x = min(p[0] for p in polygon)
         min_y = min(p[1] for p in polygon)
@@ -92,7 +113,7 @@ class TextureManager:
         h = max_y - min_y
         if w <= 0 or h <= 0:
             surf = pygame.Surface((1, 1), pygame.SRCALPHA)
-            self._province_cache[province_idx] = surf
+            self._province_cache[key] = surf
             return surf
 
         pad = 4
@@ -103,57 +124,56 @@ class TextureManager:
         pygame.draw.polygon(mask_surf, (255, 255, 255, 255), local_poly)
 
         seed_val = province_idx * 7919
+        base_colors = PARCHMENT_BASE
+        noise_scale = 0.02
+        tint = OWNER_TINT.get(owner)
 
-        if owner == "neutral":
-            base_colors = NEUTRAL_COLORS
-            noise_scale = 0.08
-            variation = 15
-        elif owner == "red":
-            base_colors = [(140 + c[0] // 4, 40 + c[1] // 6, 35 + c[2] // 6) for c in GRASS_COLORS]
-            noise_scale = 0.07
-            variation = 12
-        elif owner == "blue":
-            base_colors = [(40 + c[0] // 6, 70 + c[1] // 4, 140 + c[2] // 4) for c in GRASS_COLORS]
-            noise_scale = 0.07
-            variation = 12
-        elif owner == "green":
-            base_colors = [(35 + c[0] // 6, 110 + c[1] // 4, 55 + c[2] // 5) for c in GRASS_COLORS]
-            noise_scale = 0.06
-            variation = 14
-        else:
-            base_colors = GRASS_COLORS
-            noise_scale = 0.08
-            variation = 15
+        # тёмные пятна-леса для этой провинции (как тени на референсе)
+        rng = random.Random(seed_val)
+        blobs = [(rng.randint(0, w), rng.randint(0, h), rng.randint(18, 55))
+                 for _ in range(3)]
 
         for py in range(h + pad * 2):
             for px in range(w + pad * 2):
                 if mask_surf.get_at((px, py)).a < 128:
                     continue
-                nx = (min_x + px - pad) * noise_scale
-                ny = (min_y + py - pad) * noise_scale
-                n = _fbm(nx, ny, 3, seed_val)
+                wx = min_x + px - pad
+                wy = min_y + py - pad
+                n = _fbm(wx * noise_scale, wy * noise_scale, 4, seed_val)
+                grain = _hash_noise(wx, wy, seed_val) - 0.5
 
-                tree_n = _fbm(nx * 2.5, ny * 2.5, 2, seed_val + 50000)
-                if tree_n > 0.62 and owner != "neutral":
-                    col = FOREST_COLORS[int(tree_n * 100) % len(FOREST_COLORS)]
+                # лоскутные поля как на скриншоте
+                field_n = _fbm(wx * 0.008, wy * 0.008, 2, seed_val + 999)
+                if 0.52 < field_n < 0.60:
+                    col = FIELD_COLORS[int(field_n * 100) % len(FIELD_COLORS)]
                 else:
                     ci = int(n * len(base_colors)) % len(base_colors)
                     col = base_colors[ci]
 
-                dv = int((n - 0.5) * variation)
+                # лес-тень
+                for bx, by, br in blobs:
+                    d2 = (px - bx) ** 2 + (py - by) ** 2
+                    if d2 < br * br:
+                        k = 1.0 - (d2 / (br * br)) ** 0.5
+                        col = (int(col[0] * (1 - 0.35 * k)),
+                               int(col[1] * (1 - 0.35 * k)),
+                               int(col[2] * (1 - 0.30 * k)))
+                        break
+
+                dv = int((n - 0.5) * 16 + grain * 10)
                 col = (
                     max(0, min(255, col[0] + dv)),
                     max(0, min(255, col[1] + dv)),
                     max(0, min(255, col[2] + dv)),
                 )
 
-                edge_dist = min(
-                    abs(px - pad), abs(px - w - pad),
-                    abs(py - pad), abs(py - h - pad)
-                )
-                if edge_dist < 3:
-                    dark = max(0, 1.0 - edge_dist / 3.0) * 0.3
-                    col = (int(col[0] * (1 - dark)), int(col[1] * (1 - dark)), int(col[2] * (1 - dark)))
+                if tint is not None:
+                    # лёгкий налёт цвета владельца поверх пергамента
+                    col = (
+                        int(col[0] * 0.82 + tint[0] * 0.18),
+                        int(col[1] * 0.82 + tint[1] * 0.18),
+                        int(col[2] * 0.82 + tint[2] * 0.18),
+                    )
 
                 surf.set_at((px, py), col)
 
@@ -164,7 +184,10 @@ class TextureManager:
         final.blit(surf, (0, 0))
         final.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
-        self._province_cache[province_idx] = final
+        # чистим старый цвет той же провинции, чтобы не рос кэш
+        for k in [k for k in self._province_cache if k[0] == province_idx]:
+            self._province_cache.pop(k, None)
+        self._province_cache[key] = final
         return final
 
     def get_ocean_texture(self, w: int, h: int) -> pygame.Surface:
@@ -172,17 +195,17 @@ class TextureManager:
             return self._ocean_cache
 
         surf = pygame.Surface((w, h))
-        for y in range(0, h, 3):
-            for x in range(0, w, 3):
-                n = _fbm(x * 0.003, y * 0.003, 3, 42)
+        for y in range(0, h, 4):
+            for x in range(0, w, 4):
+                n = _fbm(x * 0.004, y * 0.004, 3, 42)
                 col = _blend_color(WATER_DEEP, WATER_MID, n)
-                dv = int((n - 0.5) * 15)
+                grain = int((_hash_noise(x, y, 7) - 0.5) * 8)
                 col = (
-                    max(0, min(255, col[0] + dv)),
-                    max(0, min(255, col[1] + dv)),
-                    max(0, min(255, col[2] + dv)),
+                    max(0, min(255, col[0] + grain)),
+                    max(0, min(255, col[1] + grain)),
+                    max(0, min(255, col[2] + grain)),
                 )
-                pygame.draw.rect(surf, col, (x, y, 3, 3))
+                pygame.draw.rect(surf, col, (x, y, 4, 4))
         self._ocean_cache = surf
         self._ocean_size = (w, h)
         return surf
@@ -246,55 +269,100 @@ class GeneralIcon:
 
         pygame.draw.polygon(surface, (255, 255, 255), shield_pts, 1)
 
+    @staticmethod
+    def draw_banner(surface: pygame.Surface, x: int, y: int, color: Tuple[int, int, int],
+                    selected: bool = False, moved: bool = False, scale: float = 1.0,
+                    label: str = ""):
+        """Наполеоновский флажок-баннер как на референсе: древко + знамя."""
+        s = scale
+        pole_h = int(30 * s)
+        # тень
+        pygame.draw.ellipse(surface, (0, 0, 0, 90),
+                            (int(x - 10 * s), int(y + 12 * s), int(20 * s), int(6 * s)))
+        # древко
+        pygame.draw.line(surface, (45, 35, 25), (x, y - pole_h * s), (x, y + 12 * s), max(1, int(2 * s)))
+        pygame.draw.circle(surface, (190, 170, 100), (x, int(y - pole_h * s)), max(2, int(3 * s)))
+        # знамя
+        fw, fh = int(30 * s), int(20 * s)
+        top = int(y - pole_h * s)
+        flag = [(x, top), (x + fw, top + 2), (x + fw, top + fh), (x, top + fh - 2)]
+        dark = (max(0, color[0] - 50), max(0, color[1] - 50), max(0, color[2] - 50))
+        pygame.draw.polygon(surface, dark, [(p[0] + 1, p[1] + 1) for p in flag])
+        pygame.draw.polygon(surface, (235, 225, 200), flag)
+        inner = [(x + 2, top + 2), (x + fw - 2, top + 4), (x + fw - 2, top + fh - 2), (x + 2, top + fh - 4)]
+        pygame.draw.polygon(surface, color, inner)
+        # крест/полоса по центру как у корпусных знамён
+        pygame.draw.line(surface, (235, 225, 200),
+                         (x + fw // 2, top + 3), (x + fw // 2, top + fh - 3), 2)
+        pygame.draw.line(surface, (235, 225, 200),
+                         (x + 3, top + fh // 2), (x + fw - 3, top + fh // 2 + 1), 1)
+        # обводка статуса
+        if selected:
+            pygame.draw.polygon(surface, (255, 255, 120), flag, 2)
+        elif not moved:
+            pygame.draw.polygon(surface, (140, 255, 140), flag, 1)
+        else:
+            pygame.draw.polygon(surface, (150, 145, 130), flag, 1)
+        # табличка с именем под флагом
+        if label:
+            try:
+                f = pygame.font.SysFont("serif", max(10, int(12 * s)))
+            except Exception:
+                f = pygame.font.SysFont(None, max(10, int(12 * s)))
+            txt = f.render(label, True, (240, 230, 200))
+            bg = pygame.Surface((txt.get_width() + 6, txt.get_height() + 2), pygame.SRCALPHA)
+            bg.fill((20, 18, 12, 190))
+            surface.blit(bg, (x - bg.get_width() // 2, y + 12 * s))
+            surface.blit(txt, (x - txt.get_width() // 2, y + 12 * s + 1))
+
 
 class RiverRenderer:
     @staticmethod
-    def draw_river(surface: pygame.Surface, river_x: int, cam_x: int, cam_y: int,
-                   screen_h: int, time_ticks: float):
-        t = time_ticks * 0.003
+    def river_points(river_x: int, cam_y: int, screen_h: int, time_ticks: float, seed: int = 0):
+        t = time_ticks * 0.0006
         points = []
-        for y in range(-20, screen_h - 60, 3):
+        for y in range(-20, screen_h - 60, 4):
             wy = y + cam_y
-            wave1 = math.sin(wy * 0.008 + t) * 14
-            wave2 = math.sin(wy * 0.015 + t * 1.3) * 6
-            wave3 = math.sin(wy * 0.025 + t * 0.7) * 3
-            sx = river_x + wave1 + wave2 + wave3 - cam_x
-            points.append((sx, y))
+            wave1 = math.sin(wy * 0.008 + seed + t) * 16
+            wave2 = math.sin(wy * 0.017 + seed * 2 + t * 1.2) * 8
+            wave3 = math.sin(wy * 0.033 + seed * 3) * 4
+            points.append((river_x + wave1 + wave2 + wave3, y, wy))
+        return points
 
-        if len(points) < 2:
+    @staticmethod
+    def draw_river(surface: pygame.Surface, river_x: int, cam_x: int, cam_y: int,
+                   screen_h: int, time_ticks: float, zoom: float = 1.0):
+        pts = RiverRenderer.river_points(river_x, cam_y, screen_h, time_ticks, seed=river_x)
+        if len(pts) < 2:
             return
-
-        for i in range(len(points) - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            wy = y1 + cam_y
-            wave_val = math.sin(wy * 0.01 + t) * 0.5 + 0.5
-            width = int(18 + wave_val * 10)
-
-            base_col = _blend_color(WATER_DEEP, WATER_MID, wave_val)
-            pygame.draw.line(surface, base_col, (int(x1), int(y1)), (int(x2), int(y2)), width)
-
-            if random.random() < 0.08:
-                sparkle_x = int(x1 + random.randint(-3, 3))
-                sparkle_y = int(y1)
-                sparkle_size = random.randint(1, 2)
-                pygame.draw.circle(surface, WATER_FOAM, (sparkle_x, sparkle_y), sparkle_size)
-
-        for i in range(0, len(points) - 1, 8):
-            x1, y1 = points[i]
-            wy = y1 + cam_y
-            foam_wave = math.sin(wy * 0.02 + t * 1.5)
-            if foam_wave > 0.3:
-                foam_x = int(x1 + foam_wave * 4)
-                foam_y = int(y1)
-                pygame.draw.circle(surface, WATER_FOAM, (foam_x, foam_y), 2)
+        w_outer = max(2, int(5 * zoom))
+        w_inner = max(1, int(2 * zoom))
+        for i in range(len(pts) - 1):
+            x1, y1, _ = pts[i]
+            x2, y2, _ = pts[i + 1]
+            sx1, sx2 = int((x1 - cam_x) * zoom), int((x2 - cam_x) * zoom)
+            sy1, sy2 = int(y1 * zoom), int(y2 * zoom)
+            pygame.draw.line(surface, RIVER_DARK, (sx1, sy1), (sx2, sy2), w_outer)
+        for i in range(len(pts) - 1):
+            x1, y1, _ = pts[i]
+            x2, y2, _ = pts[i + 1]
+            sx1, sx2 = int((x1 - cam_x) * zoom), int((x2 - cam_x) * zoom)
+            sy1, sy2 = int(y1 * zoom), int(y2 * zoom)
+            pygame.draw.line(surface, RIVER_COLOR, (sx1, sy1), (sx2, sy2), w_inner)
+        # редкие блики — детерминированные, без мерцания random каждый кадр
+        t = int(time_ticks // 500)
+        for i in range(0, len(pts) - 1, 24):
+            x1, y1, wy = pts[(i + t) % (len(pts) - 1)]
+            sx = int((x1 - cam_x) * zoom)
+            sy = int(y1 * zoom)
+            pygame.draw.circle(surface, RIVER_LIGHT, (sx, sy), max(1, int(1 * zoom)))
 
     @staticmethod
     def draw_bridge(surface: pygame.Surface, river_x: int, bridge_y: int,
-                    cam_x: int, cam_y: int):
-        sx = river_x - cam_x
-        sy = bridge_y - cam_y
-        bw, bh = 36, 16
+                    cam_x: int, cam_y: int, zoom: float = 1.0):
+        sx = int((river_x - cam_x) * zoom)
+        sy = int((bridge_y - cam_y) * zoom)
+        bw, bh = int(36 * zoom), int(16 * zoom)
 
         pygame.draw.rect(surface, (100, 80, 50),
                          (sx - bw // 2, sy - bh // 2, bw, bh))

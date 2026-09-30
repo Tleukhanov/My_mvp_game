@@ -35,11 +35,27 @@ class WorldMapScreen:
 
         self.cam_x = 0
         self.cam_y = 0
-        self._scroll_speed = 400
+        self.zoom = 1.0
+        self._zoom_min, self._zoom_max = 0.5, 2.5
+        self._scroll_speed = 500
         self._dragging = False
         self._drag_start = (0, 0)
         self._cam_start = (0, 0)
+        self._rmb_dragging = False
+        self._rmb_start = (0, 0)
+        self._rmb_cam_start = (0, 0)
+        self._rmb_moved = False
         self._keys_held = set()
+        self._mouse_pos = (0, 0)
+        self._hover_province = None
+        self._zoom_cache = {}
+        # serif для подписей городов как на референсе
+        try:
+            self.font_city = pygame.font.SysFont("serif", 22)
+            self.font_city_small = pygame.font.SysFont("serif", 15)
+        except Exception:
+            self.font_city = pygame.font.SysFont(None, 22)
+            self.font_city_small = pygame.font.SysFont(None, 15)
 
         self.diplomacy = DiplomacyManager()
         self.provinces: List[Province] = [Province(p.name, p.owner, p.region_type,
@@ -85,13 +101,30 @@ class WorldMapScreen:
         return list(self._conn_by_province.get(idx, set()))
 
     def _clamp_camera(self):
-        map_w = SCREEN_WIDTH
-        map_h = SCREEN_HEIGHT - 80
-        self.cam_x = max(0, min(self.cam_x, map_w - SCREEN_WIDTH))
-        self.cam_y = max(0, min(self.cam_y, map_h - (SCREEN_HEIGHT - 80)))
+        map_w, map_h = SCREEN_WIDTH, SCREEN_HEIGHT - 80
+        vis_w, vis_h = SCREEN_WIDTH / self.zoom, (SCREEN_HEIGHT - 80) / self.zoom
+        max_x = max(0, map_w - vis_w)
+        max_y = max(0, map_h - vis_h)
+        self.cam_x = max(0, min(self.cam_x, max_x))
+        self.cam_y = max(0, min(self.cam_y, max_y))
 
     def _screen_to_world(self, sx: int, sy: int) -> Tuple[int, int]:
-        return sx + self.cam_x, sy + self.cam_y
+        return int(sx / self.zoom + self.cam_x), int(sy / self.zoom + self.cam_y)
+
+    def _world_to_screen(self, wx: int, wy: int) -> Tuple[int, int]:
+        return int((wx - self.cam_x) * self.zoom), int((wy - self.cam_y) * self.zoom)
+
+    def _zoom_at(self, sx: int, sy: int, factor: float):
+        old_zoom = self.zoom
+        new_zoom = max(self._zoom_min, min(self._zoom_max, old_zoom * factor))
+        if abs(new_zoom - old_zoom) < 1e-4:
+            return
+        # точка под курсором остаётся на месте
+        wx, wy = self._screen_to_world(sx, sy)
+        self.zoom = new_zoom
+        self.cam_x = wx - sx / new_zoom
+        self.cam_y = wy - sy / new_zoom
+        self._clamp_camera()
 
     def run(self) -> Optional[str]:
         while self.running:
@@ -118,6 +151,14 @@ class WorldMapScreen:
                         self.running = False
                 elif event.key == pygame.K_SPACE:
                     self._end_turn()
+                elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                    self._zoom_at(SCREEN_WIDTH // 2, (SCREEN_HEIGHT - 80) // 2, 1.2)
+                elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    self._zoom_at(SCREEN_WIDTH // 2, (SCREEN_HEIGHT - 80) // 2, 1 / 1.2)
+                elif event.key == pygame.K_0:
+                    self.zoom = 1.0
+                    self.cam_x, self.cam_y = 0, 0
+                    self._clamp_camera()
                 elif event.key == pygame.K_TAB:
                     self._show_diplomacy = not self._show_diplomacy
                 elif event.key == pygame.K_n and self._show_diplomacy:
@@ -138,14 +179,25 @@ class WorldMapScreen:
                 self._keys_held.discard(event.key)
 
             elif event.type == pygame.MOUSEWHEEL:
-                self.cam_y -= event.y * 40
-                self._clamp_camera()
+                mx, my = pygame.mouse.get_pos()
+                # колесо — зум к курсору (как в Total War), с Shift — вертикальный скролл
+                keys = pygame.key.get_pressed()
+                if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
+                    self.cam_y -= event.y * 40 / self.zoom
+                    self._clamp_camera()
+                else:
+                    self._zoom_at(mx, my, 1.1 if event.y > 0 else 1 / 1.1)
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 2:
                     self._dragging = True
                     self._drag_start = event.pos
                     self._cam_start = (self.cam_x, self.cam_y)
+                elif event.button == 3:
+                    self._rmb_dragging = True
+                    self._rmb_start = event.pos
+                    self._rmb_cam_start = (self.cam_x, self.cam_y)
+                    self._rmb_moved = False
                 elif event.button == 1:
                     mx, my = event.pos
                     if my < SCREEN_HEIGHT - 80:
@@ -154,16 +206,37 @@ class WorldMapScreen:
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 2:
                     self._dragging = False
+                elif event.button == 3:
+                    was_drag = self._rmb_moved
+                    self._rmb_dragging = False
+                    if not was_drag:
+                        # правый клик без драга — приказ / снять выделение (RTS-стиль)
+                        mx, my = event.pos
+                        if my < SCREEN_HEIGHT - 80:
+                            if self.selected_general:
+                                self._handle_map_click(mx, my, via_right=True)
+                            else:
+                                self.selected_general = None
 
             elif event.type == pygame.MOUSEMOTION:
+                self._mouse_pos = event.pos
                 if self._dragging:
-                    dx = event.pos[0] - self._drag_start[0]
-                    dy = event.pos[1] - self._drag_start[1]
+                    dx = (event.pos[0] - self._drag_start[0]) / self.zoom
+                    dy = (event.pos[1] - self._drag_start[1]) / self.zoom
                     self.cam_x = self._cam_start[0] - dx
                     self.cam_y = self._cam_start[1] - dy
                     self._clamp_camera()
+                if self._rmb_dragging:
+                    dx = (event.pos[0] - self._rmb_start[0]) / self.zoom
+                    dy = (event.pos[1] - self._rmb_start[1]) / self.zoom
+                    if abs(dx) + abs(dy) > 5:
+                        self._rmb_moved = True
+                    if self._rmb_moved:
+                        self.cam_x = self._rmb_cam_start[0] - dx
+                        self.cam_y = self._rmb_cam_start[1] - dy
+                        self._clamp_camera()
 
-    def _handle_map_click(self, mx: int, my: int):
+    def _handle_map_click(self, mx: int, my: int, via_right: bool = False):
         if my >= SCREEN_HEIGHT - 80:
             return
 
@@ -368,7 +441,7 @@ class WorldMapScreen:
 
     def _update(self, dt: float):
         if not self._show_diplomacy:
-            scroll = self._scroll_speed * dt
+            scroll = self._scroll_speed * dt / self.zoom
             if pygame.K_w in self._keys_held or pygame.K_UP in self._keys_held:
                 self.cam_y -= scroll
             if pygame.K_s in self._keys_held or pygame.K_DOWN in self._keys_held:
@@ -378,6 +451,21 @@ class WorldMapScreen:
             if pygame.K_d in self._keys_held or pygame.K_RIGHT in self._keys_held:
                 self.cam_x += scroll
             self._clamp_camera()
+
+        # ховер провинции для подсветки + тултипа
+        try:
+            mx, my = self._mouse_pos
+            if my < SCREEN_HEIGHT - 80:
+                wx, wy = self._screen_to_world(mx, my)
+                self._hover_province = None
+                for i, prov in enumerate(self.provinces):
+                    if prov.contains_point(wx, wy):
+                        self._hover_province = i
+                        break
+            else:
+                self._hover_province = None
+        except Exception:
+            self._hover_province = None
 
         if self._battle_timer > 0:
             self._battle_timer -= dt
@@ -398,24 +486,72 @@ class WorldMapScreen:
             self._game_over = True
             self._winner = "VICTORY"
 
+    _OWNER_BORDER = {
+        "neutral": (195, 180, 140),
+        "red": (185, 90, 75),
+        "blue": (95, 135, 205),
+        "green": (95, 175, 105),
+    }
+
+    def _get_scaled_tex(self, i, tex):
+        zr = round(self.zoom, 1)
+        key = (i, zr, tex.get_width(), tex.get_height())
+        # кэш с привязкой к объекту текстуры (владелец уже в ключе менеджера)
+        ckey = (i, id(tex), zr)
+        if ckey in self._zoom_cache:
+            return self._zoom_cache[ckey]
+        if abs(self.zoom - 1.0) < 0.02:
+            self._zoom_cache[ckey] = tex
+            return tex
+        nw = max(1, int(tex.get_width() * self.zoom))
+        nh = max(1, int(tex.get_height() * self.zoom))
+        try:
+            scaled = pygame.transform.smoothscale(tex, (nw, nh))
+        except Exception:
+            scaled = pygame.transform.scale(tex, (nw, nh))
+        # чистим старые зумы той же провинции
+        for k in [k for k in self._zoom_cache if k[0] == i and k[2] != zr]:
+            self._zoom_cache.pop(k, None)
+        self._zoom_cache[ckey] = scaled
+        return scaled
+
     def _render(self):
-        ocean = self.tex_manager.get_ocean_texture(SCREEN_WIDTH, SCREEN_HEIGHT - 80)
+        view_h = SCREEN_HEIGHT - 80
+        ocean = self.tex_manager.get_ocean_texture(SCREEN_WIDTH, view_h)
+        if abs(self.zoom - 1.0) > 0.02:
+            try:
+                ocean = pygame.transform.scale(ocean, (SCREEN_WIDTH, view_h))
+            except Exception:
+                pass
         self.screen.blit(ocean, (0, 0))
 
         for i, prov in enumerate(self.provinces):
-            min_x, min_y = self._prov_offsets[i]
+            xs = [p[0] for p in prov.polygon]
+            ys = [p[1] for p in prov.polygon]
+            min_x, min_y = min(xs), min(ys)
             tex = self.tex_manager.get_province_texture(
                 i, prov.polygon, prov.owner, prov.region_type,
                 SCREEN_WIDTH, SCREEN_HEIGHT
             )
-            sx = min_x - self.cam_x - 4
-            sy = min_y - self.cam_y - 4
-            self.screen.blit(tex, (sx, sy))
+            stex = self._get_scaled_tex(i, tex)
+            sx = int((min_x - self.cam_x) * self.zoom - 4 * self.zoom)
+            sy = int((min_y - self.cam_y) * self.zoom - 4 * self.zoom)
+            self.screen.blit(stex, (sx, sy))
 
-            screen_poly = [(x - self.cam_x, y - self.cam_y) for x, y in prov.polygon]
-            pygame.draw.polygon(self.screen, COLOR_PROVINCE_BORDER, screen_poly, 1)
+            screen_poly = [self._world_to_screen(x, y) for x, y in prov.polygon]
+            border_col = self._OWNER_BORDER.get(prov.owner, COLOR_PROVINCE_BORDER)
+            try:
+                pygame.draw.polygon(self.screen, border_col, screen_poly, max(1, int(2 * self.zoom)))
+            except Exception:
+                pass
+            if i == self._hover_province:
+                try:
+                    pygame.draw.polygon(self.screen, (255, 250, 220), screen_poly, max(1, int(1 * self.zoom)))
+                except Exception:
+                    pass
 
         self._render_rivers()
+        self._render_city_labels()
 
         for general in self.generals:
             self._render_general(general)
@@ -426,11 +562,13 @@ class WorldMapScreen:
             for ai in adj:
                 prov = self.provinces[ai]
                 cx, cy = prov.centroid
-                sx = cx - self.cam_x
-                sy = cy - self.cam_y
+                sx, sy = self._world_to_screen(cx, cy)
                 pulse = abs(math.sin(pygame.time.get_ticks() * 0.004)) * 0.4 + 0.6
                 col = (int(255 * pulse), int(255 * pulse), int(80 * pulse))
-                pygame.draw.circle(self.screen, col, (sx, sy), 22, 2)
+                try:
+                    pygame.draw.circle(self.screen, col, (sx, sy), int(22 * self.zoom), 2)
+                except Exception:
+                    pass
 
         self._render_hud()
 
@@ -448,12 +586,36 @@ class WorldMapScreen:
 
         pygame.display.flip()
 
+    def _render_city_labels(self):
+        # подписи как на референсе: точка + serif-название
+        from world_data import RegionType
+        for i, prov in enumerate(self.provinces):
+            cx, cy = prov.centroid
+            sx, sy = self._world_to_screen(cx, cy)
+            if sx < -100 or sx > SCREEN_WIDTH + 100 or sy < -50 or sy > SCREEN_HEIGHT:
+                continue
+            is_city = prov.region_type in (RegionType.CITY, RegionType.CAPITAL)
+            if not is_city and self.zoom < 1.2 and i != self._hover_province:
+                continue
+            font = self.font_city if is_city else self.font_city_small
+            # точка города
+            if is_city:
+                pygame.draw.circle(self.screen, (20, 18, 12), (sx, sy), 5)
+                pygame.draw.circle(self.screen, (240, 235, 215), (sx, sy), 4)
+                pygame.draw.circle(self.screen, (20, 18, 12), (sx, sy), 2)
+            name = prov.name
+            # тень + светлый текст
+            shadow = font.render(name, True, (25, 22, 12))
+            text = font.render(name, True, (242, 236, 214))
+            self.screen.blit(shadow, (sx + 8 + 1, sy - 12 + 1))
+            self.screen.blit(text, (sx + 8, sy - 12))
+
     def _render_rivers(self):
         t = pygame.time.get_ticks()
 
         for river_x in [RIVER_WEST_X, RIVER_EAST_X]:
             RiverRenderer.draw_river(self.screen, river_x, self.cam_x, self.cam_y,
-                                     SCREEN_HEIGHT, t)
+                                     SCREEN_HEIGHT, t, zoom=self.zoom)
 
             bridge_indices = []
             for a, b in BRIDGE_CONNECTIONS:
@@ -461,46 +623,53 @@ class WorldMapScreen:
                 pb = self.provinces[b]
                 cx_a, cy_a = pa.centroid
                 cx_b, cy_b = pb.centroid
-                if abs(cx_a - river_x) < 30 or abs(cx_b - river_x) < 30:
+                if abs(cx_a - river_x) < 60 or abs(cx_b - river_x) < 60:
                     bridge_y = (cy_a + cy_b) // 2
                     bridge_indices.append(bridge_y)
 
             for by in bridge_indices:
-                RiverRenderer.draw_bridge(self.screen, river_x, by, self.cam_x, self.cam_y)
+                RiverRenderer.draw_bridge(self.screen, river_x, by, self.cam_x, self.cam_y, zoom=self.zoom)
 
     def _render_general(self, general: General):
         prov = self.provinces[general.province_idx]
         cx, cy = prov.centroid
-        x = cx - self.cam_x
-        y = cy - self.cam_y
+        # флаг чуть выше центра, чтобы не закрывать подпись города
+        cy -= 18
+        x, y = self._world_to_screen(cx, cy)
 
-        if x < -30 or x > SCREEN_WIDTH + 30 or y < -30 or y > SCREEN_HEIGHT + 30:
+        if x < -60 or x > SCREEN_WIDTH + 60 or y < -60 or y > SCREEN_HEIGHT + 60:
             return
 
         nation = WORLD_NATIONS.get(general.nation)
         color = nation.color if nation else (150, 150, 150)
 
         is_selected = general is self.selected_general
-        GeneralIcon.draw_shield(self.screen, int(x), int(y), color,
-                                selected=is_selected, moved=general.moved)
-
-        label = self.font_region.render(f"{general.name[:6]}({general.troops})", True, COLOR_WHITE)
-        lx = int(x) - label.get_width() // 2
-        ly = int(y) - 24
-        bg = pygame.Surface((label.get_width() + 4, label.get_height() + 2), pygame.SRCALPHA)
-        bg.fill((0, 0, 0, 160))
-        self.screen.blit(bg, (lx - 2, ly - 1))
-        self.screen.blit(label, (lx, ly))
+        GeneralIcon.draw_banner(self.screen, int(x), int(y), color,
+                                selected=is_selected, moved=general.moved,
+                                scale=self.zoom,
+                                label=f"{general.name} {general.troops}")
 
     def _render_hud(self):
         hud_y = SCREEN_HEIGHT - 80
         pygame.draw.rect(self.screen, COLOR_HUD_BG, (0, hud_y, SCREEN_WIDTH, 80))
 
         turn_text = self.font_hud.render(
-            f"Turn: {self._turn} | SPACE: End Turn | TAB: Diplomacy | WASD/Arrows: Scroll | ESC: Menu",
+            f"Turn: {self._turn} | LMB/RMB: select+move | Wheel:+/-: zoom | WASD: pan | SPACE: turn | TAB: dipl | 0: reset",
             True, COLOR_HUD_TEXT
         )
         self.screen.blit(turn_text, (12, hud_y + 4))
+        # тултип ховера
+        if self._hover_province is not None:
+            prov = self.provinces[self._hover_province]
+            tip = self.font_hud.render(
+                f"{prov.name} [{prov.owner}] troops:{prov.troops}",
+                True, (245, 238, 218))
+            tx = min(max(self._mouse_pos[0] + 14, 4), SCREEN_WIDTH - tip.get_width() - 8)
+            ty = max(self._mouse_pos[1] - 22, 4)
+            bg = pygame.Surface((tip.get_width() + 8, tip.get_height() + 4), pygame.SRCALPHA)
+            bg.fill((20, 18, 12, 200))
+            self.screen.blit(bg, (tx - 4, ty - 2))
+            self.screen.blit(tip, (tx, ty))
 
         nation = WORLD_NATIONS[PLAYER_NATION]
         info = self.font_hud.render(
