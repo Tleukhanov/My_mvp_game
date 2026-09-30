@@ -1,7 +1,13 @@
+import hashlib
+import os
 import pygame
 import math
 import random
 from typing import Dict, Tuple, List
+
+
+#: Каталог для кэша сгенерированных текстур — рядом с этим модулем.
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 
 def _hash_noise(x: int, y: int, seed: int = 0) -> float:
@@ -90,13 +96,39 @@ RIVER_DARK = (90, 110, 145)
 RIVER_LIGHT = (165, 185, 210)
 
 
+#: Текстуры провинций рисуются в уменьшенном разрешении и растягиваются.
+#: Пергамент — фон под подписями, детализация ему не нужна, а экономия
+#: в 4 раза по пикселям превращает минуту ожидания в пару секунд.
+PROVINCE_DETAIL = 2
+PROVINCE_PAD = 4
+
+
 class TextureManager:
     def __init__(self):
         self._province_cache: Dict[tuple, pygame.Surface] = {}
+        self._province_base_cache: Dict[int, pygame.Surface] = {}
         self._water_surface: pygame.Surface = None
         self._water_size: Tuple[int, int] = (0, 0)
         self._ocean_cache: pygame.Surface = None
         self._ocean_size: Tuple[int, int] = (0, 0)
+
+    def _tint_factor(self, owner: str) -> Tuple[int, int, int]:
+        """Множитель цвета владельца: 82% пергамента + 18% цвета нации.
+
+        Считается так, что обычный ``BLEND_RGB_MULT`` даёт ровно нужную
+        примесь — поэтому перекраска провинции при захвате стоит один
+        быстрый блит, а не перегенерацию текстуры попиксельно.
+        """
+        tint = OWNER_TINT.get(owner)
+        base = 0.82 * 255
+        if tint is None:
+            v = int(base)
+            return (v, v, v)
+        return (
+            min(255, int(base + 0.18 * tint[0])),
+            min(255, int(base + 0.18 * tint[1])),
+            min(255, int(base + 0.18 * tint[2])),
+        )
 
     def get_province_texture(self, province_idx: int, polygon: List[Tuple[int, int]],
                              owner: str, region_type, screen_w: int, screen_h: int) -> pygame.Surface:
@@ -105,45 +137,119 @@ class TextureManager:
         if key in self._province_cache:
             return self._province_cache[key]
 
+        base = self._get_province_base(province_idx, polygon)
+        tinted = base.copy()
+        factor = self._tint_factor(owner)
+        if factor != (208, 208, 208):
+            tinted.fill(factor, special_flags=pygame.BLEND_RGB_MULT)
+
+        # чистим старый цвет той же провинции, чтобы не рос кэш
+        for k in [k for k in self._province_cache if k[0] == province_idx]:
+            self._province_cache.pop(k, None)
+        self._province_cache[key] = tinted
+        return tinted
+
+    def _base_cache_path(self, province_idx: int, polygon: List[Tuple[int, int]]) -> str:
+        """Путь к файлу базовой текстуры.
+
+        Хеш геометрии входит в имя: если границы провинции изменились,
+        старый файл просто не найдётся и текстура перегенерируется.
+        Без этого перегенерация всех 50 провинций занимала бы 15 секунд
+        при каждом входе в мировую карту.
+        """
+        digest = hashlib.md5(repr(tuple(polygon)).encode("utf-8")).hexdigest()[:10]
+        return os.path.join(ASSETS_DIR, f"base_{province_idx:02d}_{digest}.png")
+
+    def _get_province_base(self, province_idx: int,
+                           polygon: List[Tuple[int, int]]) -> pygame.Surface:
+        """Пергамент провинции без цвета владельца.
+
+        Кэшируется дважды: в памяти и на диске. Файл валиден, только если
+        в его имени совпадает хеш геометрии.
+        """
+        if province_idx in self._province_base_cache:
+            return self._province_base_cache[province_idx]
+
+        path = self._base_cache_path(province_idx, polygon)
+        final = None
+        if os.path.isfile(path):
+            try:
+                loaded = pygame.image.load(path)
+                if (loaded.get_width(), loaded.get_height()) == self._base_size(polygon):
+                    final = loaded.convert_alpha()
+            except Exception:
+                final = None
+
+        if final is None:
+            final = self._render_province_base(province_idx, polygon)
+            try:
+                os.makedirs(ASSETS_DIR, exist_ok=True)
+                pygame.image.save(final, path)
+            except Exception:
+                pass
+
+        self._province_base_cache[province_idx] = final
+        return final
+
+    def _base_size(self, polygon: List[Tuple[int, int]]) -> Tuple[int, int]:
+        xs = [p[0] for p in polygon]
+        ys = [p[1] for p in polygon]
+        return ((max(xs) - min(xs)) + PROVINCE_PAD * 2,
+                (max(ys) - min(ys)) + PROVINCE_PAD * 2)
+
+    def _render_province_base(self, province_idx: int,
+                              polygon: List[Tuple[int, int]]) -> pygame.Surface:
+        """Пергамент провинции без цвета владельца. Генерируется один раз."""
+        if province_idx in self._province_base_cache:
+            return self._province_base_cache[province_idx]
+
         min_x = min(p[0] for p in polygon)
         min_y = min(p[1] for p in polygon)
         max_x = max(p[0] for p in polygon)
         max_y = max(p[1] for p in polygon)
-        w = max_x - min_x
-        h = max_y - min_y
-        if w <= 0 or h <= 0:
+        full_w = max_x - min_x
+        full_h = max_y - min_y
+        if full_w <= 0 or full_h <= 0:
             surf = pygame.Surface((1, 1), pygame.SRCALPHA)
-            self._province_cache[key] = surf
+            self._province_base_cache[province_idx] = surf
             return surf
 
-        pad = 4
-        surf = pygame.Surface((w + pad * 2, h + pad * 2), pygame.SRCALPHA)
+        out_w = full_w + PROVINCE_PAD * 2
+        out_h = full_h + PROVINCE_PAD * 2
 
-        mask_surf = pygame.Surface((w + pad * 2, h + pad * 2), pygame.SRCALPHA)
-        local_poly = [(x - min_x + pad, y - min_y + pad) for x, y in polygon]
+        detail = PROVINCE_DETAIL
+        work_w = max(1, full_w // detail)
+        work_h = max(1, full_h // detail)
+        wpad = 1
+        size = (work_w + wpad * 2, work_h + wpad * 2)
+
+        surf = pygame.Surface(size, pygame.SRCALPHA)
+        mask_surf = pygame.Surface(size, pygame.SRCALPHA)
+        local_poly = [((x - min_x) // detail + wpad, (y - min_y) // detail + wpad)
+                      for x, y in polygon]
         pygame.draw.polygon(mask_surf, (255, 255, 255, 255), local_poly)
 
         seed_val = province_idx * 7919
         base_colors = PARCHMENT_BASE
         noise_scale = 0.02
-        tint = OWNER_TINT.get(owner)
 
         # тёмные пятна-леса для этой провинции (как тени на референсе)
         rng = random.Random(seed_val)
-        blobs = [(rng.randint(0, w), rng.randint(0, h), rng.randint(18, 55))
+        blobs = [(rng.randint(0, work_w), rng.randint(0, work_h),
+                  max(3, rng.randint(6, 16)))
                  for _ in range(3)]
 
-        for py in range(h + pad * 2):
-            for px in range(w + pad * 2):
+        for py in range(size[1]):
+            for px in range(size[0]):
                 if mask_surf.get_at((px, py)).a < 128:
                     continue
-                wx = min_x + px - pad
-                wy = min_y + py - pad
-                n = _fbm(wx * noise_scale, wy * noise_scale, 4, seed_val)
-                grain = _hash_noise(wx, wy, seed_val) - 0.5
+                wx = min_x + (px - wpad) * detail
+                wy = min_y + (py - wpad) * detail
+                n = _fbm(wx * noise_scale, wy * noise_scale, 3, seed_val)
+                grain = _hash_noise(px, py, seed_val) - 0.5
 
                 # лоскутные поля как на скриншоте
-                field_n = _fbm(wx * 0.008, wy * 0.008, 2, seed_val + 999)
+                field_n = _fbm(wx * 0.008, wy * 0.008, 1, seed_val + 999)
                 if 0.52 < field_n < 0.60:
                     col = FIELD_COLORS[int(field_n * 100) % len(FIELD_COLORS)]
                 else:
@@ -166,28 +272,24 @@ class TextureManager:
                     max(0, min(255, col[1] + dv)),
                     max(0, min(255, col[2] + dv)),
                 )
-
-                if tint is not None:
-                    # лёгкий налёт цвета владельца поверх пергамента
-                    col = (
-                        int(col[0] * 0.82 + tint[0] * 0.18),
-                        int(col[1] * 0.82 + tint[1] * 0.18),
-                        int(col[2] * 0.82 + tint[2] * 0.18),
-                    )
-
                 surf.set_at((px, py), col)
+
+        # растягиваем до рабочего размера с отступами
+        if size != (out_w, out_h):
+            try:
+                surf = pygame.transform.smoothscale(surf, (out_w, out_h))
+                mask_surf = pygame.transform.smoothscale(mask_surf, (out_w, out_h))
+            except Exception:
+                pass
 
         surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
         surf.set_colorkey(None)
 
-        final = pygame.Surface((w + pad * 2, h + pad * 2), pygame.SRCALPHA)
+        final = pygame.Surface((out_w, out_h), pygame.SRCALPHA)
         final.blit(surf, (0, 0))
         final.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
-        # чистим старый цвет той же провинции, чтобы не рос кэш
-        for k in [k for k in self._province_cache if k[0] == province_idx]:
-            self._province_cache.pop(k, None)
-        self._province_cache[key] = final
+        self._province_base_cache[province_idx] = final
         return final
 
     def get_ocean_texture(self, w: int, h: int) -> pygame.Surface:
@@ -210,8 +312,17 @@ class TextureManager:
         self._ocean_size = (w, h)
         return surf
 
-    def invalidate(self):
-        self._province_cache.clear()
+    def invalidate(self, province_idx: int = None, owner: str = None):
+        """Сброс кэша. Без аргументов — весь; иначе по провинции и/или владельцу."""
+        if province_idx is None:
+            self._province_cache.clear()
+            self._province_base_cache.clear()
+            return
+        for k in [k for k in self._province_cache
+                  if k[0] == province_idx and (owner is None or k[1] == owner)]:
+            self._province_cache.pop(k, None)
+        if owner is None:
+            self._province_base_cache.pop(province_idx, None)
         self._ocean_cache = None
 
 
