@@ -33,7 +33,11 @@ import pytest
 
 from sim import dumps, from_jsonable, loads, new_streams, register_enum, state_hash, to_jsonable
 from states import (
+    COMMAND_MIN_RANK,
+    CONTRACT_CHANGES_PER_TURN,
     CONTRACT_LEVELS,
+    COUNCIL_INFLUENCE,
+    COUNCIL_LOYALTY,
     COUNTY_FIELDS,
     COURT_COST_PER_VASSAL,
     CROWN_COST,
@@ -74,8 +78,17 @@ from states import (
     MERC_QUALITY_STREAM,
     MERC_SALT_STRIDE,
     MERC_TIER_THRESHOLDS,
+    ORDER_DEADLINE_TURNS,
+    ORDER_DEFAULT_WEIGHT,
+    ORDER_REFUSAL_FLOOR,
+    ORDER_REFUSAL_STEP,
+    ORDERS_ISSUED_PER_TURN,
+    ORDER_WEIGHTS,
+    PUNISHED_LOYALTY,
+    PUNISHED_OPINION,
     RAISED_LEVY_UPKEEP_DIVISOR,
     REBELLION_LOYALTY,
+    REFUSED_WEIGHT,
     ROYAL_COURT_BASE_COST,
     ROYAL_COURT_PRESTIGE_DIVISOR,
     STATE_VERSION,
@@ -85,18 +98,25 @@ from states import (
     VASSAL_REBELLION_LOYALTY,
     Character,
     Hierarchy,
+    Order,
+    OrderKind,
+    OrderStatus,
     Tier,
     TitleRank,
     VassalContract,
     as_int,
     build_default_hierarchy,
     clean_mercenary_tiers,
+    clean_order_args,
     development_tax_multiplier,
     development_upgrade_cost,
     gift_gain,
     loyalty_tax_multiplier,
     mercenary_salt,
     mercenary_tier,
+    order_kind_of,
+    order_refusal_threshold,
+    order_weight,
     prosperity_tax_multiplier,
     security_tax_multiplier,
 )
@@ -121,6 +141,17 @@ CAPITAL_INDICES: Tuple[int, ...] = (10, 32, 42)
 FORBIDDEN_STATE_KEYS: Tuple[str, ...] = (
     "provinces", "polygon", "_centroid", "streams", "linked_general",
 )
+
+#: Точный набор ВЕРХНЕУРОВНЕВЫХ ключей снапшота. Жёстко зафиксирован, потому
+#: что это весь контракт ``to_state``: лишний ключ — это либо мусор в хеше, либо
+#: обещание, которого ``from_state`` не сдержит. Вынесено в одну константу,
+#: потому что проверяется в двух местах, и раньше эти два места уже разошлись
+#: бы при добавлении поля. ``orders`` добавлен этапом 1.2: у приказа есть срок
+#: и последствия, поэтому это состояние, а не история.
+SNAPSHOT_KEYS = {
+    "version", "turn", "log", "log_truncated",
+    "realms", "duchies", "characters", "contracts", "orders", "counties",
+}
 
 
 # --------------------------------------------------------------------------
@@ -1206,10 +1237,7 @@ class TestStateSerialization:
     # --- состав снапшота ---
 
     def test_state_has_exact_top_level_keys(self):
-        assert set(self.h.to_state()) == {
-            "version", "turn", "log", "log_truncated",
-            "realms", "duchies", "characters", "contracts", "counties",
-        }
+        assert set(self.h.to_state()) == SNAPSHOT_KEYS
 
     def test_version_is_one_and_integer(self):
         version = self.h.to_state()["version"]
@@ -2791,10 +2819,7 @@ class TestExpenditures:
         state = self.h.to_state()
         assert "action_ledger" not in state
         assert "action_ledger" not in all_keys(state)
-        assert set(state) == {
-            "version", "turn", "log", "log_truncated",
-            "realms", "duchies", "characters", "contracts", "counties",
-        }
+        assert set(state) == SNAPSHOT_KEYS
 
     def test_snapshot_at_turn_boundary_keeps_fingerprint_and_empty_ledger(self):
         self.fund(100000)
@@ -2980,3 +3005,1043 @@ def hire_tiers_of(hierarchy: Hierarchy, blocks: int) -> List[int]:
 
 def hire_tiers(seed: int) -> List[int]:
     return hire_tiers_of(seeded_hierarchy(seed), MERC_MAX_BLOCKS_PER_TURN)
+
+# --------------------------------------------------------------------------
+# Права приказов (этап 1.1)
+# --------------------------------------------------------------------------
+
+
+#: Актёры для тестов прав. Зелёное герцогство — единственное, у которого
+#: ``province.owner`` совпадает с нацией во всём дукционе (leafguard, 40-44),
+#: поэтому «свой барон» и «своя земля» проверяются на нём, а не на greymoor,
+#: где все пять провинций нейтральны.
+RIGHTS_KING = "king_sigurd"          # зелёный король
+RIGHTS_DUKE = "duke_lyra"            # leafguard, 40-44, все зелёные
+RIGHTS_DUKE_OTHER = "duke_orso"      # greymoor, 35-39, все нейтральные
+RIGHTS_BARON = "baron_thorn"         # вассал RIGHTS_DUKE, держит 41
+RIGHTS_BARON_OTHER = "baron_moss"    # второй вассал RIGHTS_DUKE, держит 43
+RIGHTS_FOREIGN_KING = "king_erik"    # красный: ему не подчиняется никто зелёный
+RIGHTS_OWN_PROVINCE = 44             # зелёная, в leafguard
+RIGHTS_NEUTRAL_PROVINCE = 47         # нейтральная
+RIGHTS_FOREIGN_PROVINCE = 11         # красная
+
+
+class TestOrderRights:
+    """``by_actor`` переносит правило «кто вправе» из UI в состояние.
+
+    Контракт, который здесь защищается:
+
+    * ``by_actor=None`` — прежнее поведение без проверок (его зовут 308 старых
+      тестов и UI-обёртка, поэтому он обязан остаться прежним ДОСЛОВНО);
+    * ``by_actor`` задан — актор обязан существовать, быть живым и быть
+      сюзереном цели по рангу: герцогом командует король его realm'а, бароном —
+      непосредственный сюзерен, королем — никто;
+    * ``grant_fief`` сверх того требует, чтобы земля принадлежала realm'у
+      актора и чтобы получатель не держал графство;
+    * ``set_contract`` сверх того ОТКЛОНЯЕТ значение вне диапазона (не клампит)
+      и тратит лимит ``action_ledger``.
+
+    Отказ всегда — ОДНО событие с причиной: это то, что UI показывает игроку.
+    """
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    # ---------------- хелперы ----------------
+
+    def landless(self, baron_id: str) -> str:
+        """Сделать барона безземельным, сохранив его дукцию (и сюзерена)."""
+        self.h.revoke_fief(baron_id)
+        assert self.h.characters[baron_id].province_idx is None
+        return baron_id
+
+    def assert_refused(self, events, *parts: str) -> None:
+        assert isinstance(events, list) and len(events) == 1, events
+        message = events[0]
+        assert isinstance(message, str) and message, events
+        for part in parts:
+            assert part in message, (part, message)
+
+    def fingerprint(self) -> str:
+        return self.h.state_fingerprint()
+
+    # ==================================================================
+    # Правило ранга
+    # ==================================================================
+
+    def test_command_min_rank_is_the_documented_one(self):
+        # бароном командует герцог, герцогом — король, королем — никто
+        assert COMMAND_MIN_RANK == {TitleRank.BARON: Tier.DUCHY,
+                                    TitleRank.DUKE: Tier.REALM}
+        assert TitleRank.KING not in COMMAND_MIN_RANK
+
+    def test_contract_change_limit_is_once_per_turn(self):
+        assert CONTRACT_CHANGES_PER_TURN == 1
+
+    def test_duke_may_give_fief_to_own_baron(self):
+        self.landless(RIGHTS_BARON)
+        events = self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                   by_actor=RIGHTS_DUKE)
+        assert events, "своему барону герцог выдать обязан"
+        assert self.h.characters[RIGHTS_BARON].province_idx == RIGHTS_OWN_PROVINCE
+
+    def test_duke_may_not_give_fief_to_a_foreign_baron(self):
+        # baron_wolf под duke_orso, а не под duke_lyra
+        assert self.h.revoke_fief("baron_wolf")
+        before = self.fingerprint()
+        events = self.h.grant_fief(RIGHTS_OWN_PROVINCE, "baron_wolf",
+                                   by_actor=RIGHTS_DUKE)
+        self.assert_refused(events, "не сюзерен")
+        assert self.h.characters["baron_wolf"].province_idx is None
+        assert self.fingerprint() == before, "отказ не должен менять состояние"
+
+    def test_king_may_command_own_duke(self):
+        events = self.h.set_contract("duke_lyra", 3, by_actor=RIGHTS_KING)
+        assert events, "король вправе менять контракт своего герцога"
+        assert self.h.contracts["duke_lyra"].level == 3
+
+    def test_king_may_not_command_a_foreign_duke(self):
+        # ЭТО ТОТ САМЫЙ БАГ, который закрывает этап 1.1: раньше set_contract
+        # подставлял liege_of(вассала) и позволял переписать чужой контракт
+        before = self.fingerprint()
+        events = self.h.set_contract("duke_lyra", 4, by_actor=RIGHTS_FOREIGN_KING)
+        self.assert_refused(events, "не сюзерен")
+        assert self.h.contracts["duke_lyra"].level == 2
+        assert self.fingerprint() == before
+
+    def test_king_may_give_fief_to_own_duke_and_keeps_his_duchy(self):
+        events = self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_DUKE,
+                                   by_actor=RIGHTS_KING)
+        assert events
+        duke = self.h.characters[RIGHTS_DUKE]
+        assert duke.province_idx == RIGHTS_OWN_PROVINCE
+        # выдача графства герцогу НЕ отнимает у него дукцию — иначе все его
+        # бароны осиротели бы через liege_of
+        assert duke.duchy_id == "leafguard"
+        assert self.h.duchies["leafguard"].holder_id == RIGHTS_DUKE
+        assert [c.id for c in self.h.vassals_of(RIGHTS_DUKE)] == \
+            sorted([RIGHTS_BARON, RIGHTS_BARON_OTHER])
+
+    def test_baron_may_not_command_another_baron(self):
+        # ранг важен не только для сюзерена: барон не командует даже «своему»
+        events = self.h.set_contract(RIGHTS_BARON_OTHER, 3, by_actor=RIGHTS_BARON)
+        self.assert_refused(events, "не сюзерен")
+        assert self.h.contracts[RIGHTS_BARON_OTHER].level == 2
+
+    def test_nobody_may_command_a_king(self):
+        for actor in (RIGHTS_DUKE, RIGHTS_FOREIGN_KING, RIGHTS_BARON):
+            events = self.h.set_contract(RIGHTS_KING, 4, by_actor=actor)
+            self.assert_refused(events, "никто")
+        assert RIGHTS_KING not in self.h.contracts
+
+    def test_fief_and_revoke_refuse_a_king_target_too(self):
+        assert self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_KING,
+                                 by_actor=RIGHTS_KING)
+        assert self.h.revoke_fief(RIGHTS_KING, by_actor=RIGHTS_FOREIGN_KING)
+        assert self.h.characters[RIGHTS_KING].province_idx is None
+
+    # ==================================================================
+    # Регрессия: by_actor=None — прежнее поведение
+    # ==================================================================
+
+    def test_none_actor_grants_fief_without_any_rights_check(self):
+        # нейтральная земля и барон из чужого дукциона: без актора это как
+        # раньше — землю можно выдать кому угодно и из любого герцогства
+        assert self.h.revoke_fief("baron_wolf")
+        events = self.h.grant_fief(RIGHTS_NEUTRAL_PROVINCE, "baron_wolf")
+        assert events
+        assert self.h.characters["baron_wolf"].province_idx == RIGHTS_NEUTRAL_PROVINCE
+        assert self.h.characters["baron_wolf"].duchy_id == "goldfield"
+
+    def test_none_actor_revokes_fief_without_any_rights_check(self):
+        events = self.h.revoke_fief(RIGHTS_BARON)
+        assert events
+        assert self.h.characters[RIGHTS_BARON].province_idx is None
+
+    def test_none_actor_still_clamps_the_contract_level(self):
+        self.h.set_contract(RIGHTS_BARON, len(CONTRACT_LEVELS) + 17)
+        assert self.h.contracts[RIGHTS_BARON].level == len(CONTRACT_LEVELS) - 1
+        self.h.set_contract(RIGHTS_BARON, -25)
+        assert self.h.contracts[RIGHTS_BARON].level == 0
+
+    def test_none_actor_is_exactly_the_same_as_before_the_stage(self):
+        # эталон «как было»: полный вызов без актора меняет ровно те поля,
+        # которые менялись до этапа 1.1, и не занимает action_ledger
+        before = self.fingerprint()
+        self.h.revoke_fief(RIGHTS_BARON)
+        self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON)
+        self.h.set_contract(RIGHTS_BARON, 1)
+        assert self.h.action_ledger == {}, "путь без актора не тратит лимиты"
+        assert self.fingerprint() != before
+        assert self.h.characters[RIGHTS_BARON].province_idx == RIGHTS_OWN_PROVINCE
+        assert self.h.contracts[RIGHTS_BARON].level == 1
+
+    def test_unknown_target_stays_silent_on_all_three_methods(self):
+        # «некому/нечего» — пустой список, а не объяснение
+        assert self.h.grant_fief(3, "baron_ghost") == []
+        assert self.h.revoke_fief("baron_ghost") == []
+        assert self.h.set_contract("baron_ghost", 4) == []
+
+    # ==================================================================
+    # Актор: не существует / мёртв / мусор
+    # ==================================================================
+
+    def test_unknown_actor_is_refused_on_all_three_methods(self):
+        cases = (
+            lambda: self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                      by_actor="duke_ghost"),
+            lambda: self.h.revoke_fief(RIGHTS_BARON, by_actor="duke_ghost"),
+            lambda: self.h.set_contract(RIGHTS_BARON, 3, by_actor="duke_ghost"),
+        )
+        for call in cases:
+            self.assert_refused(call(), "актор")
+
+    def test_dead_actor_is_refused_on_all_three_methods(self):
+        self.h.characters[RIGHTS_DUKE].alive = False
+        self.assert_refused(self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                               by_actor=RIGHTS_DUKE), "мёртв")
+        self.assert_refused(self.h.revoke_fief(RIGHTS_BARON, by_actor=RIGHTS_DUKE),
+                            "мёртв")
+        self.assert_refused(self.h.set_contract(RIGHTS_BARON, 3,
+                                                by_actor=RIGHTS_DUKE), "мёртв")
+
+    def test_junk_actor_is_refused_and_does_not_crash(self):
+        for junk in (None, 7, 3.5, ["duke_lyra"], object()):
+            events = self.h.revoke_fief(RIGHTS_BARON, by_actor=junk)
+            assert isinstance(events, list) and len(events) == 1
+
+    def test_dead_target_is_refused(self):
+        self.h.characters[RIGHTS_BARON].alive = False
+        self.assert_refused(self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                               by_actor=RIGHTS_DUKE), "мёртв")
+
+    # ==================================================================
+    # grant_fief: земля
+    # ==================================================================
+
+    def test_grant_refused_on_a_neutral_province(self):
+        self.landless(RIGHTS_BARON)
+        before = self.fingerprint()
+        events = self.h.grant_fief(RIGHTS_NEUTRAL_PROVINCE, RIGHTS_BARON,
+                                   by_actor=RIGHTS_DUKE)
+        self.assert_refused(events, "не под его властью")
+        assert self.h.characters[RIGHTS_BARON].province_idx is None
+        assert self.fingerprint() == before
+
+    def test_grant_refused_on_a_province_of_another_realm(self):
+        self.landless(RIGHTS_BARON)
+        events = self.h.grant_fief(RIGHTS_FOREIGN_PROVINCE, RIGHTS_BARON,
+                                   by_actor=RIGHTS_DUKE)
+        self.assert_refused(events, "не под его властью")
+        assert self.h.characters[RIGHTS_BARON].province_idx is None
+
+    def test_grant_refuses_junk_province_instead_of_crashing(self):
+        for junk in (None, -1, 999, True, "44"):
+            events = self.h.grant_fief(junk, RIGHTS_BARON, by_actor=RIGHTS_DUKE)
+            self.assert_refused(events)
+
+    def test_grant_does_not_touch_province_owner(self):
+        # фьеф не меняет владельца нации: доход realm'а считается по owner
+        owner = self.h.provinces[RIGHTS_OWN_PROVINCE].owner
+        income = self.h.realm_income("kingdom_thorn")
+        self.landless(RIGHTS_BARON)
+        assert self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                 by_actor=RIGHTS_DUKE)
+        assert self.h.provinces[RIGHTS_OWN_PROVINCE].owner == owner
+        assert self.h.realm_income("kingdom_thorn") == income
+
+    def test_successful_grant_moves_fief_duchy_and_opinion(self):
+        baron = self.h.characters[RIGHTS_BARON]
+        self.landless(RIGHTS_BARON)
+        opinion, loyalty = baron.opinion_of_liege, baron.loyalty
+        assert self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                 by_actor=RIGHTS_DUKE)
+        assert baron.province_idx == RIGHTS_OWN_PROVINCE
+        assert baron.duchy_id == self.h.duchy_of(RIGHTS_OWN_PROVINCE) == "leafguard"
+        assert baron.landless_turns == 0
+        assert baron.is_ruler
+        assert baron.opinion_of_liege == opinion + 20
+        assert baron.loyalty == min(100, loyalty + 10)
+
+    # ==================================================================
+    # grant_fief: конфликт «у получателя уже есть графство»
+    # ==================================================================
+
+    def test_grant_refused_when_recipient_already_holds_a_fief(self):
+        assert self.h.characters[RIGHTS_BARON].province_idx is not None
+        events = self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                   by_actor=RIGHTS_DUKE)
+        self.assert_refused(events, "уже держит", "отзыв")
+        assert self.h.characters[RIGHTS_BARON].province_idx == 41, "старое не тронуто"
+
+    def test_revoke_then_grant_is_the_documented_way_to_move_a_fief(self):
+        assert self.h.revoke_fief(RIGHTS_BARON, by_actor=RIGHTS_DUKE)
+        assert self.h.grant_fief(RIGHTS_OWN_PROVINCE, RIGHTS_BARON,
+                                 by_actor=RIGHTS_DUKE)
+        assert self.h.characters[RIGHTS_BARON].province_idx == RIGHTS_OWN_PROVINCE
+
+    def test_regranting_the_same_county_is_allowed_and_idempotent(self):
+        held = self.h.characters[RIGHTS_BARON].province_idx
+        assert self.h.grant_fief(held, RIGHTS_BARON, by_actor=RIGHTS_DUKE) == []
+        assert self.h.characters[RIGHTS_BARON].province_idx == held
+
+    # ==================================================================
+    # set_contract: диапазон и лимит
+    # ==================================================================
+
+    def test_contract_level_out_of_range_is_refused_with_an_actor(self):
+        for junk_level in (len(CONTRACT_LEVELS), 17, -1):
+            events = self.h.set_contract(RIGHTS_BARON, junk_level,
+                                         by_actor=RIGHTS_DUKE)
+            self.assert_refused(events, "вне диапазона")
+            assert self.h.contracts[RIGHTS_BARON].level == 2
+
+    def test_contract_level_out_of_range_is_clamped_without_an_actor(self):
+        # ровно то же, что до этапа 1.1: клампим, а не отказываем
+        self.h.set_contract(RIGHTS_BARON, len(CONTRACT_LEVELS) + 17)
+        assert self.h.contracts[RIGHTS_BARON].level == len(CONTRACT_LEVELS) - 1
+        self.h.set_contract(RIGHTS_BARON, -25)
+        assert self.h.contracts[RIGHTS_BARON].level == 0
+
+    def test_contract_level_junk_is_refused_with_an_actor(self):
+        for junk in (None, "high", [2], float("nan")):
+            events = self.h.set_contract(RIGHTS_BARON, junk, by_actor=RIGHTS_DUKE)
+            assert isinstance(events, list) and len(events) == 1, junk
+        assert self.h.contracts[RIGHTS_BARON].level == 2
+
+    def test_contract_limit_is_once_per_actor_per_turn(self):
+        assert self.h.set_contract(RIGHTS_BARON, 3, by_actor=RIGHTS_DUKE)
+        snapshot = self.fingerprint()
+        self.assert_refused(self.h.set_contract(RIGHTS_BARON_OTHER, 1,
+                                                by_actor=RIGHTS_DUKE), "этом ходу")
+        assert self.fingerprint() == snapshot
+
+    def test_contract_limit_is_per_actor_not_global(self):
+        assert self.h.set_contract(RIGHTS_BARON, 3, by_actor=RIGHTS_DUKE)
+        assert self.h.set_contract("baron_gray", 3, by_actor=RIGHTS_DUKE_OTHER)
+
+    def test_contract_limit_reopens_on_the_next_turn(self):
+        assert self.h.set_contract(RIGHTS_BARON, 3, by_actor=RIGHTS_DUKE)
+        self.h.end_turn()
+        assert self.h.set_contract(RIGHTS_BARON, 1, by_actor=RIGHTS_DUKE)
+
+    def test_refused_contract_does_not_spend_the_allowance(self):
+        self.assert_refused(self.h.set_contract(RIGHTS_BARON, 99,
+                                                by_actor=RIGHTS_DUKE))
+        assert self.h.set_contract(RIGHTS_BARON, 3, by_actor=RIGHTS_DUKE)
+
+    def test_contract_by_actor_names_the_commanding_liege(self):
+        self.h.set_contract(RIGHTS_BARON, 3, by_actor=RIGHTS_DUKE)
+        assert self.h.contracts[RIGHTS_BARON].liege_id == RIGHTS_DUKE
+        self.h.set_contract("duke_lyra", 1, by_actor=RIGHTS_KING)
+        assert self.h.contracts["duke_lyra"].liege_id == RIGHTS_KING
+
+    def test_command_is_refused_for_a_vassal_without_a_liege(self):
+        # герцогство без держателя делает барона ничьим вассалом
+        self.h.duchies["greymoor"].holder_id = None
+        assert self.h.liege_of("baron_wolf") is None
+        events = self.h.revoke_fief("baron_wolf", by_actor=RIGHTS_DUKE_OTHER)
+        self.assert_refused(events, "не сюзерен")
+
+
+# --------------------------------------------------------------------------
+# Приказы как объект состояния (этап 1.2)
+# --------------------------------------------------------------------------
+
+
+class TestOrders:
+    """Приказ живёт в состоянии: отказ, срок и наказание — это факты мира.
+
+    Здесь проверяется весь цикл ``issue_order`` -> ``resolve_orders`` ->
+    (``FULFILLED`` | ``REFUSED`` | ``PUNISHED``), плюс три вещи, которые легко
+    испортить и которые дороже всего: детерминизм (решения не бросают кубик),
+    round-trip снапшота с непустым ``orders`` и регрессия «мир без приказов
+    ведёт себя ровно как раньше».
+    """
+
+    KING = "king_sigurd"
+    DUKE = "duke_lyra"
+    DUKE_OTHER = "duke_orso"
+    BARON = "baron_thorn"
+    BARON_OTHER = "baron_moss"
+    PROVINCE = RIGHTS_OWN_PROVINCE       # зелёная, в leafguard
+    NEUTRAL = RIGHTS_NEUTRAL_PROVINCE
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+        self.h.realms["kingdom_thorn"].gold = 10000
+        self.h.characters[self.DUKE].gold = 10000
+
+    # ---------------- хелперы ----------------
+
+    def landless(self, baron_id: str) -> str:
+        self.h.revoke_fief(baron_id)
+        return baron_id
+
+    def opinion(self, character_id: str) -> int:
+        return self.h.characters[character_id].opinion_of_liege
+
+    def issue(self, issuer: str, kind, target: str, args=None) -> Order:
+        order = self.h.issue_order(issuer, kind, target, args)
+        assert isinstance(order, Order), (issuer, kind, target, args)
+        return order
+
+    # ==================================================================
+    # Модель приказа и его числа
+    # ==================================================================
+
+    def test_order_kinds_are_the_documented_seven(self):
+        assert {k.value for k in OrderKind} == {
+            "grant_fief", "revoke_fief", "set_contract", "summon_council",
+            "raise_levy", "develop_county", "gift_vassal",
+        }
+
+    def test_order_statuses_are_the_documented_five(self):
+        assert {s.value for s in OrderStatus} == {
+            "pending", "accepted", "refused", "fulfilled", "punished",
+        }
+
+    def test_weights_table_is_the_documented_one(self):
+        assert ORDER_WEIGHTS == {
+            OrderKind.GIFT: 1,
+            OrderKind.SUMMON_COUNCIL: 1,
+            OrderKind.GRANT_FIEF: 2,
+            OrderKind.DEVELOP_COUNTY: 2,
+            OrderKind.SET_CONTRACT: 2,
+            OrderKind.REVOKE_FIEF: 4,
+            OrderKind.RAISE_LEVY: 5,
+        }
+
+    def test_refusal_penalty_is_the_base_weight_times_the_kind_weight(self):
+        # штраф за отказ — это REFUSED_WEIGHT * вес вида приказа, а не таблица
+        assert REFUSED_WEIGHT == 5
+        for kind, weight in ORDER_WEIGHTS.items():
+            order = Order(id="x", kind=kind, issuer_id="a", target_id="b",
+                          turn_issued=1)
+            assert order.weight == weight
+            assert order.refusal_penalty == REFUSED_WEIGHT * weight
+
+    def test_gift_is_forgiven_easier_than_a_levy_raising(self):
+        # ключевое обещание модели: мелкий приказ прощают легче тяжёлого
+        gift = self.issue(self.KING, OrderKind.GIFT, self.DUKE)
+        levy = self.issue(self.KING, OrderKind.RAISE_LEVY, self.DUKE,
+                          {"blocks": 1})
+        assert gift.refusal_penalty < levy.refusal_penalty
+        assert gift.refusal_penalty == 5
+        assert levy.refusal_penalty == 25
+
+    def test_refusal_threshold_ladder_starts_at_the_floor_and_widens(self):
+        assert (ORDER_REFUSAL_FLOOR, ORDER_REFUSAL_STEP) == (-10, 5)
+        assert order_refusal_threshold(OrderKind.GIFT) == -10
+        assert order_refusal_threshold(OrderKind.SET_CONTRACT) == -15
+        assert order_refusal_threshold("raise_the_siege") == -20
+        assert order_refusal_threshold(OrderKind.REVOKE_FIEF) == -25
+        assert order_refusal_threshold(OrderKind.RAISE_LEVY) == -30
+
+    def test_order_kind_of_accepts_object_name_and_value(self):
+        assert order_kind_of(OrderKind.GIFT) is OrderKind.GIFT
+        assert order_kind_of("GIFT") is OrderKind.GIFT
+        assert order_kind_of("gift_vassal") is OrderKind.GIFT
+        assert order_kind_of("raise a levy") is None
+        assert order_kind_of(None) is None
+        assert order_kind_of(7) is None
+
+    def test_order_weight_of_an_unknown_string_is_the_default_middle(self):
+        assert ORDER_DEFAULT_WEIGHT == 3
+        assert order_weight("raise_the_siege") == ORDER_DEFAULT_WEIGHT
+        assert order_weight(None) == ORDER_DEFAULT_WEIGHT
+
+    def test_clean_order_args_keeps_scalars_and_drops_junk(self):
+        cleaned = clean_order_args({"province_idx": 44, "level": 3,
+                                    "flag": True, "name": "x",
+                                    "weird": {"nested": 1}, "list": [1],
+                                    "nan": float("nan"), 7: "int key"})
+        assert cleaned == {"province_idx": 44, "level": 3, "flag": True,
+                           "name": "x", "7": "int key"}
+        assert clean_order_args("not a dict") == {}
+
+    # ==================================================================
+    # can_accept_order наконец использует параметр order
+    # ==================================================================
+
+    def test_can_accept_order_depends_on_the_order_weight(self):
+        # -20: подарок (вес 1, порог -10) отвергнут, левейс (вес 5, порог -30)
+        # принят — при одном и том же мнении
+        self.h.realms["kingdom_thorn"].crown_authority = 2
+        self.h.characters[self.DUKE].opinion_of_liege = -20
+        assert not self.h.can_accept_order(self.DUKE, OrderKind.GIFT)
+        assert self.h.can_accept_order(self.DUKE, OrderKind.RAISE_LEVY)
+
+    def test_can_accept_order_forgives_a_gift_deeper_than_a_levy_raising(self):
+        self.h.realms["kingdom_thorn"].crown_authority = 2
+        self.h.characters[self.DUKE].opinion_of_liege = -9
+        assert self.h.can_accept_order(self.DUKE, OrderKind.GIFT)
+        self.h.characters[self.DUKE].opinion_of_liege = -29
+        assert self.h.can_accept_order(self.DUKE, OrderKind.RAISE_LEVY)
+
+    def test_can_accept_order_still_answers_for_legacy_string_calls(self):
+        # 308 старых тестов зовут can_accept_order(vassal, "raise_the_siege"):
+        # при нулевом мнении любой приказ принимается, как и раньше
+        self.h.characters[self.BARON].opinion_of_liege = 0
+        assert self.h.can_accept_order(self.BARON, "raise_the_siege")
+        self.h.characters[self.BARON].opinion_of_liege = -70
+        assert not self.h.can_accept_order(self.BARON, "raise_the_siege")
+        self.h.characters[self.BARON].alive = False
+        assert not self.h.can_accept_order(self.BARON, OrderKind.GIFT)
+
+    # ==================================================================
+    # issue_order
+    # ==================================================================
+
+    def test_issue_order_creates_a_pending_order_in_the_registry(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        assert order.status is OrderStatus.PENDING
+        assert order.resolved_turn is None
+        assert order.issuer_id == self.DUKE
+        assert order.target_id == self.BARON
+        assert order.turn_issued == self.h.turn
+        assert self.h.orders[order.id] is order
+        assert order.is_open
+
+    def test_issue_order_does_not_apply_anything_yet(self):
+        # приказ только выдан: контракт и земля не тронуты до решения
+        opinion = self.opinion(self.BARON)
+        self.issue(self.DUKE, OrderKind.SET_CONTRACT, self.BARON, {"level": 3})
+        assert self.h.contracts[self.BARON].level == 2
+        assert self.opinion(self.BARON) == opinion
+
+    def test_issue_order_needs_the_right_to_command(self):
+        assert self.h.issue_order("king_erik", OrderKind.SUMMON_COUNCIL,
+                                  self.BARON) is None
+        assert self.h.issue_order(self.BARON, OrderKind.SUMMON_COUNCIL,
+                                  self.BARON_OTHER) is None
+        assert self.h.issue_order(self.KING, OrderKind.SUMMON_COUNCIL,
+                                  self.KING) is None
+        assert self.h.orders == {}
+
+    def test_issue_order_refuses_a_dead_actor(self):
+        self.h.characters[self.DUKE].alive = False
+        assert self.h.issue_order(self.DUKE, OrderKind.SUMMON_COUNCIL,
+                                  self.BARON) is None
+
+    def test_issue_order_refuses_an_unknown_kind_or_target(self):
+        assert self.h.issue_order(self.DUKE, "raise a levy", self.BARON) is None
+        assert self.h.issue_order(self.DUKE, OrderKind.GIFT, "baron_ghost") is None
+        assert self.h.issue_order(self.DUKE, OrderKind.GIFT, None) is None
+
+    def test_issue_order_refuses_a_fief_in_land_the_issuer_does_not_own(self):
+        assert self.h.issue_order(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                                  {"province_idx": self.NEUTRAL}) is None
+        assert self.h.issue_order(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                                  {"province_idx": RIGHTS_FOREIGN_PROVINCE}) is None
+        assert self.h.issue_order(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                                  {"province_idx": "many"}) is None
+        self.landless(self.BARON)
+        assert self.issue(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                          {"province_idx": self.PROVINCE})
+
+    def test_issue_order_refuses_a_fief_to_someone_who_already_has_one(self):
+        assert self.h.issue_order(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                                  {"province_idx": self.PROVINCE}) is None
+
+    def test_issue_order_refuses_a_contract_level_out_of_range(self):
+        assert self.h.issue_order(self.DUKE, OrderKind.SET_CONTRACT, self.BARON,
+                                  {"level": 99}) is None
+        assert self.h.issue_order(self.DUKE, OrderKind.SET_CONTRACT, self.BARON,
+                                  {"level": "high"}) is None
+        assert self.issue(self.DUKE, OrderKind.SET_CONTRACT, self.BARON,
+                          {"level": 3})
+
+    def test_issue_order_refuses_a_revocation_of_nothing(self):
+        self.landless(self.BARON)
+        assert self.h.issue_order(self.DUKE, OrderKind.REVOKE_FIEF, self.BARON) is None
+        assert self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+
+    def test_issue_order_refuses_a_levy_from_a_non_king(self):
+        # левейс поднимает правитель realm'а, поэтому герцог его не поднимет
+        assert self.h.issue_order(self.DUKE, OrderKind.RAISE_LEVY, self.BARON,
+                                  {"blocks": 1}) is None
+        assert self.h.issue_order(self.KING, OrderKind.RAISE_LEVY, self.DUKE,
+                                  {"blocks": 0}) is None
+        assert self.h.issue_order(self.KING, OrderKind.RAISE_LEVY, self.DUKE,
+                                  {"blocks": 1,
+                                   "realm_id": "kingdom_ember"}) is None
+        assert self.issue(self.KING, OrderKind.RAISE_LEVY, self.DUKE, {"blocks": 1})
+
+    def test_issue_order_refuses_development_ordered_by_a_vaudal_duke(self):
+        # застройку платит казна realm'а, а тратить её может только правитель
+        assert self.h.issue_order(self.DUKE, OrderKind.DEVELOP_COUNTY, self.BARON,
+                                  {"province_idx": 43}) is None
+        assert self.h.issue_order(self.KING, OrderKind.DEVELOP_COUNTY, self.DUKE,
+                                  {"province_idx": self.NEUTRAL}) is None
+        assert self.issue(self.KING, OrderKind.DEVELOP_COUNTY, self.DUKE,
+                          {"province_idx": 43})
+
+    def test_issue_order_limit_is_two_per_kind_per_turn(self):
+        assert ORDERS_ISSUED_PER_TURN == 2
+        first = self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+        second = self.issue(self.DUKE, OrderKind.GIFT, self.BARON_OTHER)
+        assert first.id != second.id
+        # третий приказ того же вида в том же ходу — отказ, даже если он
+        # адресован тому же вассалу, что и первый
+        assert self.h.issue_order(self.DUKE, OrderKind.GIFT, self.BARON) is None
+        # другой вид приказа — независимый счётчик
+        assert self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        assert len(self.h.orders) == 3
+
+    def test_issue_order_limit_is_per_actor_not_global(self):
+        self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+        self.issue(self.DUKE, OrderKind.GIFT, self.BARON_OTHER)
+        assert self.h.issue_order(self.DUKE, OrderKind.GIFT, self.BARON) is None
+        assert self.issue(self.DUKE_OTHER, OrderKind.GIFT, "baron_gray")
+
+    def test_issue_order_limit_reopens_on_the_next_turn(self):
+        self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+        self.issue(self.DUKE, OrderKind.GIFT, self.BARON_OTHER)
+        assert self.h.issue_order(self.DUKE, OrderKind.GIFT, self.BARON) is None
+        self.h.end_turn()
+        assert self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+
+    def test_order_ids_are_deterministic_and_unique(self):
+        ids = [self.issue(self.DUKE, OrderKind.GIFT, self.BARON).id,
+               self.issue(self.DUKE, OrderKind.GIFT, self.BARON_OTHER).id]
+        assert ids == [f"order_{self.h.turn}_0", f"order_{self.h.turn}_1"]
+
+    def test_order_of_returns_the_latest_open_order_of_a_vassal(self):
+        assert self.h.order_of(self.BARON) is None
+        first = self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+        second = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        assert self.h.order_of(self.BARON) is second
+        self.h.resolve_orders()
+        # принятый приказ всё ещё открыт: он ждёт своего срока
+        assert self.h.order_of(self.BARON) is second
+        self.h.punish_order(first.id)
+        assert self.h.order_of(self.BARON) is second
+        for _ in range(ORDER_DEADLINE_TURNS + 1):
+            self.h.end_turn()
+        assert self.h.order_of(self.BARON) is None
+        assert self.h.order_of("nobody") is None
+
+    # ==================================================================
+    # resolve_orders: решение вассала
+    # ==================================================================
+
+    def test_resolve_orders_is_silent_when_there_are_no_orders(self):
+        assert self.h.orders == {}
+        assert self.h.resolve_orders() == []
+        self.h.end_turn()
+        assert self.h.orders == {}
+
+    def test_resolve_orders_accepts_a_loved_order(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        events = self.h.resolve_orders()
+        assert order.status is OrderStatus.ACCEPTED
+        assert order.resolved_turn == self.h.turn
+        assert any(order.id in e for e in events)
+
+    def test_resolve_orders_refuses_and_costs_opinion(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        self.h.characters[self.BARON].opinion_of_liege = -20
+        before = self.opinion(self.BARON)
+        events = self.h.resolve_orders()
+        assert order.status is OrderStatus.REFUSED
+        assert self.opinion(self.BARON) == before - order.refusal_penalty
+        assert any("отказ" in e for e in events)
+
+    def test_heavier_orders_cost_more_opinion_on_refusal(self):
+        # одинаковое мнение и одинаковый порог отказа — разная цена отказа
+        self.h.realms["kingdom_thorn"].crown_authority = 2
+        self.h.characters[self.DUKE].opinion_of_liege = -35
+        self.h.characters[self.DUKE_OTHER].opinion_of_liege = -35
+        gift = self.issue(self.KING, OrderKind.GIFT, self.DUKE_OTHER)
+        levy = self.issue(self.KING, OrderKind.RAISE_LEVY, self.DUKE,
+                          {"blocks": 1})
+        self.h.resolve_orders()
+        assert gift.status is OrderStatus.REFUSED
+        assert levy.status is OrderStatus.REFUSED
+        # -35 - 25 = -60 за отказ от левейса и -35 - 5 = -40 за отказ от подарка
+        assert self.opinion(self.DUKE) == -35 - levy.refusal_penalty == -60
+        assert self.opinion(self.DUKE_OTHER) == -35 - gift.refusal_penalty == -40
+        assert gift.refusal_penalty < levy.refusal_penalty
+
+    def test_order_of_a_dead_vassal_is_closed_without_an_opinion_penalty(self):
+        order = self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+        self.h.characters[self.BARON].alive = False
+        opinion = self.opinion(self.BARON)
+        self.h.resolve_orders()
+        assert order.status is OrderStatus.REFUSED
+        assert order.message == "приказ снят: сюзерен или вассал мёртв"
+        assert self.opinion(self.BARON) == opinion, "виноватых нет — штрафа нет"
+
+    def test_resolve_orders_is_idempotent_for_closed_orders(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        first = self.h.resolve_orders()
+        opinion = self.opinion(self.BARON)
+        assert first, "первый разбор обязан что-то вернуть"
+        assert self.h.resolve_orders() == []
+        assert order.status is OrderStatus.ACCEPTED
+        assert self.opinion(self.BARON) == opinion
+
+    def test_resolve_orders_accepts_a_str_kind_as_well_as_the_enum(self):
+        order = self.issue(self.DUKE, "summon_council", self.BARON)
+        assert order.kind is OrderKind.SUMMON_COUNCIL
+
+    # ==================================================================
+    # Срок приказа и его исполнение
+    # ==================================================================
+
+    def test_accepted_order_waits_its_deadline_before_it_is_applied(self):
+        self.landless(self.BARON)
+        order = self.issue(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                           {"province_idx": self.PROVINCE})
+        self.h.end_turn()
+        assert order.status is OrderStatus.ACCEPTED
+        assert self.h.characters[self.BARON].province_idx is None
+        self.h.end_turn()
+        assert order.status is OrderStatus.ACCEPTED
+        assert self.h.characters[self.BARON].province_idx is None
+        self.h.end_turn()
+        assert order.status is OrderStatus.FULFILLED
+        assert order.resolved_turn == 3, "приказ хода 1 исполняется на границе 1+2"
+        assert self.h.characters[self.BARON].province_idx == self.PROVINCE
+
+    def test_deadline_is_the_documented_number_of_turns(self):
+        # приказ хода 1: решение на границе 1, исполнение на границе 1 + DEADLINE
+        assert ORDER_DEADLINE_TURNS == 2
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        self.h.end_turn()
+        assert order.status is OrderStatus.ACCEPTED
+        for _ in range(ORDER_DEADLINE_TURNS):
+            assert order.status is not OrderStatus.FULFILLED
+            self.h.end_turn()
+        assert order.status is OrderStatus.FULFILLED
+
+    def test_fulfilled_order_really_applied_the_effect(self):
+        order = self.issue(self.DUKE, OrderKind.SET_CONTRACT, self.BARON,
+                           {"level": 3})
+        for _ in range(ORDER_DEADLINE_TURNS + 1):
+            self.h.end_turn()
+        assert order.status is OrderStatus.FULFILLED
+        assert self.h.contracts[self.BARON].level == 3
+        assert self.opinion(self.BARON) < 20
+
+    def test_fulfilled_council_order_really_gave_the_bonuses(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        baron = self.h.characters[self.BARON]
+        influence, loyalty = baron.influence, baron.loyalty
+        for _ in range(ORDER_DEADLINE_TURNS + 1):
+            self.h.end_turn()
+        assert order.status is OrderStatus.FULFILLED
+        # влияние никто, кроме совета, не трогает — оно проверяется точно;
+        # лояльность же каждый ход подтягивает к своему равновесию tick_vassals,
+        # поэтому проверяем только знак прироста
+        assert baron.influence == influence + COUNCIL_INFLUENCE
+        assert baron.loyalty > loyalty
+
+    def test_order_application_rechecks_the_rights_at_the_moment_it_runs(self):
+        # пока приказ висел, провинция сменила владельца — приказ обязан
+        # закрыться как «не исполнен», а не выдать чужую землю
+        self.landless(self.BARON)
+        order = self.issue(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                           {"province_idx": self.PROVINCE})
+        self.h.end_turn()
+        self.h.provinces[self.PROVINCE].owner = "red"
+        for _ in range(ORDER_DEADLINE_TURNS):
+            self.h.end_turn()
+        assert order.status is OrderStatus.FULFILLED
+        assert order.message == "не исполнен"
+        assert self.h.characters[self.BARON].province_idx is None
+
+    # ==================================================================
+    # Наказание за неисполнение
+    # ==================================================================
+
+    def test_punish_order_marks_punished_and_costs_opinion_and_loyalty(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        self.h.end_turn()
+        assert order.status is OrderStatus.ACCEPTED
+        baron = self.h.characters[self.BARON]
+        opinion, loyalty = self.opinion(self.BARON), baron.loyalty
+        events = self.h.punish_order(order.id, by_actor=self.DUKE)
+        assert events
+        assert order.status is OrderStatus.PUNISHED
+        assert order.resolved_turn == self.h.turn
+        assert self.opinion(self.BARON) == opinion + PUNISHED_OPINION
+        assert baron.loyalty == max(0, loyalty - PUNISHED_LOYALTY)
+
+    def test_non_fulfilment_costs_more_than_the_heaviest_refusal(self):
+        assert abs(PUNISHED_OPINION) > REFUSED_WEIGHT * max(ORDER_WEIGHTS.values())
+        assert PUNISHED_LOYALTY == 20
+
+    def test_punished_order_is_not_applied_anymore(self):
+        self.landless(self.BARON)
+        order = self.issue(self.DUKE, OrderKind.GRANT_FIEF, self.BARON,
+                           {"province_idx": self.PROVINCE})
+        self.h.end_turn()
+        self.h.punish_order(order.id)
+        for _ in range(ORDER_DEADLINE_TURNS):
+            self.h.end_turn()
+        assert order.status is OrderStatus.PUNISHED
+        assert self.h.characters[self.BARON].province_idx is None
+
+    def test_punish_order_refused_for_a_foreign_actor(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        self.h.end_turn()
+        before = self.h.state_fingerprint()
+        events = self.h.punish_order(order.id, by_actor="king_erik")
+        assert isinstance(events, list) and len(events) == 1
+        assert order.status is OrderStatus.ACCEPTED
+        assert self.h.state_fingerprint() == before
+
+    def test_punish_order_refused_when_the_order_is_not_accepted(self):
+        pending = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        events = self.h.punish_order(pending.id)
+        assert isinstance(events, list) and len(events) == 1
+        assert pending.status is OrderStatus.PENDING
+        assert self.h.punish_order("order_1_999") == []
+
+    # ==================================================================
+    # Совет
+    # ==================================================================
+
+    def test_summon_council_gives_influence_and_loyalty(self):
+        baron = self.h.characters[self.BARON]
+        influence, loyalty = baron.influence, baron.loyalty
+        events = self.h.summon_council(self.DUKE, self.BARON)
+        assert events
+        assert baron.influence == influence + COUNCIL_INFLUENCE
+        assert baron.loyalty == loyalty + COUNCIL_LOYALTY
+
+    def test_summon_council_costs_no_gold(self):
+        # совет — не подарок: казна сюзерена не тратится
+        purse = self.h.purse_of(self.h.characters[self.DUKE])
+        self.h.summon_council(self.DUKE, self.BARON)
+        assert self.h.purse_of(self.h.characters[self.DUKE]) == purse
+
+    def test_summon_council_is_capped_at_the_top(self):
+        baron = self.h.characters[self.BARON]
+        baron.influence, baron.loyalty = 99, 99
+        self.h.summon_council(self.DUKE, self.BARON)
+        assert (baron.influence, baron.loyalty) == (100, 100)
+
+    def test_summon_council_refused_for_a_foreign_liege_and_for_a_king(self):
+        for call in (lambda: self.h.summon_council("king_erik", self.BARON),
+                     lambda: self.h.summon_council(self.BARON, self.BARON_OTHER),
+                     lambda: self.h.summon_council(self.KING, self.KING)):
+            assert isinstance(call(), list) and len(call()) == 1
+        assert self.h.summon_council(self.DUKE, "baron_ghost") == []
+        assert self.h.characters[self.BARON].influence == 10, "отказ не награждает"
+
+    def test_refused_council_order_costs_the_least_opinion_of_all(self):
+        assert COUNCIL_INFLUENCE == 5 and COUNCIL_LOYALTY == 10
+        council = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        self.h.characters[self.BARON].opinion_of_liege = -20
+        before = self.opinion(self.BARON)
+        self.h.resolve_orders()
+        assert council.status is OrderStatus.REFUSED
+        assert before - self.opinion(self.BARON) == REFUSED_WEIGHT
+        assert council.refusal_penalty == min(ORDER_WEIGHTS.values()) * REFUSED_WEIGHT
+
+    # ==================================================================
+    # end_turn: разбор приказов без поломки старого поведения
+    # ==================================================================
+
+    def test_end_turn_resolves_orders_when_they_exist(self):
+        order = self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        events = self.h.end_turn()
+        assert order.status is OrderStatus.ACCEPTED
+        assert any(order.id in e for e in events)
+        assert any(order.id in e for e in self.h.log)
+
+    def test_end_turn_without_orders_is_unchanged_and_clears_the_ledger(self):
+        self.h.develop_county(43, actor_id=self.KING)
+        assert self.h.action_ledger
+        events = self.h.end_turn()
+        assert not any("приказ" in e for e in events)
+        assert self.h.orders == {}
+        assert self.h.action_ledger == {}, "граница хода — пустой журнал лимитов"
+
+    def test_order_execution_does_not_spend_the_command_allowance(self):
+        # приказ исполняется приказом сюзерена, но «раз в ход» относится к
+        # живой кнопке: иначе ранее выданный приказ был бы неисполним из-за
+        # того, что герцог уже кликнул ту же кнопку
+        self.issue(self.DUKE, OrderKind.SET_CONTRACT, self.BARON, {"level": 3})
+        self.h.set_contract(self.BARON_OTHER, 1, by_actor=self.DUKE)
+        for _ in range(ORDER_DEADLINE_TURNS + 1):
+            self.h.end_turn()
+        assert self.h.contracts[self.BARON].level == 3, "приказ исполнен несмотря на лимит"
+        assert self.h.contracts[self.BARON_OTHER].level == 1
+
+    def test_resolve_orders_never_touches_the_dice(self):
+        self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        self.issue(self.KING, OrderKind.RAISE_LEVY, self.DUKE, {"blocks": 1})
+        for _ in range(ORDER_DEADLINE_TURNS + 2):
+            self.h.end_turn()
+        assert len(self.h.streams) == 0, "решение по приказу не бросает кубик"
+        assert self.h.streams.consumed("anything") == 0
+
+    def test_summary_keys_are_unchanged_by_orders(self):
+        before = set(self.h.summary())
+        self.issue(self.DUKE, OrderKind.SUMMON_COUNCIL, self.BARON)
+        for _ in range(ORDER_DEADLINE_TURNS + 1):
+            self.h.end_turn()
+        assert set(self.h.summary()) == before == {"turn", "realms", "duchies",
+                                                   "characters"}
+
+    # ==================================================================
+    # Детерминизм
+    # ==================================================================
+
+    def order_chatter(self, hierarchy: Hierarchy) -> None:
+        """Одинаковая переписка приказов для двух независимых миров."""
+        hierarchy.realms["kingdom_thorn"].gold = 10000
+        hierarchy.characters["duke_lyra"].gold = 10000
+        hierarchy.revoke_fief("baron_thorn")
+        hierarchy.issue_order("duke_lyra", OrderKind.GRANT_FIEF, "baron_thorn",
+                              {"province_idx": 44})
+        hierarchy.issue_order("king_sigurd", OrderKind.SET_CONTRACT, "duke_lyra",
+                              {"level": 3})
+        hierarchy.issue_order("king_sigurd", OrderKind.SUMMON_COUNCIL, "duke_lyra")
+        hierarchy.issue_order("duke_lyra", OrderKind.GIFT, "baron_moss")
+        hierarchy.issue_order("king_sigurd", OrderKind.RAISE_LEVY, "duke_lyra",
+                              {"blocks": 1})
+        hierarchy.characters["duke_lyra"].opinion_of_liege = -35
+        for _ in range(6):
+            hierarchy.end_turn()
+
+    def test_two_worlds_with_the_same_orders_hash_equal(self):
+        first, second = make_hierarchy(), make_hierarchy()
+        self.order_chatter(first)
+        self.order_chatter(second)
+        assert first.state_fingerprint() == second.state_fingerprint()
+        assert [o.status for o in first.orders.values()] == \
+            [o.status for o in second.orders.values()]
+
+    def test_end_turn_events_are_identical_for_identical_orders(self):
+        first, second = make_hierarchy(), make_hierarchy()
+        collected = []
+        for hierarchy in (first, second):
+            hierarchy.issue_order("king_sigurd", OrderKind.SUMMON_COUNCIL,
+                                  "duke_lyra")
+            hierarchy.issue_order("king_sigurd", OrderKind.RAISE_LEVY, "duke_lyra",
+                                  {"blocks": 1})
+            hierarchy.characters["duke_lyra"].opinion_of_liege = -35
+            events = []
+            for _ in range(4):
+                events += hierarchy.end_turn()
+            collected.append(events)
+        assert collected[0] == collected[1]
+        assert any("отказ" in e for e in collected[0])
+
+    def test_orders_do_not_depend_on_the_issue_order_of_the_same_kind(self):
+        # два мира, где приказы выданы в разном порядке, обязаны разойтись:
+        # порядок выдачи влияет на мир (id приказа, журнал лимитов)
+        first, second = make_hierarchy(), make_hierarchy()
+        first.issue_order("duke_lyra", OrderKind.GIFT, "baron_thorn")
+        first.issue_order("duke_lyra", OrderKind.SUMMON_COUNCIL, "baron_thorn")
+        second.issue_order("duke_lyra", OrderKind.SUMMON_COUNCIL, "baron_thorn")
+        second.issue_order("duke_lyra", OrderKind.GIFT, "baron_thorn")
+        assert first.state_fingerprint() != second.state_fingerprint()
+
+    def test_thirty_turns_without_orders_still_hash_equal(self):
+        first, second = make_hierarchy(), make_hierarchy()
+        for _ in range(30):
+            first.end_turn()
+            second.end_turn()
+        assert first.state_fingerprint() == second.state_fingerprint()
+        assert first.orders == second.orders == {}
+        assert len(first.streams) == 0, "ход не должен был потратить ни одного броска"
+
+    def test_fingerprint_tracks_an_issued_order(self):
+        hierarchy = make_hierarchy()
+        before = hierarchy.state_fingerprint()
+        hierarchy.issue_order("king_sigurd", OrderKind.SUMMON_COUNCIL, "duke_lyra")
+        assert hierarchy.state_fingerprint() != before, \
+            "выданный приказ — это состояние мира, а не строка в логе"
+
+    # ==================================================================
+    # Снапшот
+    # ==================================================================
+
+    def test_order_snapshot_has_exactly_the_documented_fields(self):
+        self.issue(self.DUKE, OrderKind.SET_CONTRACT, self.BARON, {"level": 3})
+        self.issue(self.KING, OrderKind.SUMMON_COUNCIL, self.DUKE)
+        snapshot = self.h.to_state()
+        assert set(snapshot) == SNAPSHOT_KEYS
+        assert len(snapshot["orders"]) == 2
+        for order_id, data in snapshot["orders"].items():
+            assert set(data) == {"id", "kind", "issuer_id", "target_id",
+                                 "turn_issued", "args", "status",
+                                 "resolved_turn", "message"}, order_id
+            assert data["id"] == order_id
+        assert snapshot["orders"][f"order_{self.h.turn}_0"]["kind"] == "set_contract"
+        assert snapshot["orders"][f"order_{self.h.turn}_1"]["args"] == {}
+
+    def test_order_args_in_the_snapshot_are_a_copy_not_the_live_dict(self):
+        order = self.issue(self.DUKE, OrderKind.SET_CONTRACT, self.BARON,
+                           {"level": 3})
+        snapshot = self.h.to_state()
+        snapshot["orders"][order.id]["args"]["level"] = 99
+        assert order.args["level"] == 3
+
+    def test_round_trip_with_orders_preserves_the_fingerprint(self):
+        self.order_chatter(self.h)
+        assert self.h.orders
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_json_round_trip_with_orders_preserves_the_fingerprint(self):
+        self.order_chatter(self.h)
+        restored = Hierarchy.from_state(loads(dumps(self.h.to_state())),
+                                        copy_provinces())
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+        assert set(restored.orders) == set(self.h.orders)
+
+    def test_restored_orders_keep_their_status_and_continue_the_numbering(self):
+        self.order_chatter(self.h)
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        for order_id, order in self.h.orders.items():
+            twin = restored.orders[order_id]
+            assert twin.status is order.status
+            assert twin.kind is order.kind
+            assert twin.args == order.args
+            assert twin.resolved_turn == order.resolved_turn
+            assert twin.message == order.message
+        # счётчик id продолжается, а не начинается заново: иначе новый приказ
+        # занял бы уже занятый id
+        fresh = restored.issue_order("king_sigurd", OrderKind.GIFT, "duke_lyra")
+        assert fresh.id == f"order_{restored.turn}_{len(self.h.orders)}"
+
+    def test_from_state_survives_a_broken_orders_block(self):
+        state = self.h.to_state()
+        state["orders"] = {"broken": {"kind": "raise a levy", "status": "???"}}
+        restored = Hierarchy.from_state(state, copy_provinces())
+        # неисполнимый вид приказа теряется, а не роняет загрузку
+        assert restored.orders == {}
+
+    def test_from_state_falls_back_on_a_broken_order_status(self):
+        state = self.h.to_state()
+        state["orders"] = {"order_1_0": {"kind": "gift_vassal", "status": "wat",
+                                         "turn_issued": "4"}}
+        restored = Hierarchy.from_state(state, copy_provinces())
+        order = restored.orders["order_1_0"]
+        assert order.status is OrderStatus.PENDING
+        assert order.turn_issued == 4
+        assert order.args == {}
+
+    def test_from_state_without_orders_key_loads_an_empty_registry(self):
+        state = self.h.to_state()
+        del state["orders"]
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert restored.orders == {}
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_orders_stay_out_of_the_snapshot_of_the_action_ledger(self):
+        # action_ledger живёт по тем же правилам, что и до этапа: не в снапшоте
+        # и обнуляется на границе хода
+        self.issue(self.DUKE, OrderKind.GIFT, self.BARON)
+        assert self.h.action_ledger
+        state = self.h.to_state()
+        assert "action_ledger" not in all_keys(state)
+        self.h.end_turn()
+        assert self.h.action_ledger == {}

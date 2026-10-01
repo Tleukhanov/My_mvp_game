@@ -18,6 +18,10 @@ from map import TacticalMap
 from units import Unit
 from pathfinding import Pathfinder
 from ai import AIController
+from war import (
+    BattleOutcome, WarSession,
+    TROOPS_PER_TACTICAL_UNIT, clamp_quality, quality_bonuses,
+)
 
 UNIT_TYPE_MAP = {
     "infantry": UnitType.INFANTRY,
@@ -27,11 +31,85 @@ UNIT_TYPE_MAP = {
 
 FORMATION_SPACING = CELL_SIZE * 1.2
 
+#: Первая строка и шаг строя для войск, пришедших из мира. Слева (синие) и
+#: справа (красные) от центра, чтобы колонны не наезжали друг на друга.
+SESSION_SPAWN_FIRST_ROW = 4
+SESSION_SPAWN_ROW_STEP = 2
+SESSION_SPAWN_COLS = 4
+#: Насколько далеко от идеальной клетки искать свободную. Карты кампаний
+#: местами засыпаны горами (миссия 2 — почти целиком), а на тренировочной
+#: карте в углах стоят отдельные клочья гор, поэтому «поставить в строй по
+#: сетке» нельзя: юнит на горе не сойдёт с места.
+SESSION_SPAWN_SEARCH = 8
+
+#: Геометрия карты для боя, выросшего из мировой карты (см.
+#: ``_make_world_war_map``). Всё симметрично относительно вертикали: иначе
+#: одна сторона получала бы и реку, и деревни.
+_WAR_RIVER_COLS = (19, 20)
+_WAR_BRIDGES = ((19, 4), (19, 5), (19, 12), (19, 13))
+_WAR_VILLAGES = ((10, 6), (10, 15), (29, 6), (29, 15))
+_WAR_MOUNTAINS = ((14, 0, 17, 3), (22, 0, 25, 3),
+                  (14, 18, 17, 21), (22, 18, 25, 21))
+
+
+def _make_world_war_map():
+    """Собрать карту для боя, выросшего из мировой карты.
+
+    Своя карта, а не тренировочная, потому что у ``TacticalMap()`` без сетки
+    ДЕРЕВЕНЬ НЕТ ВООБЩЕ. А именно деревни в конце боя превращаются в добычу на
+    мировой карте: ``PRESTIGE_PER_VILLAGE`` и ``villages_delta`` в
+    ``war.outcome_to_world`` считаются от них. На тренировочной карте мост был бы
+    наполовину холостым: золото за уцелевших капало бы, а престиж и деревни никогда.
+
+    Четыре деревни, по две у каждого фланга и на равном расстоянии от центра:
+    симметрия нужна, чтобы исход не решался тем, что «у синих деревни ближе».
+    Горы стоят четырьмя клиньями в глубине карты — они не мешают строю войск
+    по краям (колонки 2..5 и 34..37, строки 4..8).
+    """
+    grid = [[TerrainType.PLAIN for _ in range(MAP_COLS)]
+            for _ in range(MAP_ROWS)]
+
+    for row in range(MAP_ROWS):
+        for col in _WAR_RIVER_COLS:
+            grid[row][col] = TerrainType.RIVER
+    for col, row in _WAR_BRIDGES:
+        if 0 <= row < MAP_ROWS and 0 <= col < MAP_COLS:
+            grid[row][col] = TerrainType.BRIDGE
+    for c1, r1, c2, r2 in _WAR_MOUNTAINS:
+        for row in range(r1, r2 + 1):
+            for col in range(c1, c2 + 1):
+                if 0 <= row < MAP_ROWS and 0 <= col < MAP_COLS:
+                    grid[row][col] = TerrainType.MOUNTAIN
+    for col, row in _WAR_VILLAGES:
+        if 0 <= row < MAP_ROWS and 0 <= col < MAP_COLS:
+            grid[row][col] = TerrainType.VILLAGE
+
+    return grid, list(_WAR_VILLAGES)
+
 
 class GameEngine:
-    def __init__(self, mission: Optional[int] = None):
+    def __init__(self, mission: Optional[int] = None,
+                 session: Optional[WarSession] = None):
+        """Тактический бой.
+
+        Два необязательных параметра задают, откуда взялись войска и куда
+        уйдёт результат:
+
+        * ``mission`` — номер миссии кампании (как раньше);
+        * ``session`` — билет из ``war.py``, если бой вырос из мировой карты.
+
+        Обратная совместимость ``run()`` сохранена полностью: он по-прежнему
+        возвращает ``Optional[int]`` — номер следующей миссии. Исход боя по
+        сессии лежит в отдельном атрибуте ``outcome`` и добирается методом
+        ``build_outcome()``: смешивать «номер миссии» и «исход боя» в одном
+        возвращаемом значении значило бы заставить ``main.py`` угадывать по
+        типу, а два разных вопроса должны иметь два разных ответа.
+        """
         pygame.init()
         self.mission = mission
+        self.session = session
+        # квитанция для мира; заполняется один раз в конце боя по сессии
+        self.outcome: Optional[BattleOutcome] = None
         pygame.display.set_caption("Tactic Battle - Napoleonic Simulator")
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock = pygame.time.Clock()
@@ -47,6 +125,12 @@ class GameEngine:
         self.selected_units: List[Unit] = []
 
         self._setup_units()
+
+        # снимок стартового состава: по нему считаются потери для квитанции
+        # (world -> тактика), и без него «сколько юнитов погибло» пришлось бы
+        # угадывать по позициям на экране
+        self._start_blue_count = len(self.blue_units)
+        self._start_red_count = len(self.red_units)
 
         self.font_hud = pygame.font.SysFont(FONT_NAME, FONT_SIZE_HUD)
         self.font_title = pygame.font.SysFont(FONT_NAME, FONT_SIZE_TITLE, bold=True)
@@ -75,6 +159,13 @@ class GameEngine:
                 self.game_map = TacticalMap(config.grid, config.villages)
                 self._mission_config = config
                 return
+        if self.session is not None:
+            # бой из мира: своя симметричная карта с четырьмя деревнями,
+            # иначе трофея за деревни взять было бы негде (см. _make_world_war_map)
+            grid, villages = _make_world_war_map()
+            self.game_map = TacticalMap(grid, villages)
+            self._mission_config = None
+            return
         self.game_map = TacticalMap()
         self._mission_config = None
 
@@ -105,20 +196,157 @@ class GameEngine:
 
         self.all_units = self.blue_units + self.red_units
 
+        # К миссии, выросшей из мира, добавляется левейс генерала. Именно
+        # добавляется, а не заменяет: у миссии есть собственный сценарий с
+        # заранее расставленными войсками, и стирать их было бы потерей
+        # уровня, а не честным мостом.
+        self._add_session_warriors()
+
     def _setup_skirmish_units(self):
-        blue_infantry = Unit(UnitType.INFANTRY, Team.BLUE, 3 * CELL_SIZE + CELL_SIZE / 2, 8 * CELL_SIZE + CELL_SIZE / 2)
-        blue_infantry2 = Unit(UnitType.INFANTRY, Team.BLUE, 4 * CELL_SIZE + CELL_SIZE / 2, 10 * CELL_SIZE + CELL_SIZE / 2)
-        blue_cavalry = Unit(UnitType.CAVALRY, Team.BLUE, 5 * CELL_SIZE + CELL_SIZE / 2, 12 * CELL_SIZE + CELL_SIZE / 2)
-        blue_archer = Unit(UnitType.ARCHER, Team.BLUE, 2 * CELL_SIZE + CELL_SIZE / 2, 14 * CELL_SIZE + CELL_SIZE / 2)
+        # Без сессии — демонстрационный набор, каким он и был.
+        if self.session is None:
+            blue_infantry = Unit(UnitType.INFANTRY, Team.BLUE, 3 * CELL_SIZE + CELL_SIZE / 2, 8 * CELL_SIZE + CELL_SIZE / 2)
+            blue_infantry2 = Unit(UnitType.INFANTRY, Team.BLUE, 4 * CELL_SIZE + CELL_SIZE / 2, 10 * CELL_SIZE + CELL_SIZE / 2)
+            blue_cavalry = Unit(UnitType.CAVALRY, Team.BLUE, 5 * CELL_SIZE + CELL_SIZE / 2, 12 * CELL_SIZE + CELL_SIZE / 2)
+            blue_archer = Unit(UnitType.ARCHER, Team.BLUE, 2 * CELL_SIZE + CELL_SIZE / 2, 14 * CELL_SIZE + CELL_SIZE / 2)
 
-        red_infantry = Unit(UnitType.INFANTRY, Team.RED, 36 * CELL_SIZE + CELL_SIZE / 2, 8 * CELL_SIZE + CELL_SIZE / 2)
-        red_infantry2 = Unit(UnitType.INFANTRY, Team.RED, 37 * CELL_SIZE + CELL_SIZE / 2, 10 * CELL_SIZE + CELL_SIZE / 2)
-        red_cavalry = Unit(UnitType.CAVALRY, Team.RED, 35 * CELL_SIZE + CELL_SIZE / 2, 12 * CELL_SIZE + CELL_SIZE / 2)
-        red_archer = Unit(UnitType.ARCHER, Team.RED, 38 * CELL_SIZE + CELL_SIZE / 2, 14 * CELL_SIZE + CELL_SIZE / 2)
+            red_infantry = Unit(UnitType.INFANTRY, Team.RED, 36 * CELL_SIZE + CELL_SIZE / 2, 8 * CELL_SIZE + CELL_SIZE / 2)
+            red_infantry2 = Unit(UnitType.INFANTRY, Team.RED, 37 * CELL_SIZE + CELL_SIZE / 2, 10 * CELL_SIZE + CELL_SIZE / 2)
+            red_cavalry = Unit(UnitType.CAVALRY, Team.RED, 35 * CELL_SIZE + CELL_SIZE / 2, 12 * CELL_SIZE + CELL_SIZE / 2)
+            red_archer = Unit(UnitType.ARCHER, Team.RED, 38 * CELL_SIZE + CELL_SIZE / 2, 14 * CELL_SIZE + CELL_SIZE / 2)
 
-        self.blue_units = [blue_infantry, blue_infantry2, blue_cavalry, blue_archer]
-        self.red_units = [red_infantry, red_infantry2, red_cavalry, red_archer]
-        self.all_units = self.blue_units + self.red_units
+            self.blue_units = [blue_infantry, blue_infantry2, blue_cavalry, blue_archer]
+            self.red_units = [red_infantry, red_infantry2, red_cavalry, red_archer]
+            self.all_units = self.blue_units + self.red_units
+            return
+
+        # Сессия ЗАМЕЩАЕТ демонстрационный набор. Набор из четырёх юнитов ни на
+        # что в мире не опирается: если оставить его рядом с левейсом генерала,
+        # игрок получил бы четыре бесплатных отряда в каждом походе, и весь
+        # смысл «золото и левейс -> войска» исчез бы. В бою по сессии на поле
+        # выходят ровно те, за кого заплатили в мире, и ровно те, кто защищает
+        # атакованную провинцию.
+        self.blue_units = []
+        self.red_units = []
+        self.all_units = []
+        self._add_session_warriors()
+
+    # ---------------- войска из мира ----------------
+
+    def _add_session_warriors(self):
+        """Поставить на карту армии из ``session`` и защитника.
+
+        Синим ставится левейс генерала: ``session.tactical_units`` юнитов
+        (по ``TROOPS_PER_TACTICAL_UNIT`` солдат на юнит, не больше
+        ``TACTICS_UNIT_CAP``). Качество сессии — это «выучка» одной и той же
+        пехоты, поэтому тип юнита не меняется, а множатся здоровье и урон
+        (см. ``war.quality_bonuses``).
+
+        Красным ставится гарнизон атакованной провинции: у обороняющейся
+        стороны своего левейса в мире нет, поэтому состав берётся из
+        ``war.defender_units_for``.
+        """
+        if self.session is None:
+            return
+
+        hp_bonus, dmg_bonus = quality_bonuses(self.session.quality)
+
+        blue_cells = self._spawn_cells(Team.BLUE, self.session.tactical_units)
+        for i, cell in enumerate(blue_cells):
+            unit = self._make_warrior(UnitType.INFANTRY, Team.BLUE, cell,
+                                      hp_bonus, dmg_bonus)
+            self.blue_units.append(unit)
+            self.all_units.append(unit)
+
+        red_cells = self._spawn_cells(Team.RED, self.session.defender_units)
+        for cell in red_cells:
+            unit = self._make_warrior(UnitType.INFANTRY, Team.RED, cell)
+            self.red_units.append(unit)
+            self.all_units.append(unit)
+
+    def _make_warrior(self, unit_type: UnitType, team: Team, cell: Tuple[int, int],
+                      hp_bonus: float = 1.0, dmg_bonus: float = 1.0) -> Unit:
+        """Создать юнита с бонусами качества.
+
+        ``Unit`` принимает только ``health``, а качество меняет ещё и
+        ``max_health`` (иначе полоска здоровья и death-check поехали бы вниз
+        относительно полоски) и ``damage``. Поэтому множители применяются
+        здесь, а не в конструкторе: трогать ``units.py`` в этом этапе нельзя.
+        """
+        col, row = cell
+        x = col * CELL_SIZE + CELL_SIZE / 2
+        y = row * CELL_SIZE + CELL_SIZE / 2
+        unit = Unit(unit_type, team, x, y)
+        if hp_bonus != 1.0:
+            unit.max_health = max(1, int(round(unit.max_health * hp_bonus)))
+            unit.health = unit.max_health
+        if dmg_bonus != 1.0:
+            unit.damage = max(1, int(round(unit.damage * dmg_bonus)))
+        return unit
+
+    def _spawn_cells(self, team: Team, count: int) -> List[Tuple[int, int]]:
+        """Клетки строя для ``count`` юнитов, с проверкой проходимости.
+
+        Идеальные клетки — колонна у края карты (синие слева, красные
+        справа). Если там гора или уже стоит чужой юнит, ищется ближайшая
+        свободная клетка по расширяющимся кольцам: карты кампаний местами
+        засыпаны горами, и юнит, поставленный на гору, просто застрянет.
+        """
+        count = max(0, int(count))
+        base_col = 2 if team is Team.BLUE else MAP_COLS - 2 - SESSION_SPAWN_COLS
+        cells: List[Tuple[int, int]] = []
+        for i in range(count):
+            col = base_col + (i % SESSION_SPAWN_COLS)
+            row = SESSION_SPAWN_FIRST_ROW + (i // SESSION_SPAWN_COLS) * SESSION_SPAWN_ROW_STEP
+            cells.append(self._free_cell_near(team, col, row))
+        return cells
+
+    def _free_cell_near(self, team: Team, col: int, row: int) -> Tuple[int, int]:
+        """Ближайшая свободная клетка к ``(col, row)`` или сама ``(col, row)``.
+
+        Кольца просматриваются по возрастанию радиуса, а внутри кольца клетки
+        идут в фиксированном порядке: сначала та же колонка ниже цели, потом
+        остальные. Порядок не «случайный», а задан сортировкой — иначе строй
+        вставал бы вверх-влево от препятствия, и на тренировочной карте
+        гарнизон уезжал бы в угол вместо того, чтобы стоять напротив своих.
+
+        Отступать дальше, чем на ``SESSION_SPAWN_SEARCH`` клеток, незачем:
+        это уже другая часть карты, и «поиск удобного места» превратился бы в
+        телепорт армии к флангу.
+        """
+        if self._cell_is_free(team, col, row):
+            return (col, row)
+        for radius in range(1, SESSION_SPAWN_SEARCH + 1):
+            ring = [(dcol, drow)
+                    for dcol in range(-radius, radius + 1)
+                    for drow in range(-radius, radius + 1)
+                    if max(abs(dcol), abs(drow)) == radius]
+            # ниже цели — раньше, в той же колонке — раньше остального
+            ring.sort(key=lambda d: (-d[1], d[0]))
+            for dcol, drow in ring:
+                cand = (col + dcol, row + drow)
+                if self._cell_is_free(team, cand[0], cand[1]):
+                    return cand
+        return (col, row)
+
+    def _cell_is_free(self, team: Team, col: int, row: int) -> bool:
+        """Клетка в границах карты, проходимая и не занятая ничьим войском.
+
+        Проверяются ВСЕ юниты, а не только свои: в миссии сценарий уже расставил
+        своих, и новый отряд, вставший поверх чужого, выглядел бы как ошибка
+        позиционирования. Параметр ``team`` оставлен, чтобы вызов читался
+        однозначно и его можно было сузить, если понадобится.
+        """
+        if not self.game_map.in_bounds(col, row):
+            return False
+        if not self.game_map.is_passable(col, row):
+            return False
+        px = col * CELL_SIZE + CELL_SIZE / 2
+        py = row * CELL_SIZE + CELL_SIZE / 2
+        for unit in self.all_units:
+            if abs(unit.x - px) < 1 and abs(unit.y - py) < 1:
+                return False
+        return True
 
     def run(self):
         while self.running:
@@ -340,6 +568,11 @@ class GameEngine:
         self.pathfinder = Pathfinder(self.game_map)
         self.ai_controller = AIController(self.pathfinder)
         self._setup_units()
+        # перезапуск возвращает бою исходный состав, поэтому и счётчики
+        # потерь, и квитанция прежнего боя больше не годятся
+        self._start_blue_count = len(self.blue_units)
+        self._start_red_count = len(self.red_units)
+        self.outcome = None
 
     def _update(self, dt: float):
         for unit in self.all_units:
@@ -395,16 +628,40 @@ class GameEngine:
         self._red_food = max(0, min(FOOD_MAX, self._red_food))
 
     def _update_recruit(self, dt: float):
+        # В бою по сессии авто-вербовки нет НИКАКОЙ. Левейс генерала уже
+        # выведен из мира и учтён в WarSession, а вербовка за еду выдавала бы
+        # бесплатные войска сверх него — то есть сессия ничего не решала бы, а
+        # мир бесконечно печатал бы отряды из ниоткуда. Плюс к тому еда тут не
+        # ограничивает: деревня даёт +20/с, а расход равен -5/юнит/с, поэтому
+        # «попытка ограничить вербовку едой» в текущей экономике не работает.
+        if self.session is not None:
+            return
+
         self._recruit_timer += dt
         if self._recruit_timer >= RECRUIT_INTERVAL:
             self._recruit_timer -= RECRUIT_INTERVAL
             self._recruit_unit("blue")
             self._recruit_unit("red")
 
-    def _recruit_unit(self, team_str: str):
+    def _recruit_unit(self, team_str: str,
+                      unit_type: UnitType = UnitType.INFANTRY,
+                      health: Optional[int] = None,
+                      hp_bonus: float = 1.0,
+                      dmg_bonus: float = 1.0) -> Optional[Unit]:
+        """Вырастить юнита в своей деревне за еду.
+
+        Раньше здесь стоял хардкод ``Unit(UnitType.INFANTRY, ..., health=500)``:
+        ни тип, ни здоровье, ни урон настроить было нельзя, поэтому качество
+        левейса из мира (см. ``war.QUALITY_BONUS``) физически некуда было
+        применить. Теперь параметры открыты, а поведение по умолчанию ровно
+        прежнее — вызов без аргументов даёт того же пехотинца с 500 HP.
+
+        Возвращает созданного юнита или ``None``, если вербовать не из чего
+        (нет еды или нет своей деревни).
+        """
         food = self._blue_food if team_str == "blue" else self._red_food
         if food <= 0:
-            return
+            return None
 
         team = Team.BLUE if team_str == "blue" else Team.RED
         units = self.blue_units if team_str == "blue" else self.red_units
@@ -413,7 +670,7 @@ class GameEngine:
             if self.game_map.get_village_owner(c, r) == team_str
         ]
         if not villages:
-            return
+            return None
 
         spawn_col, spawn_row = villages[0]
         sx = spawn_col * CELL_SIZE + CELL_SIZE / 2
@@ -424,13 +681,19 @@ class GameEngine:
         sx += offset_x - CELL_SIZE
         sy += offset_y - CELL_SIZE
 
-        new_unit = Unit(UnitType.INFANTRY, team, sx, sy, health=500)
+        new_unit = Unit(unit_type, team, sx, sy, health=health)
+        if hp_bonus != 1.0 or dmg_bonus != 1.0:
+            new_unit.max_health = max(1, int(round(new_unit.max_health * hp_bonus)))
+            new_unit.health = min(new_unit.health, new_unit.max_health)
+            if dmg_bonus != 1.0:
+                new_unit.damage = max(1, int(round(new_unit.damage * dmg_bonus)))
         new_unit._pathfinder = self.pathfinder
         units.append(new_unit)
         self.all_units.append(new_unit)
 
         if team == Team.RED:
             self.ai_controller.register_unit(new_unit)
+        return new_unit
 
     def _check_game_over(self):
         blue_alive = any(u.alive for u in self.blue_units)
@@ -448,10 +711,66 @@ class GameEngine:
             self._game_over = True
             self._winner = "RED WINS"
 
+        # Квитанция для мира собирается один раз — в тот кадр, когда стало
+        # понятно, чем кончился бой. Идемпотентно: _check_game_over зовётся
+        # каждый тик, а пересчитывать потери после конца партии незачем.
+        if self._game_over and self.outcome is None:
+            self.outcome = self.build_outcome()
+
         for su in list(self.selected_units):
             if not su.alive:
                 su.selected = False
                 self.selected_units.remove(su)
+
+    # ---------------- квитанция для мира (war.py) ----------------
+
+    def build_outcome(self, winner_nation: Optional[str] = None) -> Optional[BattleOutcome]:
+        """Собрать :class:`war.BattleOutcome` для текущего состояния боя.
+
+        ``None``, если бой не вырос из мировой карты (``session is None``):
+        обычный тренировочный и миссионный бой никому ничего не должен.
+
+        ``winner_nation`` переопределяет победителя. Нужен ровно для одного
+        случая — игрок закрыл бой через ESC, не доиграв: тогда ``self._winner``
+        пуст, и подставляется честное «никто не победил» (в мире это читается
+        как отступление без награды, а потери считаются).
+
+        Поля квитанции:
+
+        * ``blue_surviving`` — сколько синих юнитов дожило;
+        * ``blue_losses`` / ``red_losses`` — потери от СТАРТОВОГО состава;
+        * ``captured_villages`` — число деревень под синим контролем к концу
+          боя. Именно они становятся добычей в мире.
+        """
+        if self.session is None:
+            return None
+
+        if winner_nation is None:
+            if self._winner == "BLUE WINS":
+                winner_nation = "blue"
+            elif self._winner == "RED WINS":
+                winner_nation = "red"
+            else:
+                # DRAW или бой не доигран: награды нет, но потери считаются
+                winner_nation = ""
+
+        blue_surviving = sum(1 for u in self.blue_units if u.alive)
+        red_surviving = sum(1 for u in self.red_units if u.alive)
+
+        return BattleOutcome(
+            match_id=int(self.session.match_id),
+            winner_nation=str(winner_nation),
+            blue_surviving=blue_surviving,
+            blue_losses=max(0, self._start_blue_count - blue_surviving),
+            red_losses=max(0, self._start_red_count - red_surviving),
+            captured_villages=self._count_blue_villages(),
+        )
+
+    def _count_blue_villages(self) -> int:
+        """Сколько деревней карты сейчас под синим контролем."""
+        owners = self.game_map.village_owners
+        return sum(1 for cell in self.game_map.get_all_villages()
+                   if owners.get(cell) == "blue")
 
     def _render(self):
         self.game_map.render(self.screen)
@@ -466,6 +785,10 @@ class GameEngine:
             unit.render(self.screen)
 
         self._render_hud()
+
+        # плашка «бой из мира» идёт последней, чтобы лежать поверх карты и HUD
+        if self.session is not None:
+            self._render_war_banner()
 
         if self._game_over:
             self._render_game_over()
@@ -500,6 +823,33 @@ class GameEngine:
                 (int(unit.x), int(unit.y)), move_range, 1
             )
         self.screen.blit(indicator_surface, (0, 0))
+
+    def _render_war_banner(self):
+        """Плашка «этот бой вырос из мира» поверх верхнего края карты.
+
+        Игрок обязан видеть, ЧТО он привёл на эту карту: имя генерала, сколько
+        левейса ушло в бой и какой выучки войска. Без этого отряд из девяти
+        юнитов выглядит как обычная тренировка, а итог боя на карте мира
+        оказывается неожиданным.
+
+        Плашка рисуется НЕ в HUD: полоса снизу высотой 48 px уже занята
+        пятью строками, и шестая наезжала бы на счётчик деревень. Сверху
+        карты места нет, поэтому полоса с тёмной подложкой читается как
+        заголовок миссии и ничего не перекрывает.
+        """
+        ws = self.session
+        if ws is None:
+            return
+        text = (f"WORLD WAR #{ws.match_id}: {ws.general_name} "
+                f"{ws.troops_committed} lev -> {ws.tactical_units} u "
+                f"(q{clamp_quality(ws.quality)}, {TROOPS_PER_TACTICAL_UNIT}/u) "
+                f"vs {ws.defender_units} garrison "
+                f"[{ws.attacker_nation} vs {ws.defender_nation}]")
+        banner = self.font_hud.render(text, True, COLOR_WHITE)
+        bar = pygame.Surface((SCREEN_WIDTH, banner.get_height() + 4), pygame.SRCALPHA)
+        bar.fill((0, 0, 0, 170))
+        self.screen.blit(bar, (0, 0))
+        self.screen.blit(banner, (SCREEN_WIDTH // 2 - banner.get_width() // 2, 2))
 
     def _render_hud(self):
         hud_y = SCREEN_HEIGHT - HUD_HEIGHT

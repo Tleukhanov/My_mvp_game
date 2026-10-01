@@ -29,6 +29,15 @@
   подарков за жизнь, ``MERC_MAX_BLOCKS_PER_TURN``, ``garrison_cap``).
   Одноразовые действия ограничены журналом ``action_ledger``
   («не чаще N раз за ход на актёра») — задел под серверную проверку команд.
+* **Приказ — объект состояния, а не строка в логе** (этапы 1.1-1.2). Права
+  команд вынесены из UI в ``states.py``: ``by_actor`` у ``grant_fief``,
+  ``revoke_fief`` и ``set_contract`` проверяет, что актор — живой сюзерен цели
+  нужного ранга, а провинция действительно принадлежит его realm'у. Приказ
+  (``Hierarchy.orders``) даёт вассалу право ответить: ``OrderStatus`` знает
+  ``REFUSED`` и ``PUNISHED``, поэтому «вассал отказался» и «вассал обещал, но
+  не сделал» — это факты мира, попадающие в снапшот и в хеш, а не строчка,
+  которую можно потерять между ходами. Приказы упираются в тот же
+  ``action_ledger``, а их решения НЕ бросают кубик: всё выводится из мнения.
 
 Хеширование состояния
 ---------------------
@@ -70,6 +79,39 @@ class TitleRank(Enum):
     BARON = "baron"
     DUKE = "duke"
     KING = "king"
+
+
+class OrderKind(Enum):
+    """Вид приказа сюзерена.
+
+    Имена совпадают с именами методов-команд (кроме ``GIFT`` → ``gift_vassal``
+    и ``DEVELOP_COUNTY`` → ``develop_county``), чтобы по логу сервера было
+    видно, какую команду отклонили. Список намеренно узкий: это только те
+    решения, которые вассал вправе обсудить, а не «всё, что умеет король».
+    """
+
+    GRANT_FIEF = "grant_fief"
+    REVOKE_FIEF = "revoke_fief"
+    SET_CONTRACT = "set_contract"
+    SUMMON_COUNCIL = "summon_council"
+    RAISE_LEVY = "raise_levy"
+    DEVELOP_COUNTY = "develop_county"
+    GIFT = "gift_vassal"
+
+
+class OrderStatus(Enum):
+    """Жизненный цикл приказа.
+
+    ``PENDING`` -> решение вассала -> ``ACCEPTED`` (обещал) или ``REFUSED``
+    (отказался по мнению). Принятый приказ доживает до своего срока и либо
+    применяется (``FULFILLED``), либо наказывается сюзереном (``PUNISHED``).
+    """
+
+    PENDING = "pending"      # выдан, ждёт решения вассала
+    ACCEPTED = "accepted"    # принят и применён
+    REFUSED = "refused"      # отказ по мнению
+    FULFILLED = "fulfilled"  # исполнен в следующем тике
+    PUNISHED = "punished"    # не исполнен, сюзерен наказал
 
 
 #: Пять уровней феодального контракта: доля налогов, доля левейсов,
@@ -268,6 +310,8 @@ ACTION_CROWN = "raise_crown_authority"
 ACTION_TAX_POLICY = "set_tax_policy"
 ACTION_HIRE_MERC = "hire_mercenaries"
 ACTION_HIRE_GARRISON = "hire_garrison"
+ACTION_SET_CONTRACT = "set_contract"
+ACTION_ISSUE_ORDER = "issue_order"
 
 #: Сколько раз за ход один правитель вправе выполнить каждое действие.
 LEVY_RAISES_PER_TURN = 2
@@ -277,6 +321,123 @@ CROWN_RAISES_PER_TURN = 1
 TAX_POLICY_CHANGES_PER_TURN = 1
 MERC_HIRES_PER_TURN = 1
 GARRISON_HIRES_PER_TURN = 2
+#: Смена контракта — раз в ход на сюзерена. Повышение контракта бьёт по мнению
+#: на 10 и вдвое быстрее подъёма левейса поднимает стоимость содержания
+#: (tax 40 -> 60 при levy 25 -> 45), то есть это решение, которое нельзя
+#: принимать дважды за ход «случайно», прокрутив ползунок.
+CONTRACT_CHANGES_PER_TURN = 1
+#: Сколько приказов один сюзерен вправе выдать за ход. Два, а не один: сюжет
+#: «дай землю этому и подними левейс» должен помещаться в один ход, а «раздать
+#: все шесть соседних владений» — уже нет. Лимит считается на ВИД приказа,
+#: поэтому ``issue_order:gift_vassal`` и ``issue_order:raise_levy`` —
+#: независимые счётчики.
+ORDERS_ISSUED_PER_TURN = 2
+
+# --------------------------------------------------------------------------
+# Приказы короля (этапы 1.1-1.2)
+# --------------------------------------------------------------------------
+#
+# До этого этапа приказ не существовал как объект: ``can_accept_order`` принимал
+# параметр ``order`` и полностью его игнорировал, поэтому «вассал отказался» не
+#льзя было ни показать игроку, ни записать в состояние, ни наказать за
+# неисполнение. Теперь приказ — это ``Order`` в ``Hierarchy.orders``: он в
+# снапшоте, в хеше и в журнале, а его судьба выражается ``OrderStatus``.
+#
+# Три правила, на которых держится вся модель:
+#
+# * **Вес приказа.** Отказ от мелкой просьбы прощают, отказ от тяжёлой —
+#   нет. Вес — целое число, а штраф ``REFUSED_WEIGHT * вес``, чтобы лестница
+#   читалась умножением, а не таблицей из семи пар «вид -> число».
+# * **Порог принятия.** Чем тяжелее приказ, тем ниже мнение, при котором
+#   вассал ещё согласится (``ORDER_REFUSAL_FLOOR`` + шаг за вес).
+# * **Срок.** Принятый приказ не висит вечно: ``ORDER_DEADLINE_TURNS`` — и либо
+#   применяется, либо сюзерен наказывает. Молчаливое «ничего не произошло»
+#   хуже отказа, поэтому неисполнение бьёт сильнее.
+
+#: Штраф мнения за отказ от приказа веса 1 — самая базовая величина всей
+#: модели. Пять пунктов выбраны рядом с уже существующими числами модуля:
+#: подарок даёт +15 мнения за 60 золота (то есть отказ от подарка съедает треть
+#: подарка), безземельность отнимает 2 мнения за ход (отказ стоит двух с
+#: половиной ходов безделья), а повышение контракта — 10. Значит минимальный
+#: вес (1) прощается легко, максимальный (5) — в пять раз дороже.
+REFUSED_WEIGHT = 5
+
+#: Вес вида приказа. Обоснование по колонкам:
+#:
+#: * ``GIFT`` и ``SUMMON_COUNCIL`` — 1. От подарка отказаться невежливо, но
+#:   не разрушительно: золото остаётся у короля, а совет — почётная просьба.
+#: * ``GRANT_FIEF`` — 2. Земля желанна, поэтому отказ от неё почти всегда
+#:   означает «у меня уже есть» или гордость, а не бунт.
+#: * ``DEVELOP_COUNTY`` и ``SET_CONTRACT`` — 2. Оба упираются в кошель и в
+#:   тиранию: застройка стоит денег, контракт — терпения.
+#: * ``REVOKE_FIEF`` — 4. Отказ от отзыва означает «оставь землю», то есть
+#:   ровно то насилие, которым ``revoke_fief`` грозит в другую сторону
+#:   (-20 мнения, -20 лояльности). Вес 4 делает отказ от приказа сравнимым с
+#:   самим отзывом.
+#: * ``RAISE_LEVY`` — 5, самый тяжёлый. Сто золота за сотню солдат плюс
+#:   постоянное содержание: подъём левейса бьёт по кошелю короля и по мускулам
+#:   королевства, и именно на него вассал пойдёт к мятежу. Пятерка — это
+#:   максимум шкалы, чтобы «тяжёлый» приказ всегда стоил дороже всего прочего.
+ORDER_WEIGHTS: Dict[OrderKind, int] = {
+    OrderKind.GIFT: 1,
+    OrderKind.SUMMON_COUNCIL: 1,
+    OrderKind.GRANT_FIEF: 2,
+    OrderKind.DEVELOP_COUNTY: 2,
+    OrderKind.SET_CONTRACT: 2,
+    OrderKind.REVOKE_FIEF: 4,
+    OrderKind.RAISE_LEVY: 5,
+}
+
+#: Вес неизвестного вида приказа — середина шкалы. Нужно для старых строковых
+#: вызовов ``can_accept_order(vassal, "raise_the_siege")`` и для команд из сети,
+#: которые прислали приказ, ещё не появившийся в этой версии сервера. Невежда
+#: не должен ни прощать всё подряд, ни получать вес 1.
+ORDER_DEFAULT_WEIGHT = 3
+
+#: Порог мнения, ниже которого вассал откажется от приказа веса 1, и шаг за
+#: каждый следующий вес. ``-10`` выбран как «вассал в обиде, но послушный»:
+#: уровень 0 — это «мнения нет», и при 0 приказ принимается всегда (старые
+#: тесты на это опираются). Шаг 5 даёт лестницу -10 / -15 / -20 / -25 / -30:
+#: подарок прощают при -10, подъём левейса — только при -30, то есть почти на
+#: пороге мятежа (``VASSAL_REBELLION_LOYALTY`` живёт по лояльности, но -30 мнения
+#: — это уже «вассал считает, что его душат»).
+ORDER_REFUSAL_FLOOR = -10
+ORDER_REFUSAL_STEP = 5
+
+#: Сколько ходов живёт принятый приказ, прежде чем сюзерен его исполнит сам.
+#: Два хода — это ровно один полный круг: вассал решает в конце хода выдачи и
+#: получает один ход на подготовку (собрать людей, пересчитать казну, съехать
+#: ко двору). Меньше — приказ не успевает быть «принят вообще», больше — за
+#: этот срок земля успевает сменить владельца, и решение вассала устаревает.
+ORDER_DEADLINE_TURNS = 2
+
+#: Штраф за неисполнение обещанного: мнение. 30 — это максимум шкалы отказа
+#: (5 * 5 = 25) плюс 5: молча не сделать хуже, чем честно отказаться, поэтому
+#: неисполнение обязано стоить дороже ЛЮБОГО отказа. Отказ хотя бы оставляет
+#: сюзерену выбор — он знает о нём сразу.
+PUNISHED_OPINION = -30
+#: ... и лояльность. 20 — ровно столько, сколько снимает ``revoke_fief``:
+#: неисполнение приказа ставит под сомнение самого вассала как племянника,
+#: а не только отношения с короной.
+PUNISHED_LOYALTY = 20
+
+#: Принятый и исполненный совет даёт столько же лояльности, сколько первый
+#: подарок (``GIFT_LOYALTY``): совет ничего не стоит сюзерену в золоте, и не
+#: должен стоить больше подарка. Влияние — половина начального влияния барона
+#: (``Character.influence`` по умолчанию 10), то есть приезд ко двору заметен,
+#: но не переводит разговор в политику.
+COUNCIL_INFLUENCE = 5
+COUNCIL_LOYALTY = 10
+
+#: Минимальный ранг сюзерена, вправе отдавать приказы цели этого ранга
+#: (этап 1.1). Правило ровно одно и оно историческое: бароном командует его
+#: НЕПОСРЕДСТВЕННЫЙ сюзерен — держатель герцогства, то есть герцог; герцогом
+#: — только король его realm'а. Короля в таблице нет намеренно: у короля нет
+#: сюзерена, поэтому приказать ему не может никто, и ``issue_order`` откажет.
+COMMAND_MIN_RANK: Dict[TitleRank, Tier] = {
+    TitleRank.BARON: Tier.DUCHY,
+    TitleRank.DUKE: Tier.REALM,
+}
 
 #: Версия снапшота состояния. Рост числа означает смену формата; старые
 #: снапшоты читаются через ``.get(field, default)`` и потому не ломаются.
@@ -421,6 +582,76 @@ def clean_mercenary_tiers(raw: object) -> List[int]:
     return [t for t in raw if isinstance(t, int) and not isinstance(t, bool)]
 
 
+def order_kind_of(kind: object) -> Optional[OrderKind]:
+    """Вид приказа из ``OrderKind``, его имени или строки-значения.
+
+    Принимает обе записи (имя и значение), потому что приказ может прийти из
+    JSON (``"set_contract"``), из вызова команды (``"SET_CONTRACT"``) или уже
+    быть объектом. Мусор даёт ``None`` — вызывающий обязан это разобрать, а не
+    превращать в приказ по умолчанию.
+    """
+    if isinstance(kind, OrderKind):
+        return kind
+    if isinstance(kind, str):
+        try:
+            return OrderKind[kind]
+        except KeyError:
+            pass
+        try:
+            return OrderKind(kind)
+        except ValueError:
+            return None
+    return None
+
+
+def order_weight(order: object) -> int:
+    """Вес приказа: во сколько раз отказ от него дороже по мнению.
+
+    Принимает ``Order``, ``OrderKind`` или строку. Неизвестное имя (в том числе
+    старые вызовы UI вида ``"raise_the_siege"``) весит как ``ORDER_DEFAULT_WEIGHT``:
+    сервер, получивший приказ из будущей версии клиента, обязан ответить
+    предсказуемо, а не «простить всё» или «отказать от всего».
+    """
+    kind = order.kind if isinstance(order, Order) else order
+    resolved = order_kind_of(kind)
+    return ORDER_WEIGHTS.get(resolved, ORDER_DEFAULT_WEIGHT)
+
+
+def order_refusal_threshold(order: object) -> int:
+    """Мнение, начиная с которого вассал примет приказ этого веса.
+
+    Лестница намеренно убывает с весом: подарок (1) прощают до ``-10``, подъём
+    левейса (5) — только до ``-30``. Ни одна ветка не уходит ниже ``-30``,
+    поэтому «тяжёлый» приказ не становится невыполнимым: при абсолютной
+    королевской власти (``can_accept_order``) его прощает даже ``-50``.
+    """
+    weight = max(1, order_weight(order))
+    return ORDER_REFUSAL_FLOOR - (weight - 1) * ORDER_REFUSAL_STEP
+
+
+def clean_order_args(raw: object) -> Dict[str, object]:
+    """Аргументы приказа — только скаляры, годные для хеша и для JSON.
+
+    Из сети приходит что угодно: вложенный dict, список, ``float``, ``nan``,
+    не-строковые ключи. Всё, что не ``bool``/``int``/``str``, приводится через
+    ``as_int``, а неразборчивое отбрасывается. Причина чисто техническая:
+    ``args`` едет в снапшот, поэтому ``nan`` или dict с плавающей точкой
+    разъехали бы ``state_hash`` между сервером и клиентом.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    clean: Dict[str, object] = {}
+    for key, value in raw.items():
+        name = str(key)
+        if isinstance(value, (bool, int, str)):
+            clean[name] = value
+            continue
+        number = as_int(value)
+        if number is not None:
+            clean[name] = number
+    return clean
+
+
 @dataclass
 class Character:
     """Персонаж: барон, герцог или король.
@@ -495,6 +726,8 @@ _RANK_TO_TIER = {
 #: формата не зависит от того, успел ли кто-то импортировать states.
 register_enum(TitleRank)
 register_enum(Tier)
+register_enum(OrderKind)
+register_enum(OrderStatus)
 
 
 @dataclass
@@ -567,6 +800,46 @@ class VassalContract:
         return self.spec["tyranny"]
 
 
+@dataclass
+class Order:
+    """Приказ сюзерена, ожидающий решения вассала.
+
+    Отдельный объект состояния, а не запись в журнале, потому что у приказа
+    есть СРОК и есть ПОСЛЕДСТВИЯ. Пока приказ жив, он занимает место в
+    ``Hierarchy.orders``, попадает в снапшот и в ``state_hash``: две машины,
+    разошедшиеся из-за потерянного отказа, разъедутся и по мнению, и по хешу.
+
+    ``id`` детерминирован (``order_{ход}_{порядковый номер}``) — в журнале и
+    на сервере он же служит ключом. ``args`` хранит только скаляры
+    (``clean_order_args``): иначе мусор из сети попал бы в хеш.
+    """
+
+    id: str
+    kind: OrderKind
+    issuer_id: str
+    target_id: str
+    turn_issued: int
+    args: Dict[str, object] = field(default_factory=dict)
+    status: OrderStatus = OrderStatus.PENDING
+    resolved_turn: Optional[int] = None
+    message: str = ""
+
+    @property
+    def weight(self) -> int:
+        """Вес вида приказа (см. ``ORDER_WEIGHTS``)."""
+        return order_weight(self.kind)
+
+    @property
+    def refusal_penalty(self) -> int:
+        """На сколько пунктов мнения упадёт вассал, отказавшись от приказа."""
+        return REFUSED_WEIGHT * self.weight
+
+    @property
+    def is_open(self) -> bool:
+        """Ждёт ли приказ ещё чего-то (решения вассала или своего срока)."""
+        return self.status in (OrderStatus.PENDING, OrderStatus.ACCEPTED)
+
+
 # --------------------------------------------------------------------------
 # Разметка герцогств
 # --------------------------------------------------------------------------
@@ -634,9 +907,12 @@ class Hierarchy:
     словарями-реестрами. Ничего не знает про pygame и про отрисовку.
 
     Про ГПСЧ. Потоки лежат на объекте, и **ни один тик их не трогает**: ни
-    ``tick_counties``, ни ``tick_vassals``, ни ``tick_realms``, ни ``end_turn``
-    не делают ни одного броска. Это осознанное ограничение, а не
-    забывчивость — иначе тесты детерминизма разошлись бы по хешу. Единственное
+    ``tick_counties``, ни ``tick_vassals``, ни ``tick_realms``, ни
+    ``resolve_orders``, ни ``end_turn`` не делают ни одного броска. Это
+    осознанное ограничение, а не забывчивость — иначе тесты детерминизма
+    разошлись бы по хешу. Решение вассала по приказу тоже не бросает кубик: оно
+    выведено из мнения через ``can_accept_order``, поэтому два одинаковых мира
+    после одинаковой последовательности приказов совпадут до бита. Единственное
     место, где бросок допустим, — явная команда, в которой игрок сам попросил
     случайность: ``hire_mercenaries`` (тир наёмника). Поэтому ``streams``
     можно не передавать: дефолтный набор потоков не влияет на состояние мира.
@@ -650,6 +926,8 @@ class Hierarchy:
         characters: Optional[Dict[str, Character]] = None,
         contracts: Optional[Dict[str, VassalContract]] = None,
         streams: Optional[NamedStreams] = None,
+        *,
+        orders: Optional[Dict[str, Order]] = None,
     ):
         self.provinces = provinces
         self.duchies: Dict[str, Duchy] = duchies if duchies is not None else {}
@@ -674,8 +952,15 @@ class Hierarchy:
         #: ``to_state``: каноническая точка сохранения — граница хода, а
         #: ``end_turn`` обнуляет журнал, поэтому в снапшоте он всегда пуст.
         self.action_ledger: Dict[str, int] = {}
+        #: Выданные приказы по id. В отличие от ``log`` это СОСТОЯНИЕ, а не
+        #: история: у приказа есть срок и последствия, поэтому он обязан
+        #: пережить ``end_turn``, попасть в снапшот и в ``state_hash``.
+        #: Записи не удаляются никогда — на этом держится счётчик id
+        #: (``len(self.orders)``), см. ``_next_order_id``.
+        self.orders: Dict[str, Order] = orders if orders is not None else {}
         self._province_duchy: Dict[int, str] = {}
         self._rebuild_province_index()
+
 
     # ---------------- журнал ----------------
 
@@ -971,13 +1256,129 @@ class Hierarchy:
         return sum(self.county_levy(i) for i, p in enumerate(self.provinces)
                    if getattr(p, "owner", "neutral") == nation)
 
+    # ---------------- права по рангу (этап 1.1) ----------------
+    #
+    # До этого этапа «кто вправе выдать землю» знал только UI. Для сети это дыра:
+    # король мог переписать контракт ЧУЖОГО вассала, потому что ``set_contract``
+    # сам подставлял ``liege_of(vassal_id)`` и ни о чём не спрашивал. Теперь
+    # правило живёт здесь, в состоянии, и проверяется по ``by_actor``.
+    #
+    # Общий вид проверки — две ступени:
+    #
+    # * актор существует и ЖИВОЙ (``_actor_of``);
+    # * актор — сюзерен цели нужного ранга (``_command_refusal``): бароном
+    #   командует его непосредственный сюзерен (держатель герцогства, то есть
+    #   герцог), герцогом — только король его realm'а, королем — никто.
+
+    def _actor_of(self, actor_id: object) -> Optional[Character]:
+        """Персонаж-исполнитель команды: существующий и ЖИВОЙ, иначе ``None``.
+
+        Отдельный метод, потому что «существует» и «жив» — это разные проверки,
+        а сливать их в одну строку в трёх местах означает забыть про смерть
+        где-нибудь в одном из них.
+        """
+        if not isinstance(actor_id, str):
+            return None
+        actor = self.characters.get(actor_id)
+        if actor is None or not actor.alive:
+            return None
+        return actor
+
+    def _command_refusal(self, actor: Optional[Character],
+                         target: Character) -> Optional[str]:
+        """Почему ``actor`` НЕ вправе командовать ``target`` (``None`` — вправе).
+
+        ``actor is None`` означает «не персонаж этой иерархии или мёртв»;
+        проверка цели тоже здесь, потому что приказ мёртвому бессмысленен так же,
+        как приказ от мёртвого. Сообщение всегда ОДНО и читаемое: это то, что
+        UI показывает игроку вместо тихого ничего.
+        """
+        if actor is None:
+            return "актор не персонаж этой иерархии или уже мёртв"
+        if not target.alive:
+            return f"{target.name}: мёртвым приказы не отдают"
+        required = COMMAND_MIN_RANK.get(target.rank)
+        if required is None:
+            return f"{target.name}: королю не подчиняется никто"
+        if actor.tier < required:
+            return f"{actor.name}: не сюзерен {target.name}"
+        liege = self.liege_of(target.id)
+        if liege is None or liege.id != actor.id:
+            return f"{actor.name}: не сюзерен {target.name}"
+        return None
+
+    def _realm_of_actor(self, actor: Character) -> Optional[Realm]:
+        """Королевство, землями которого распоряжается персонаж.
+
+        У короля оно своё (``Realm.ruler_id``), у герцога — realm его нации:
+        ``Realm`` у герцога нет, но земля, которую он вправе раздавать, от
+        ``province.owner``, то есть от нации. Выбор детерминирован (по
+        отсортированному id) — на случай двух королевств одной нации.
+        """
+        realm = self._realm_of_ruler(actor)
+        if realm is not None:
+            return realm
+        for realm_id in sorted(self.realms):
+            if self.realms[realm_id].nation == actor.nation:
+                return self.realms[realm_id]
+        return None
+
     # ---------------- контракты и мнение ----------------
 
     def contract_of(self, vassal_id: str) -> Optional[VassalContract]:
         return self.contracts.get(vassal_id)
 
-    def set_contract(self, vassal_id: str, level: int) -> List[str]:
-        """Смена уровня контракта. Повышение копит тиранию и режет мнение."""
+    def set_contract(self, vassal_id: str, level: int, *,
+                     by_actor: Optional[str] = None) -> List[str]:
+        """Смена уровня контракта. Повышение копит тиранию и режет мнение.
+
+        ``by_actor`` (этап 1.1) — проверка прав, обязательная для сети:
+
+        * ``None`` — прежнее поведение: значение клампится в
+          ``0..len(CONTRACT_LEVELS) - 1``, никаких прав не спрашивается
+          (этим путём зовёт UI-обёртка и старые тесты);
+        * актор обязан быть живым сюзереном вассала нужного ранга (см.
+          ``_command_refusal``): герцогом командует король его realm'а, бароном
+          — непосредственный сюзерен;
+        * значение вне диапазона ОТКЛОНЯЕТСЯ, а не клампится: клиент посчитал
+          бы по своей шкале и показал игроку не тот контракт, который получит
+          сервер. Молчаливая подгонка здесь стоила бы дороже, чем отказ;
+        * действует тот же ``action_ledger``, что у остальных команд:
+          ``CONTRACT_CHANGES_PER_TURN`` раз за ход на актора, и лимит
+          проверяется ПОСЛЕДНИМ, чтобы отказ по существу не съел право.
+        """
+        ch = self.characters.get(vassal_id)
+        if ch is None:
+            return []
+        actor: Optional[Character] = None
+        if by_actor is not None:
+            actor = self._actor_of(by_actor)
+            refusal = self._command_refusal(actor, ch)
+            if refusal is None:
+                value = as_int(level)
+                if value is None:
+                    refusal = "уровень контракта должен быть числом"
+                elif not 0 <= value <= len(CONTRACT_LEVELS) - 1:
+                    refusal = (f"уровень контракта {value} вне диапазона "
+                               f"0..{len(CONTRACT_LEVELS) - 1}")
+                else:
+                    level = value
+            if refusal is not None:
+                return [f"{ch.name}: {refusal}"]
+            if self._ledger_exhausted(actor.id, ACTION_SET_CONTRACT,
+                                      CONTRACT_CHANGES_PER_TURN):
+                return [f"{actor.name}: контракт этому вассалу уже меняли в этом ходу"]
+            self._ledger_spend(actor.id, ACTION_SET_CONTRACT)
+        return self._set_contract_now(vassal_id, level)
+
+    def _set_contract_now(self, vassal_id: str, level: int) -> List[str]:
+        """Ядро смены контракта без проверки прав: клампит и применяет.
+
+        Отделено от ``set_contract``, потому что ``_apply_order`` исполняет
+        УЖЕ ПРИНЯТЫЙ приказ и не должен повторно спрашивать права (которые к
+        моменту исполнения всё равно проверяются заново, но по-другому —
+        через ``by_actor``).
+        """
         level = max(0, min(len(CONTRACT_LEVELS) - 1, int(level)))
         ch = self.characters.get(vassal_id)
         if ch is None:
@@ -1000,30 +1401,90 @@ class Hierarchy:
             events.append(f"{ch.name}: контракт ослаблен, мнение {ch.opinion_of_liege}")
         return events
 
-    def can_accept_order(self, vassal_id: str, order: str) -> bool:
-        """Может ли вассал выполнить приказ сюзерена (CK3-порог)."""
-        ch = self.characters.get(vassal_id)
+    def can_accept_order(self, vassal_id: str, order: object) -> bool:
+        """Может ли вассал принять приказ сюзерена (CK3-порог).
+
+        Аргумент ``order`` наконец-то значим. Он примает ``Order``,
+        ``OrderKind`` или строку, а вес приказа задаёт, насколько глубокая
+        ненависть ещё прощается: ``GIFT`` (вес 1) — до ``-10`` мнения,
+        ``RAISE_LEVY`` (вес 5) — только до ``-30``. Поэтому от мелкой просьбы
+        можно отказаться «почти без последствий», а от тяжёлой — почти нельзя.
+
+        Неизвестная строка (старый UI вида ``"raise_the_siege"``) весит как
+        ``ORDER_DEFAULT_WEIGHT``, поэтому прежние вызовы ведут себя как раньше:
+        при ``opinion_of_liege == 0`` приказ принимается.
+
+        Второй путь — абсолютная королевская власть: при ``crown_authority == 3``
+        вассал соглашается даже при ``-50`` мнения, но не при ``-60`` и ниже.
+        """
+        ch = self.characters.get(vassal_id) if isinstance(vassal_id, str) else None
         if ch is None or not ch.alive:
             return False
-        if ch.opinion_of_liege >= 0:
+        if ch.opinion_of_liege >= order_refusal_threshold(order):
             return True
         # при глубокой ненависти выручает только абсолютная королевская власть
         return self.liege_authority(vassal_id) >= 3 and ch.opinion_of_liege > -60
 
-    def grant_fief(self, province_idx: int, baron_id: str) -> List[str]:
+    def grant_fief(self, province_idx: int, baron_id: str, *,
+                   by_actor: Optional[str] = None) -> List[str]:
         """Передать графство барону. Главный способ снизить мятеж.
 
         ``duchy_id`` пересчитывается всегда: иначе барон, получивший землю
         в чужом герцогстве, остался бы вассалом прежнего сюзерена.
+
+        ``by_actor`` (этап 1.1) — проверка прав, обязательная для сети:
+
+        * ``None`` — прежнее поведение без проверок (его зовут UI-обёртка и
+          308 старых тестов, поэтому путь обязан остаться прежним);
+        * актор обязан быть живым и быть сюзереном барона по рангу: бароном
+          командует его непосредственный сюзерен (герцог), герцогом — король
+          его realm'а;
+        * провинция должна ФАКТИЧЕСКИ принадлежать realm'у актора
+          (``province.owner == realm.nation``). Именно эта проверка закрывает
+          дыру «выдать нейтральную землю»: realm'у, который её не платит
+          налога, она и не нужна;
+        * получатель не должен уже держать графство. Правило обмена сознательно
+          ЖЁСТКОЕ (обмен только через явный отзыв), потому что тихая подмена
+          земли внутри команды «выдать» означала бы отзыв без его последствий
+          (−20 мнения и −20 лояльности) — то есть спрятала бы разрушительное
+          решение в формулировке, которая звучит безобидно. Разрушительное
+          должно быть явным: ``revoke_fief`` с отзывом, потом ``grant_fief``
+          с новой землёй.
+
+        ``province.owner`` при этом НЕ меняется: фьеф не меняет владельца
+        нации — он меняет только ``Character.province_idx``. Право раздавать
+        землю и доход realm'а считаются по ``owner``, а не по тому, кому
+        досталось графство.
         """
         ch = self.characters.get(baron_id)
         if ch is None:
             return []
+        if by_actor is not None:
+            refusal = self._grant_fief_refusal(by_actor, ch, province_idx)
+            if refusal is not None:
+                return [refusal]
+        return self._grant_fief_now(province_idx, ch)
+
+    def _grant_fief_now(self, province_idx: int, ch: Character) -> List[str]:
+        """Ядро выдачи земли без проверки прав (см. ``_set_contract_now``).
+
+        Бонус «получил землю» даётся по факту отсутствия графства
+        (``province_idx is None``), а не по ``is_ruler``: герцог и без графства
+        правитель, но король вправе пожаловать ему графство первым, и такой дар
+        должен быть замечен вассалом так же, как земля для безземельного барона.
+
+        ``duchy_id`` пересчитывается, но ТОЛЬКО если персонаж не держит
+        герцогства. Иначе пожалование графства герцогу из чужого герцогства
+        тихо отняло бы у него его дукцию, а вместе с ней — всех его баронов
+        (``liege_of`` барона идёт через держателя дукции). Держать герцогство и
+        графство «поверх» можно, а разорвать иерархию одним подарком — нет.
+        """
         events: List[str] = []
-        was_landless = not ch.is_ruler
+        was_landless = ch.province_idx is None
+        held_duchy = ch.rank is TitleRank.DUKE and ch.duchy_id is not None
         ch.province_idx = province_idx
         new_duchy = self.duchy_of(province_idx)
-        if new_duchy is not None:
+        if new_duchy is not None and not held_duchy:
             ch.duchy_id = new_duchy
         ch.landless_turns = 0
         if was_landless:
@@ -1032,11 +1493,51 @@ class Hierarchy:
             events.append(f"{ch.name} получил землю, мнение {ch.opinion_of_liege}")
         return events
 
-    def revoke_fief(self, baron_id: str) -> List[str]:
-        """Отозвать графство: снять владение, лояльность и доход поселения."""
+    def _grant_fief_refusal(self, actor_id: object, ch: Character,
+                            province_idx: object) -> Optional[str]:
+        """Почему ``actor_id`` не вправе отдать ``province_idx`` барону ``ch``.
+
+        Только для пути с ``by_actor`` и для ``issue_order``: они оба обязаны
+        отказать ДО выдачи, а не «выдать и посмотреть, что получилось».
+        """
+        actor = self._actor_of(actor_id)
+        refusal = self._command_refusal(actor, ch)
+        if refusal is not None:
+            return refusal
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool) \
+                or not 0 <= province_idx < len(self.provinces):
+            return f"{ch.name}: графство задаётся номером провинции, а не «{province_idx}»"
+        realm = self._realm_of_actor(actor)
+        if realm is None:
+            return f"{actor.name}: у него нет королевства, чтобы раздавать землю"
+        place = getattr(self.province(province_idx), "name", f"#{province_idx}")
+        if getattr(self.province(province_idx), "owner", "neutral") != realm.nation:
+            return f"{realm.name}: {place} не под его властью"
+        if ch.province_idx is not None and ch.province_idx != province_idx:
+            return (f"{ch.name} уже держит графство #{ch.province_idx}: "
+                    f"обмен землями только через отзыв")
+        return None
+
+    def revoke_fief(self, baron_id: str, *,
+                    by_actor: Optional[str] = None) -> List[str]:
+        """Отозвать графство: снять владение, лояльность и доход поселения.
+
+        ``by_actor`` (этап 1.1) — те же права, что у ``grant_fief``: живой
+        сюзерен цели по рангу. Проверять тут особенно важно, потому что отзыв —
+        самое разрушительное, что может сделать сюзерен, и раньше он был
+        доступен кому угодно, кто знает id вассала.
+        """
         ch = self.characters.get(baron_id)
         if ch is None:
             return []
+        if by_actor is not None:
+            refusal = self._command_refusal(self._actor_of(by_actor), ch)
+            if refusal is not None:
+                return [refusal]
+        return self._revoke_fief_now(ch)
+
+    def _revoke_fief_now(self, ch: Character) -> List[str]:
+        """Ядро отзыва земли без проверки прав."""
         ch.province_idx = None
         ch.landless_turns = 0
         ch.opinion_of_liege = max(-100, ch.opinion_of_liege - 20)
@@ -1309,6 +1810,344 @@ class Hierarchy:
         return [f"{place}: нанято {taken} солдат в гарнизон{clipped} "
                 f"(всего {province.garrison}/{cap}, казна {realm.gold})"]
 
+    # ---------------- приказы (этап 1.2) ----------------
+    #
+    # Контракт раздела:
+    #
+    # * ``issue_order`` — команда сюзерена. Проверяет право той же логикой, что и
+    #   ``by_actor``, плюс осмысленность аргументов, и кладёт ``PENDING`` в
+    #   ``self.orders``. Ничего не применяет: приказ живёт.
+    # * ``resolve_orders`` — конец хода. ``PENDING`` получает решение вассала,
+    #   просроченный ``ACCEPTED`` применяется.
+    # * ``punish_order`` — команда сюзерена на ПРИНЯТЫЙ, но не исполненный
+    #   приказ.
+    # * ``summon_council`` — команда «приехать ко двору»; исполняет приказ
+    #   ``SUMMON_COUNCIL``.
+    #
+    # Ни одна из них не обращается к ГПСЧ: решение выводится из мнения, чтобы
+    # два одинаковых мира после одинаковой переписки приказов совпали по хешу.
+
+    def _next_order_id(self) -> str:
+        """Детерминированный id приказа: ``order_{ход}_{номер}``.
+
+        Счётчик — ``len(self.orders)``, а не отдельное поле. Это работает,
+        потому что приказы не удаляются никогда (см. ``__init__``), и заодно
+        выживает round-trip без нового ключа в снапшоте: у загруженного мира
+        ``len(orders)`` уже включает всё, что было до сохранения, поэтому новый
+        id не может с ним столкнуться.
+        """
+        return f"order_{self.turn}_{len(self.orders)}"
+
+    def issue_order(self, issuer_id: str, kind: object, target_id: str,
+                    args: Optional[Dict[str, object]] = None) -> Optional[Order]:
+        """Выдать приказ вассалу. ``None`` — права нет.
+
+        Проверяется ровно то же, что проверяют команды с ``by_actor``: издатель
+        обязан быть живым сюзереном цели по рангу. Сверх того проверяется
+        осмысленность аргументов (``_order_args_refusal``): нельзя выдать
+        приказ выдать графство в чужой земле или сменить контракт на
+        несуществующий уровень — иначе вассал получил бы заведомо
+        неисполнимый приказ, и его «отказ» ничего бы не значил.
+
+        Лимит — ``ORDERS_ISSUED_PER_TURN`` на ВИД приказа (``action_ledger``).
+        Приказ создаётся в статусе ``PENDING`` и ждёт ``resolve_orders``.
+
+        Порядок проверок совпадает с порядком команд: неизвестный вид и
+        неизвестная цель дают ``None`` молча (нечего показывать), отказ по
+        существу — тоже ``None``, потому что вызывающий UI сам формирует текст
+        из причины, а приказ в этом случае не создан.
+        """
+        resolved = order_kind_of(kind)
+        if resolved is None:
+            return None
+        target = self.characters.get(target_id) if isinstance(target_id, str) else None
+        if target is None:
+            return None
+        actor = self._actor_of(issuer_id)
+        if self._command_refusal(actor, target) is not None:
+            return None
+        payload = clean_order_args(args)
+        if self._order_args_refusal(resolved, actor, target, payload) is not None:
+            return None
+        action = f"{ACTION_ISSUE_ORDER}:{resolved.value}"
+        if self._ledger_exhausted(actor.id, action, ORDERS_ISSUED_PER_TURN):
+            return None
+        self._ledger_spend(actor.id, action)
+        order = Order(id=self._next_order_id(), kind=resolved, issuer_id=actor.id,
+                      target_id=target.id, turn_issued=self.turn, args=payload,
+                      status=OrderStatus.PENDING, resolved_turn=None,
+                      message="ждёт решения")
+        self.orders[order.id] = order
+        return order
+
+    def _order_args_refusal(self, kind: OrderKind, actor: Character,
+                            target: Character,
+                            args: Dict[str, object]) -> Optional[str]:
+        """Осмысленность аргументов приказа на момент ВЫДАЧИ, а не исполнения.
+
+        Золото и лояльность здесь не проверяются: к моменту исполнения (через
+        ``ORDER_DEADLINE_TURNS``) они изменятся, и проверка стала бы ложью.
+        Проверяется только то, что останется правдой: чья это земля, какой это
+        уровень контракта и есть ли у цели что отзывать.
+        """
+        if kind is OrderKind.GRANT_FIEF:
+            return self._grant_fief_refusal(actor.id, target,
+                                            args.get("province_idx"))
+        if kind is OrderKind.REVOKE_FIEF:
+            if target.province_idx is None:
+                return f"{target.name}: отзывать нечего, земли у него нет"
+            return None
+        if kind is OrderKind.SET_CONTRACT:
+            level = as_int(args.get("level"))
+            if level is None:
+                return "уровень контракта должен быть числом"
+            if not 0 <= level <= len(CONTRACT_LEVELS) - 1:
+                return (f"уровень контракта {level} вне диапазона "
+                        f"0..{len(CONTRACT_LEVELS) - 1}")
+            return None
+        if kind is OrderKind.RAISE_LEVY:
+            realm = self._realm_of_ruler(actor)
+            if realm is None:
+                return f"{actor.name}: левейс поднимает только король"
+            blocks = as_int(args.get("blocks"))
+            if blocks is None or blocks <= 0:
+                return f"левейс поднимают блоками по {LEVY_BLOCK_TROOPS}"
+            if args.get("realm_id") is not None and args.get("realm_id") != realm.id:
+                return f"{actor.name}: левейс его realm'а, а не чужого"
+            return None
+        if kind is OrderKind.DEVELOP_COUNTY:
+            province_idx = args.get("province_idx")
+            if not isinstance(province_idx, int) or isinstance(province_idx, bool) \
+                    or not 0 <= province_idx < len(self.provinces):
+                return f"застройка задаётся номером провинции, а не «{province_idx}»"
+            realm = self._realm_of_actor(actor)
+            if realm is None:
+                return f"{actor.name}: у него нет королевства, чтобы застраивать"
+            if getattr(self.province(province_idx), "owner", "neutral") != realm.nation:
+                return f"{realm.name}: провинция #{province_idx} не под его властью"
+            # платит казна того королевства, которому земля принадлежит по факту,
+            # а ``develop_county`` разрешает тратить её только правителю realm'а,
+            # поэтому заказать застройку может именно он — не герцог от лица
+            # короны. Проверяем здесь, чтобы вассал не получил бы заведомо
+            # неисполнимый приказ.
+            if realm.ruler_id != actor.id:
+                return (f"{actor.name}: застройку оплачивает и заказывает "
+                        f"правитель {realm.name}")
+            return None
+        # SUMMON_COUNCIL и GIFT аргументов не требуют
+        return None
+
+    def order_of(self, vassal_id: str) -> Optional[Order]:
+        """Последний ЖИВОЙ приказ этому вассалу (``None``, если таких нет).
+
+        Удобно UI: показать вассалу один незакрытый приказ, а не весь список.
+        Порядок — по ``id``, поэтому выбор детерминирован.
+        """
+        if not isinstance(vassal_id, str):
+            return None
+        for order_id in sorted(self.orders, reverse=True):
+            order = self.orders[order_id]
+            if order.target_id == vassal_id and order.is_open:
+                return order
+        return None
+
+    def summon_council(self, actor_id: str, vassal_id: str) -> List[str]:
+        """Созвать совет: вассал едет ко двору и получает влияние и лояльность.
+
+        По смыслу CK3 — «summon to court». Это НЕ наказание, поэтому исполненный
+        вызов награждает: ``+COUNCIL_INFLUENCE`` влияния (половина начального
+        влияния барона, 10 — заметный, но не переломный шаг) и
+        ``+COUNCIL_LOYALTY`` лояльности (ровно как первый подарок: совет ничего
+        не стоит сюзерену в золоте и потому не должен стоить больше подарка).
+
+        Отказ от приказа наносится НЕ здесь, а в ``resolve_orders``: он весит по
+        ``ORDER_WEIGHTS``, а совет — самый лёгкий вид приказа (вес 1).
+
+        Права те же, что у ``by_actor``: созвать совет может только живой
+        сюзерен цели по рангу.
+        """
+        vassal = self.characters.get(vassal_id) if isinstance(vassal_id, str) else None
+        if vassal is None:
+            return []
+        actor = self._actor_of(actor_id)
+        refusal = self._command_refusal(actor, vassal)
+        if refusal is not None:
+            return [refusal]
+        return self._council_now(vassal)
+
+    def _council_now(self, vassal: Character) -> List[str]:
+        """Ядро совета без проверки прав (см. ``_grant_fief_now``)."""
+        vassal.influence = min(100, vassal.influence + COUNCIL_INFLUENCE)
+        vassal.loyalty = min(100, vassal.loyalty + COUNCIL_LOYALTY)
+        issuer = self.liege_of(vassal.id)
+        return [f"{issuer.name if issuer else '?'} → {vassal.name}: совет во дворце "
+                f"(+{COUNCIL_INFLUENCE} влияния, +{COUNCIL_LOYALTY} лояльности), "
+                f"теперь {vassal.influence}/{vassal.loyalty}"]
+
+    def resolve_orders(self, turn: Optional[int] = None) -> List[str]:
+        """Конец хода: каждый приказ получает решение, принятое — исполняется.
+
+        Три перехода, и только три:
+
+        * ``PENDING`` -> ``ACCEPTED`` («вассал принял») либо ``REFUSED`` минус
+          ``REFUSED_WEIGHT * вес приказа`` мнения. Решение выводится из
+          ``can_accept_order``, то есть из мнения и веса, и НЕ бросает кубик;
+        * ``ACCEPTED`` старше ``ORDER_DEADLINE_TURNS`` -> ``FULFILLED``: приказ
+          применяется ядром команды сюзерена, и права перепроверяются заново (см.
+          ``_apply_order``). Приказ хода ``N`` исполняется на границе
+          ``N + ORDER_DEADLINE_TURNS``, то есть у вассала есть ровно
+          ``ORDER_DEADLINE_TURNS`` полных ходов на подготовку;
+        * ``ACCEPTED`` младше срока — просто ждёт. Это окно нужно сюзерену,
+          чтобы успеть позвать ``punish_order``.
+
+        Мёртвые с обеих сторон приказы закрываются как ``REFUSED`` с пустым
+        штрафом: виноватых нет, а оставлять такой приказ в очереди навсегда
+        нельзя — тогда ``resolve_orders`` перестанет быть чистой функцией
+        состояния.
+
+        Обход строго по отсортированным ``id``, чтобы порядок событий не зависел
+        от порядка выдачи приказов (он зависит от команд игрока, а не от хеша).
+        """
+        current = self.turn if turn is None else int(turn)
+        events: List[str] = []
+        for order_id in sorted(self.orders):
+            order = self.orders[order_id]
+            if not order.is_open:
+                continue
+            issuer = self.characters.get(order.issuer_id)
+            target = self.characters.get(order.target_id)
+            label = self._order_label(order)
+            if issuer is None or not issuer.alive or target is None or not target.alive:
+                order.status = OrderStatus.REFUSED
+                order.resolved_turn = current
+                order.message = "приказ снят: сюзерен или вассал мёртв"
+                events.append(f"{label}: снят, никто не может его исполнить")
+                continue
+            if order.status is OrderStatus.PENDING:
+                if self.can_accept_order(target.id, order):
+                    order.status = OrderStatus.ACCEPTED
+                    order.resolved_turn = current
+                    order.message = "вассал принял"
+                    events.append(f"{label}: принят, ждёт исполнения")
+                else:
+                    order.status = OrderStatus.REFUSED
+                    order.resolved_turn = current
+                    order.message = "вассал отказался"
+                    target.opinion_of_liege = max(
+                        -100, target.opinion_of_liege - order.refusal_penalty)
+                    events.append(f"{label}: отказ, мнение {target.opinion_of_liege} "
+                                  f"(-{order.refusal_penalty})")
+                continue
+            # ACCEPTED: исполняем, когда срок вышел
+            if current - order.turn_issued < ORDER_DEADLINE_TURNS:
+                continue
+            applied, applied_events = self._apply_order(order)
+            order.status = OrderStatus.FULFILLED
+            order.resolved_turn = current
+            order.message = "исполнен" if applied else "не исполнен"
+            events.append(f"{label}: {order.message}")
+            if applied:
+                events += applied_events
+        return events
+
+    def _order_label(self, order: Order) -> str:
+        """Короткая подпись приказа для журнала: ``приказ {id} ({вид})``."""
+        issuer = self.characters.get(order.issuer_id)
+        target = self.characters.get(order.target_id)
+        return (f"приказ {order.id} ({order.kind.value}) "
+                f"{issuer.name if issuer else '?'} → "
+                f"{target.name if target else '?'}")
+
+    def _apply_order(self, order: Order) -> Tuple[bool, List[str]]:
+        """Применить принятый приказ. ``False`` — условия приказа сорвались.
+
+        Условия проверяются ОДНОЙ функцией с ``issue_order``
+        (``_order_args_refusal``) плюс общей проверкой прав: за
+        ``ORDER_DEADLINE_TURNS`` земля могла сменить владельца, а получатель —
+        получить другое графство. Приказ, который нельзя исполнить, честно
+        закрывается как «не исполнен» с причиной в журнале.
+
+        Применение идёт ЯДРАМИ (``_grant_fief_now``, ``_revoke_fief_now``,
+        ``_set_contract_now``, ``_council_now``), а не публичными командами, и
+        поэтому НЕ тратит ``action_ledger``: «одна смена контракта за ход»
+        относится к живой кнопке сюзерена, а не к разбирательству по ранее
+        выданному приказу. Иначе король, кликнувший кнопку в этом же ходу,
+        мог бы тихо похоронить собственный приказ — и «приказ висит» стало бы
+        синонимом «игрок нажал не туда».
+
+        Отказ САМОЙ команды-траты (нет золота, левейс исчерпан, подарки иссякли)
+        не делает приказ неисполненным: условия приказа были в порядке, срок
+        вышел. Хочешь повторить — выдай новый приказ.
+        """
+        issuer = self.characters.get(order.issuer_id)
+        target = self.characters.get(order.target_id)
+        if issuer is None or not issuer.alive or target is None or not target.alive:
+            return False, []
+        label = self._order_label(order)
+        refusal = self._command_refusal(issuer, target)
+        if refusal is None:
+            refusal = self._order_args_refusal(order.kind, issuer, target, order.args)
+        if refusal is not None:
+            return False, [f"{label}: не исполнен — {refusal}"]
+        args = order.args
+        if order.kind is OrderKind.SUMMON_COUNCIL:
+            events = self._council_now(target)
+        elif order.kind is OrderKind.GIFT:
+            events = self.gift_vassal(target.id)
+        elif order.kind is OrderKind.GRANT_FIEF:
+            events = self._grant_fief_now(as_int(args.get("province_idx")), target)
+        elif order.kind is OrderKind.REVOKE_FIEF:
+            events = self._revoke_fief_now(target)
+        elif order.kind is OrderKind.SET_CONTRACT:
+            events = self._set_contract_now(target.id, as_int(args.get("level")) or 0)
+        elif order.kind is OrderKind.RAISE_LEVY:
+            realm = self._realm_of_ruler(issuer)
+            if realm is None:
+                return False, []
+            events = self.raise_levy(realm.id, args.get("blocks", 1))
+        elif order.kind is OrderKind.DEVELOP_COUNTY:
+            events = self.develop_county(as_int(args.get("province_idx")), issuer.id)
+        else:
+            return False, []
+        return True, events
+
+    def punish_order(self, order_id: str, *,
+                     by_actor: Optional[str] = None) -> List[str]:
+        """Наказать вассала за неисполненный приказ: минус мнение и лояльность.
+
+        Схема неисполнения выбрана простая: **приказ не висит вечно, но и не
+        применяется сам**. ``resolve_orders`` закрывает просроченный ``ACCEPTED``
+        либо исполнением, либо оставляет его сюзерену решать — то есть сначала
+        «вассал обещал» (ACCEPTED), затем либо «сделал» (FULFILLED), либо «с
+        него спросили» (PUNISHED). Молчаливое игнорирование приказа было бы
+        худшим вариантом из трёх: у него нет ни автора, ни последствий.
+
+        Наказать можно только пока приказ ``ACCEPTED``: отказённый не
+        обещал, исполненный уже нечего наказывать. ``by_actor`` — та же проверка
+        прав, что и везде; ``None`` — прежний стиль вызовов.
+        """
+        order = self.orders.get(order_id) if isinstance(order_id, str) else None
+        if order is None:
+            return []
+        if order.status is not OrderStatus.ACCEPTED:
+            return [f"приказ {order.id}: наказать нечего "
+                    f"(статус {order.status.value})"]
+        target = self.characters.get(order.target_id)
+        if target is None or not target.alive:
+            return [f"приказ {order.id}: наказывать некого"]
+        if by_actor is not None:
+            refusal = self._command_refusal(self._actor_of(by_actor), target)
+            if refusal is not None:
+                return [refusal]
+        order.status = OrderStatus.PUNISHED
+        order.resolved_turn = self.turn
+        order.message = "наказан за неисполнение"
+        target.opinion_of_liege = max(-100, target.opinion_of_liege + PUNISHED_OPINION)
+        target.loyalty = max(0, target.loyalty - PUNISHED_LOYALTY)
+        return [f"приказ {order.id}: {target.name} наказан за неисполнение "
+                f"({PUNISHED_OPINION} мнения, -{PUNISHED_LOYALTY} лояльности), "
+                f"теперь {target.opinion_of_liege}/{target.loyalty}"]
+
     # ---------------- конец хода ----------------
 
     def prosperity_cap(self, province_idx: int) -> int:
@@ -1476,21 +2315,39 @@ class Hierarchy:
         функция состояния, поэтому хеш мира не «дрожет» от того, откуда
         взялись случайные числа. Броски живут только в командах.
 
+        Разбор приказов стоит в конце цепочки и вызывается **только если
+        приказы есть**. Это не микрооптимизация, а требование совместимости:
+        ``end_turn`` обязана вести себя ровно как раньше, пока приказов не
+        выдавали, иначе 532 теста прошлых этапов (включая проверки числа
+        событий и детерминизма по хешу) разъедутся на пустом месте. При пустом
+        ``orders`` ``resolve_orders`` всё равно вернул бы ``[]``, но явная
+        охрана делает это свойство видимым в коде, а не «случайно так вышло».
+
         Здесь же обнуляется ``action_ledger``: лимиты «раз за ход» действуют
         внутри хода, а номер хода в ключе журнала нужен только для логов.
         Обнуление делает каноническую точку сохранения (границу хода)
-        единственной точкой, где журнал гарантированно пуст.
+        единственной точкой, где журнал гарантированно пуст. Оно выполняется
+        ДВАЖДЫ: перед разбором приказов и после него. Первое — потому что
+        разбор не должен отнимать у сюзерена его «раз за ход» живой кнопки
+        (иначе ранее выданный приказ мог бы не исполниться только потому, что
+        король в этом ходу уже кликнул ту же кнопку), второе — чтобы каноническая
+        точка сохранения осталась с ПУСТЫМ журналом.
         """
         events: List[str] = []
         events += self.tick_counties()
         events += self.tick_vassals()
         events += self.tick_realms()
+        closing_turn = self.turn
+        self.action_ledger.clear()
+        if self.orders:
+            events += self.resolve_orders(closing_turn)
         self.turn += 1
         self.action_ledger.clear()
         self._append_log(events)
         return events
 
     def rebellions(self) -> List[str]:
+
         """Кто реально может поднять мятеж (лояльность < порога)."""
         out: List[str] = []
         for ch in sorted(self.characters.values(), key=lambda c: c.id):
@@ -1523,8 +2380,8 @@ class Hierarchy:
 
         Что внутри: ``version``, ``turn``, урезанный ``log`` с признаком
         усечения, все поля ``Realm``/``Duchy``/``Character``, контракты
-        (только ``liege_id``/``vassal_id``/``level``) и девять полей
-        поселения по каждой провинции.
+        (только ``liege_id``/``vassal_id``/``level``), выданные приказы
+        (``orders``) и девять полей поселения по каждой провинции.
 
         Чего здесь НЕТ и почему:
 
@@ -1562,7 +2419,9 @@ class Hierarchy:
         Новые поля этапа 3 (``raised_levy``, ``mercenary_tiers``,
         ``gifts_received``) — обычные поля dataclass, поэтому снапшот по
         Realm/Duchy/Character остаётся полным: любое забытое поле разъехало
-        бы хеш после round-trip.
+        бы хеш после round-trip. ``orders`` устроен так же: это единственный
+        новый верхнеуровневый ключ этапа 1.2, и его содержимое — все девять полей
+        ``Order``, чтобы ``state_hash`` после round-trip совпал до бита.
 
         Порядок ключей детерминирован (реестры — по отсортированным id),
         так что ``state_hash`` от двух одинаковых миров совпадает.
@@ -1632,6 +2491,24 @@ class Hierarchy:
                 "vassal_id": c.vassal_id,
                 "level": c.level,
             } for vassal_id, c in sorted(self.contracts.items())},
+            # Приказы — состояние, а не история: у приказа есть срок и
+            # последствия, поэтому без него мир после загрузки «забыл» бы, что
+            # вассал отказался (или что сюзерен ждёт исполнения).
+            # enum'ы пишутся ЗНАЧЕНИЕМ, а не именем, как у персонажей: у приказа
+            # вид и статус приходят из сети по строке, и ``.name``/``.value``
+            # совпадают только у части видов.
+            "orders": {order_id: {
+                "id": order_id,
+                "kind": o.kind.value,
+                "issuer_id": o.issuer_id,
+                "target_id": o.target_id,
+                "turn_issued": o.turn_issued,
+                # копия: снапшот не должен делить словарь с живым приказом
+                "args": dict(o.args),
+                "status": o.status.value,
+                "resolved_turn": o.resolved_turn,
+                "message": o.message,
+            } for order_id, o in sorted(self.orders.items())},
             "counties": {
                 idx: {name: getattr(p, name, default)
                       for name, default in COUNTY_FIELD_DEFAULTS.items()}
@@ -1756,8 +2633,37 @@ class Hierarchy:
                 level=data.get("level", 2),
             )
 
+        orders: Dict[str, Order] = {}
+        for raw_id, data in dict(state.get("orders") or {}).items():
+            data = dict(data)
+            kind = order_kind_of(data.get("kind"))
+            if kind is None:
+                # приказ неизвестного вида исполнить нечем и нечем показать в
+                # UI: пропускаем запись целиком. Старый снапшот без ``orders``
+                # тоже сюда попадает — просто с пустым словарём.
+                continue
+            try:
+                status = OrderStatus(data.get("status", OrderStatus.PENDING.value))
+            except ValueError:
+                status = OrderStatus.PENDING
+            # id приводим к строке: JSON уже отдал строки, а вот
+            # hand-made снапшот мог иметь числовой ключ — и тогда он разошёлся бы
+            # с ``to_state`` по типу ключа, а счётчик id сбился бы.
+            order_id = str(data.get("id") or raw_id)
+            orders[order_id] = Order(
+                id=order_id,
+                kind=kind,
+                issuer_id=str(data.get("issuer_id") or ""),
+                target_id=str(data.get("target_id") or ""),
+                turn_issued=as_int(data.get("turn_issued")) or 0,
+                args=clean_order_args(data.get("args")),
+                status=status,
+                resolved_turn=as_int(data.get("resolved_turn")),
+                message=str(data.get("message") or ""),
+            )
+
         hierarchy = Hierarchy(provinces, duchies, realms, characters, contracts,
-                              streams=streams)
+                              streams=streams, orders=orders)
 
         for raw_idx, data in dict(state.get("counties") or {}).items():
             try:

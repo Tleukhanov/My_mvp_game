@@ -1,8 +1,13 @@
 import pygame
 import sys
 import math
-import random
 from typing import Optional, List, Tuple, Dict
+from sim.rng import NamedStreams, new_streams
+from war import (
+    WarSession, WORLD_BATTLE_STREAM, WORLD_BATTLE_SALT_BASE,
+    WORLD_SESSION_SALT_BASE, WORLD_STREAM_SEED,
+    quality_from_roll, apply_deltas_to_screen,
+)
 from world_data import (
     SCREEN_WIDTH, SCREEN_HEIGHT,
     COLOR_OCEAN, COLOR_OCEAN_LIGHT, COLOR_LAND, COLOR_RIVER,
@@ -105,7 +110,24 @@ _TC_VASSALS = "vassals"
 
 
 class WorldMapScreen:
-    def __init__(self):
+    def __init__(self, hierarchy=None, generals=None, streams=None):
+        """Экран мировой карты.
+
+        Три необязательных параметра — не украшение, а способ не терять мир
+        между экранами. Раньше объект строился целиком заново при каждом
+        входе в карту, и захваченные провинции, потраченное золото и левейс
+        генералов начинали с нуля.
+
+        * ``hierarchy`` — готовая иерархия владений (``states.Hierarchy``).
+          Иерархия привязана к СВОЕМУ списку провинций, поэтому её можно
+          передать только вместе с этим же экраном: ``main.py`` держит один
+          объект карты и заходит на него снова после боя;
+        * ``generals`` — готовый список генералов (с их левейсом);
+        * ``streams`` — готовый набор именованных потоков ГПСЧ.
+
+        Без аргументов поведение прежнее: карта строится с нуля. На этом
+        построении завязан тест ``TestWorldMapInit``.
+        """
         pygame.init()
         pygame.display.set_caption("Tactic Battle - World Map")
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -148,14 +170,18 @@ class WorldMapScreen:
                                            for p in WORLD_PROVINCES]
         # иерархия владений поверх тех же провинций: графство = провинция,
         # поле owner не трогаем, чтобы старые механики и тесты не сломались
-        self.hierarchy = build_default_hierarchy(self.provinces)
+        self.hierarchy = hierarchy if hierarchy is not None \
+            else build_default_hierarchy(self.provinces)
         for _realm in self.hierarchy.realms.values():
             _realm.is_player = (_realm.nation == PLAYER_NATION)
 
-        self.generals: List[General] = [General(g.name, g.nation, g.province_idx, g.troops)
-                                         for g in WORLD_GENERALS]
-        for orig, copy in zip(WORLD_GENERALS, self.generals):
-            copy.health = orig.health
+        if generals is not None:
+            self.generals: List[General] = generals
+        else:
+            self.generals = [General(g.name, g.nation, g.province_idx, g.troops)
+                             for g in WORLD_GENERALS]
+            for orig, copy in zip(WORLD_GENERALS, self.generals):
+                copy.health = orig.health
 
         self.connections: List[Tuple[int, int]] = list(PROVINCE_CONNECTIONS)
         self._build_connection_index()
@@ -180,9 +206,68 @@ class WorldMapScreen:
         self._message: Optional[str] = None
         self._message_timer = 0.0
 
+        # ---- мост в тактический слой (war.py) ----
+        # нации отданы наружу: war.py раздаёт добычу по этому же словарю
+        self.nations = WORLD_NATIONS
+        # именованные потоки ГПСЧ: ни одного глобального random на карте
+        self.streams: NamedStreams = streams if streams is not None \
+            else new_streams(WORLD_STREAM_SEED)
+        # билет в тактический бой, который запустил игрок (см. run())
+        self.pending_session: Optional[WarSession] = None
+        # счётчики солей: match_id растёт по сессиям, _battle_seq — по мгновенным
+        # боям бота, поэтому поток «world:battle» не переигрывается по кругу
+        self._match_seq = 0
+        self._battle_seq = 0
+        # True, пока идёт ход ИИ: в нём бой остаётся мгновенным, тактику
+        # запускать изнутри хода ИИ нельзя (см. _start_tactical_session)
+        self._ai_turn_active = False
+
         self.tex_manager = TextureManager()
         self._build_province_offsets()
         self._build_static_surfaces()
+
+    @property
+    def is_finished(self) -> bool:
+        """Партия на карте окончена (победа или поражение королевства)."""
+        return bool(self._game_over)
+
+    def _nation_object(self, nation_key: str):
+        """Объект нации по id или ``None`` — то, что читает HUD."""
+        return self.nations.get(nation_key)
+
+    def reopen(self):
+        """Поднять экран после тактического боя и войти в карту заново.
+
+        Сбрасывается только состояние прогона (был закрыт / шёл финальный
+        бой), но НЕ состояние мира: казна, провинции и генералы остаются теми
+        же объектами, что были до боя.
+        """
+        self.pending_session = None
+        self._game_over = False
+        self._winner = None
+        self._battle_result = None
+        self._battle_timer = 0.0
+        self.selected_general = None
+        self.running = True
+        self._invalidate_panel()
+
+    def apply_outcome(self, deltas: Dict[str, object]) -> None:
+        """Применить дельты боя к живому миру (см. ``war.outcome_to_world``).
+
+        Разбор дельт живёт в ``war.py``: список полей — это контракт
+        ``outcome_to_world``, и держать его в двух местах значит однажды
+        забыть про новое поле. Здесь только передача своего состояния.
+        """
+        apply_deltas_to_screen(self, deltas)
+
+    def _battle_rng(self, salt: int):
+        """Ветка именованного потока ``world:battle`` под целочисленной солью.
+
+        Отдельная ветка на каждое применение: бой бота и сессия игрока больше
+        не зависят от того, кто первый позвал ``stream()``, и реплей мира
+        воспроизводится целиком.
+        """
+        return self.streams.derive(WORLD_BATTLE_STREAM, int(salt))
 
     def _build_static_surfaces(self):
         """Поверхности, которые больше не меняются: затемнения и панель владений.
@@ -262,13 +347,26 @@ class WorldMapScreen:
         self.cam_y = wy - sy / new_zoom
         self._clamp_camera()
 
-    def run(self) -> Optional[str]:
+    def run(self):
+        """Цикл карты до выхода.
+
+        Возвращает :class:`war.WarSession`, если игрок нажал на чужого генерала
+        или на чужую провинцию с войсками (см. ``_start_tactical_session``), и
+        ``None`` во всех остальных случаях — включая победу и поражение
+        королевства. Игровой цикл в ``main.py`` трактует это так: сессия —
+        значит запустить тактику и вернуться сюда же, ``None`` — уйти в меню.
+
+        Раньше здесь возвращался ``self._winner``. Этот атрибут жив (на нём
+        держится финальный экран карты), но наружу больше не отдаётся: иначе
+        маршрут «мир -> тактика -> мир» пришлось бы различать по строке
+        ``"VICTORY"``, а сессия и победа — принципиально разные вещи.
+        """
         while self.running:
             dt = self.clock.tick(60) / 1000.0
             self._handle_events()
             self._update(dt)
             self._render()
-        return self._winner
+        return self.pending_session
 
     def _handle_events(self):
         for event in pygame.event.get():
@@ -439,13 +537,34 @@ class WorldMapScreen:
                             self.selected_general = gen
                             return
 
-    def _move_general_to_province(self, general: General, target_idx: int):
+    def _move_general_to_province(self, general: General, target_idx: int,
+                                  player_initiated: Optional[bool] = None):
+        """Перевести генерала в соседнюю провинцию.
+
+        ``player_initiated`` разделяет два принципиально разных случая, и
+        поэтому это не украшение: игрок нажал на врага — идём в тактику
+        (``_start_tactical_session``), а ход ИИ проглатывается мгновенным
+        расчётом (``_start_battle``). Запускать тактический экран изнутри хода
+        ИИ нельзя: он блокирующий и вернул бы управление игроку посреди
+        чужого хода, а «триггер боя» у бота в этом этапе нет.
+
+        По умолчанию (``None``) источник определяется флагом ``_ai_turn_active``,
+        который ставит ``_ai_turn``. Явный параметр нужен для проверок и для
+        будущего «игрок отдаёт приказ генералу из панели владений».
+        """
+        if player_initiated is None:
+            player_initiated = not self._ai_turn_active
+
         target = self.provinces[target_idx]
 
         for other in self.generals:
             if other is not general and other.province_idx == target_idx:
                 if self.diplomacy.is_enemy(general.nation, other.nation):
-                    self._start_battle(general, other)
+                    if player_initiated:
+                        self._start_tactical_session(general, defender_nation=other.nation,
+                                                     province_idx=target_idx)
+                    else:
+                        self._start_battle(general, other)
                     general.moved = True
                     return
                 elif general.nation != other.nation:
@@ -482,17 +601,66 @@ class WorldMapScreen:
                     self._invalidate_panel()
                     self._show_msg(f"{target.name} захвачена!")
                 else:
-                    self._start_battle_with_region(general, target)
+                    if player_initiated:
+                        self._start_tactical_session(general, defender_nation=target.owner,
+                                                     province_idx=target_idx)
+                    else:
+                        self._start_battle_with_region(general, target)
                     general.moved = True
             else:
                 self._show_msg("Нельзя войти на чужую территорию!")
                 return
 
+    def _start_tactical_session(self, general: General, defender_nation: str,
+                                province_idx: int) -> WarSession:
+        """Завести билет в тактический бой и выйти из карты.
+
+        Левейс генерала при этом НЕ трогается: он уходит в бой целиком, а
+        вернётся вместе с трофеями через ``outcome_to_world``. Так потери
+        считаются один раз и по результату боя, а не до него.
+
+        Качество войск и зерно боя берутся из именованного потока
+        ``world:battle`` под солью ``match_id`` — целое число, поэтому
+        последовательность боёв воспроизводится при любом порядке вызовов.
+        """
+        self._match_seq += 1
+        match_id = self._match_seq
+        # соль из СВОЕГО диапазона (WORLD_SESSION_SALT_BASE), иначе сессия делила
+        # бы генератор с мгновенными боями и качество зависело от ходов ИИ
+        rnd = self._battle_rng(WORLD_SESSION_SALT_BASE + match_id)
+
+        session = WarSession(
+            match_id=match_id,
+            attacker_nation=general.nation,
+            defender_nation=defender_nation,
+            province_idx=int(province_idx),
+            general_name=general.name,
+            troops_committed=int(general.troops),
+            quality=quality_from_roll(rnd.randrange(100)),
+            seed=rnd.getrandbits(32),
+            player_attacker=(general.nation == PLAYER_NATION),
+        )
+
+        self.pending_session = session
+        self._battle_result = None
+        self._battle_timer = 0.0
+        # карта отдаёт управление: цикл в main.py увидит pending_session,
+        # запустит тактику и вернёт нас сюда же через reopen()
+        self.running = False
+        return session
+
     def _start_battle(self, attacker: General, defender: General):
+        """Мгновенный бой генералов. Остаётся для ходов ИИ.
+
+        Формула и пороги не тронуты — переехали только броски: вместо
+        глобального ``random.uniform`` берётся ветка именованного потока под
+        солью счётчика боёв. Иначе одна партия мира не была бы повторяемой.
+        """
+        rnd = self._battle_rng(self._next_battle_salt())
         a_power = attacker.troops * (attacker.health / 100)
         d_power = defender.troops * (defender.health / 100)
-        a_roll = a_power * random.uniform(0.7, 1.3)
-        d_roll = d_power * random.uniform(0.7, 1.3)
+        a_roll = a_power * rnd.uniform(0.7, 1.3)
+        d_roll = d_power * rnd.uniform(0.7, 1.3)
 
         if a_roll > d_roll:
             ratio = d_roll / a_roll if a_roll > 0 else 0
@@ -516,10 +684,16 @@ class WorldMapScreen:
         self._battle_timer = 3.0
 
     def _start_battle_with_region(self, general: General, region: Province):
+        """Мгновенный штурм провинции. Остаётся для ходов ИИ.
+
+        Как и в ``_start_battle``, формула старая, поменялся только источник
+        бросков (см. ``_battle_rng``).
+        """
+        rnd = self._battle_rng(self._next_battle_salt())
         a_power = general.troops * (general.health / 100)
         d_power = region.troops
-        a_roll = a_power * random.uniform(0.7, 1.3)
-        d_roll = d_power * random.uniform(0.7, 1.3)
+        a_roll = a_power * rnd.uniform(0.7, 1.3)
+        d_roll = d_power * rnd.uniform(0.7, 1.3)
 
         if a_roll > d_roll:
             losses = int(general.troops * 0.2)
@@ -535,6 +709,17 @@ class WorldMapScreen:
             self._battle_result = f"{general.name} отбит от {region.name}!"
         self._invalidate_panel()
         self._battle_timer = 3.0
+
+    def _next_battle_salt(self) -> int:
+        """Следующая целочисленная соль для мгновенного боя.
+
+        Счётчик, а не номер хода: соль должна быть уникальной на КАЖДЫЙ бросок,
+        иначе второй бой за ход получил бы ту же ветку потока и повторил
+        первый результат. Диапазон отделён от сессий (см.
+        ``WORLD_BATTLE_SALT_BASE``).
+        """
+        self._battle_seq += 1
+        return WORLD_BATTLE_SALT_BASE + self._battle_seq
 
     def _show_msg(self, msg: str):
         self._message = msg
@@ -653,9 +838,16 @@ class WorldMapScreen:
                            + (f" (+{len(loyalty) - 1})" if len(loyalty) > 1 else ""))
 
     def _ai_turn(self):
-        for g in self.generals:
-            if g.nation != PLAYER_NATION and not g.moved:
-                self._ai_move_general(g)
+        # флаг поднимается на весь ход ИИ: пока он стоит, любой вызов
+        # _move_general_to_province считается ходом бота и оставляет бой
+        # мгновенным (см. _move_general_to_province)
+        self._ai_turn_active = True
+        try:
+            for g in self.generals:
+                if g.nation != PLAYER_NATION and not g.moved:
+                    self._ai_move_general(g)
+        finally:
+            self._ai_turn_active = False
 
     def _ai_move_general(self, general: General):
         g_idx = general.province_idx
@@ -671,7 +863,8 @@ class WorldMapScreen:
                 for adj in self._adjacent_provinces(g_idx):
                     for e in self.generals:
                         if e is nearest and e.province_idx == adj:
-                            self._move_general_to_province(general, adj)
+                            self._move_general_to_province(general, adj,
+                                                            player_initiated=False)
                             general.moved = True
                             return
 
@@ -681,8 +874,13 @@ class WorldMapScreen:
                 neutral_targets.append(adj)
 
         if neutral_targets:
-            target_idx = random.choice(neutral_targets)
-            self._move_general_to_province(general, target_idx)
+            # выбор цели тоже бросок: глобальный random.choice убран, вместо
+            # него ветка именованного потока под своей солью, иначе два прогона
+            # мира давали бы разные картины при одном и том же вводе
+            rnd = self._battle_rng(self._next_battle_salt())
+            target_idx = rnd.choice(neutral_targets)
+            self._move_general_to_province(general, target_idx,
+                                           player_initiated=False)
             general.moved = True
             return
 
@@ -691,7 +889,8 @@ class WorldMapScreen:
             if prov.owner != general.nation and prov.owner != "neutral":
                 rel = self.diplomacy.get_relation(general.nation, prov.owner)
                 if rel == Relation.WAR and prov.troops <= 0:
-                    self._move_general_to_province(general, adj)
+                    self._move_general_to_province(general, adj,
+                                                   player_initiated=False)
                     general.moved = True
                     return
 
