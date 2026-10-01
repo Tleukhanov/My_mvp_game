@@ -21,6 +21,14 @@
   владеть частью чужого герцогства, и это видно игроку.
 * Числа целочисленные либо из конечного набора уровней — чтобы
   :func:`sim.hashing.state_hash` не «дрожал» из-за плавающей точки.
+* **Золото умеет уходить.** До этапа 3 казна только росла (net +22 золота за
+  ход на старте, +169 в насыщении), и ресурс становился бессмысленным.
+  Теперь есть шесть трат — подъём левейса, застройка, подарок вассалу, корона,
+  наёмники и наём гарнизона, — и каждая упирается в осмысленный потолок
+  (левейс realm'а, ``DEVELOPMENT_MAX``, ``MAX_CROWN_AUTHORITY``, счётчик
+  подарков за жизнь, ``MERC_MAX_BLOCKS_PER_TURN``, ``garrison_cap``).
+  Одноразовые действия ограничены журналом ``action_ledger``
+  («не чаще N раз за ход на актёра») — задел под серверную проверку команд.
 
 Хеширование состояния
 ---------------------
@@ -134,8 +142,148 @@ GARRISON_CAP_PER_FORT = 100
 #: Порог оставлен как «живой» параметр на будущую настройку.
 GARRISON_IS_FREE_THRESHOLD = 0
 
+# --------------------------------------------------------------------------
+# Траты золота (этап 3)
+# --------------------------------------------------------------------------
+#
+# До этого этапа золото было только входящим: net +22 золота за ход на старте и
+# +169 в насыщении, то есть к 100 ходу казна упиралась в 16 тысяч, и ресурс
+# становился бессмысленным — «копил, копил, и ничего не купил». Шесть трат ниже
+# закрывают эту дыру. Общие правила для всех шести:
+#
+# * цена выражена целыми и выведена из уже существующих величин (содержание
+#   гарнизона, доход графства, престиж), а не взята с потолка;
+# * одноразовое действие ограничено «не чаще N раз за ход на актёра»
+#   (``Hierarchy.action_ledger``) — задел под сетевую проверку команд;
+# * ни одна из трат не обращается к ГПСЧ, кроме ``hire_mercenaries``: тир
+#   наёмника — единственная случайность в экономике.
+
+#: Солдат в одном блоке поднимаемого левейса. Круглое число нужно не для
+#: красоты: лимит «сколько поднято» и цена считаются блоками, а солдаты —
+#: производная от них.
+LEVY_BLOCK_TROOPS = 100
+
+#: Цена одного блока левейса. Сто золота за сотню солдат — это 12.5 ходов
+#: содержания этой же сотни (100 // RAISED_LEVY_UPKEEP_DIVISOR = 8 зол/ход),
+#: то есть левейс остаётся дорогим, но не «вечной армией за полсотни золотов».
+LEVY_COST_PER_BLOCK = 100
+
+#: Содержание поднятого левейса: 8 золота за ход на блок. Вдвое дешевле
+#: содержания всего левейса realm'а (``LEVY_UPKEEP_DIVISOR = 6``), потому что
+#: поднятый левейс — это выбранная сотня, а не все наличные войска.
+RAISED_LEVY_UPKEEP_DIVISOR = 12
+
+#: Застройка графства. Цена растёт линейно, чтобы дорогая последняя ступень
+#: читалась как «столица», а не как «ещё немного денег».
+#: Замеренная окупаемость ступени 1->2 (цена 50) на старте: столица ~4.5 хода,
+#: город ~10, деревня ~17; в насыщении (процветание 100, безопасность 20) —
+#: 1.0 / 1.5 / 2.6 хода. Выгодно везде, но деревня окупается дольше всех.
+DEV_COST_BASE = 40
+DEV_COST_STEP = 10
+
+#: Потолок застройки. ``development_tax_multiplier`` и так упирается в 10
+#: (множитель 1.5), поэтому 11-я ступень не дала бы НИКАКОГО дохода — брать
+#: за неё деньги было бы чистым обманом игрока.
+DEVELOPMENT_MAX = 10
+
+#: Подарок вассалу: 60 золота за +15 мнения и +10 лояльности.
+GIFT_COST = 60
+GIFT_OPINION = 15
+GIFT_LOYALTY = 10
+
+#: Убывающая отдача от подарков ЗА ЖИЗНЬ персонажа (``gifts_received``), а не
+#: за ход. Иначе подарок — не событие, а способ за два хода выкачать лояльность
+#: до 100 и держать её. Пятый подарок даёт единицу, шестой — ничего: покупать
+#: бессмысленно, поэтому он и отклоняется.
+GIFT_OPINION_BY_COUNT: Tuple[int, ...] = (GIFT_OPINION, 8, 4, 2, 1)
+GIFT_LOYALTY_BY_COUNT: Tuple[int, ...] = (GIFT_LOYALTY, 5, 3, 1, 1)
+
+#: Корона: 300 золота и 30 престижа за ступень власти. Престиж копится по +1
+#: за ход при 5+ землях, то есть ступень стоит 30 ходов накопления; золото при
+#: net +22 (старт) .. +169 (насыщение) копится за 2..14 ходов — престиж
+#: ограничивает корону сильнее золота, и это правильно: власть не купить.
+CROWN_COST = 300
+CROWN_PRESTIGE_COST = 30
+MAX_CROWN_AUTHORITY = 3
+
+#: Налоговая политика. ``tax_policy = 1`` режет лояльность поселений на 2 за
+#: ход (tick_counties) и стабильность на 2 за ход (tick_realms), то есть это
+#: не «немного больше денег», а прямой урон по мятежному потенциалу.
+TAX_POLICY_MIN = 0
+TAX_POLICY_MAX = 1
+#: ГЕЙТ: тяжёлый налог разрешён только при сильной короне. Именно он даёт
+#: ``crown_authority`` смысл, а не только украшение в UI.
+TAX_POLICY_CROWN_AUTHORITY = 2
+
+#: Наёмники: 180 золота за блок, максимум 6 блоков за ход. 6*180 = 1080 золота
+#: за один ход найма — примерно шесть ходов накопления в насыщении
+#: (net +169) или сорок девять на старте (net +22). Решение «нанять шесть
+#: блоков» остаётся серьёзным даже в богатой казне.
+MERC_COST_PER_BLOCK = 180
+MERC_MAX_BLOCKS_PER_TURN = 6
+#: Солдат в блоке наёмников. Тир меняет КАЧЕСТВО, а не численность.
+MERC_BLOCK_TROOPS = 100
+
+#: Шаг соли броска наёмника. Только целое число: ``hash(id)`` и ``hash(str)``
+#: запрещены в ``sim/rng.py`` (PYTHONHASHSEED рандомизирует строковый хеш
+#: между процессами, и реплей разъехался бы после рестарта сервера).
+#: Шаг заведомо больше ``MERC_MAX_BLOCKS_PER_TURN``, поэтому соли соседних
+#: ходов не пересекаются: ход 5 блок 0 -> 320, ход 6 блок 0 -> 384.
+MERC_SALT_STRIDE = 64
+#: Пороги тира на кубике 0..99: тир 1 — 60%, тир 2 — 30%, тир 3 — 10%.
+MERC_TIER_THRESHOLDS: Tuple[int, ...] = (60, 90)
+#: Имя потока ГПСЧ наёмников. Собственное, чтобы траты других систем
+#: (бой, погода) не сдвигали последовательность найма.
+MERC_QUALITY_STREAM = "mercenary:quality"
+
+#: Единоразовая плата за набор гарнизона — пропорционально той же сотне,
+#: которой уже платится содержание: ``soldiers * 40 // 100``.
+#: 40 золота за сотню — это 4 хода её же содержания (10 зол/ход): наём дороже
+#: содержания, но не в разы, и окупается там, где гарнизон держит лояльность
+#: (гарнизон тянет лояльность к 100 и безопасность к 20). Замеренный прирост
+#: дохода на старте: деревня 16 -> 28, город 29 -> 49, столица 63 -> 105.
+GARRISON_RECRUIT_COST_PER_100 = 40
+
+# --------------------------------------------------------------------------
+# Лимиты «не чаще N раз за ход на актёра»
+# --------------------------------------------------------------------------
+#
+# Журнал ``Hierarchy.action_ledger`` — это задел под сеть: сервер обязан
+# отклонить вторую команду игрока в том же ходу, не доверяя клиенту.
+# Ключ — ``f"{turn}:{actor}:{action}"``, где ``action`` может быть уточнён
+# целью (``gift_vassal:baron_wolf``): подарок ограничен одним на ВАССАЛА, а
+# не на весь мир короля. Журнал обнуляется в ``end_turn``.
+#
+# Величины подобраны так, чтобы «за ход» оставалось осмысленным количеством
+# решений: левейс и застройку можно долить/растянуть на два хода, гарнизон —
+# нанять в двух разных провинциях, а подарок, корону и найм — по одному разу,
+# иначе усталость от «ещё 12 провинций подряд» съест смысл хода.
+
+#: Имена действий в журнале лимитов совпадают с именами методов — чтобы по
+#: логу сервера было видно, какую команду отклонили.
+ACTION_RAISE_LEVY = "raise_levy"
+ACTION_DEVELOP = "develop_county"
+ACTION_GIFT = "gift_vassal"
+ACTION_CROWN = "raise_crown_authority"
+ACTION_TAX_POLICY = "set_tax_policy"
+ACTION_HIRE_MERC = "hire_mercenaries"
+ACTION_HIRE_GARRISON = "hire_garrison"
+
+#: Сколько раз за ход один правитель вправе выполнить каждое действие.
+LEVY_RAISES_PER_TURN = 2
+DEVELOPMENTS_PER_TURN = 2
+GIFTS_PER_TURN = 1
+CROWN_RAISES_PER_TURN = 1
+TAX_POLICY_CHANGES_PER_TURN = 1
+MERC_HIRES_PER_TURN = 1
+GARRISON_HIRES_PER_TURN = 2
+
 #: Версия снапшота состояния. Рост числа означает смену формата; старые
 #: снапшоты читаются через ``.get(field, default)`` и потому не ломаются.
+#: Версия остаётся 1 и после этапа 3: новые поля Realm/Character
+#: (``raised_levy``, ``mercenary_tiers``, ``gifts_received``) добавляются
+#: так, что снимок без них читается и даёт нули — обратная совместимость
+#: не ломается, а ломать её ради трёх чисел незачем.
 STATE_VERSION = 1
 
 #: Сколько записей журнала уезжает в снапшот. Длинный лог — это данные для
@@ -202,6 +350,77 @@ def development_tax_multiplier(development: int) -> float:
     return DEVELOPMENT_BASE + min(10, max(1, development)) * DEVELOPMENT_STEP
 
 
+def as_int(value: object) -> Optional[int]:
+    """Мягкое приведение к целому: мусор на входе даёт ``None``, а не исключение.
+
+    Все команды-траты обязаны переживать ввод из сети: ``None``, ``"3"``,
+    ``1.9``, ``nan``, ``True``. Проверка границ в методе тогда читается как
+    ``if count is None or count <= 0`` и никогда не роняет ход. ``bool``
+    отклонён намеренно: ``True`` как «один блок» — это баг, а не заказ.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number)
+
+
+def development_upgrade_cost(development: int) -> int:
+    """Цена следующей ступени застройки: ``40 + 10 * development``."""
+    return DEV_COST_BASE + DEV_COST_STEP * max(0, int(development))
+
+
+def gift_gain(gifts_received: int, table: Sequence[int]) -> int:
+    """Прибавка от подарка по числу уже полученных за ЖИЗНЬ персонажа.
+
+    За пределами таблицы — ноль: подарок, который не даёт ничего, должен быть
+    отклонён, а не продан за 60 золота впустую.
+    """
+    index = max(0, int(gifts_received))
+    if index >= len(table):
+        return 0
+    return int(table[index])
+
+
+def mercenary_salt(turn: int, block_index: int) -> int:
+    """Целочисленная соль броска тира наёмника.
+
+    Формула только арифметическая: ``turn * MERC_SALT_STRIDE + block_index``.
+    Никаких ``hash(id)``/``hash(str)`` — строковый хеш рандомизируется
+    между процессами (PYTHONHASHSEED) и реплей разъезжался бы после рестарта
+    сервера. Шаг больше ``MERC_MAX_BLOCKS_PER_TURN``, поэтому разные ходы и
+    разные блоки внутри хода дают непересекающиеся соли.
+    """
+    return int(turn) * MERC_SALT_STRIDE + int(block_index)
+
+
+def mercenary_tier(rnd) -> int:
+    """Тир наёмника по одному броску: 1 (60%), 2 (30%), 3 (10%).
+
+    Бросок целочисленный (``randrange(100)``), а не ``random()`` с порогом:
+    состояние мира не должно зависеть от плавающей точки — здесь сравнение
+    шло бы по double, а тир уезжает в снапшот и в хеш.
+    """
+    roll = int(rnd.randrange(100))
+    for tier, threshold in enumerate(MERC_TIER_THRESHOLDS, start=1):
+        if roll < threshold:
+            return tier
+    return len(MERC_TIER_THRESHOLDS) + 1
+
+
+def clean_mercenary_tiers(raw: object) -> List[int]:
+    """Только целые тиры из битого снапшота: мусор не должен ломать загрузку."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [t for t in raw if isinstance(t, int) and not isinstance(t, bool)]
+
+
 @dataclass
 class Character:
     """Персонаж: барон, герцог или король.
@@ -231,6 +450,11 @@ class Character:
     traits: Tuple[str, ...] = ()
     heir: Optional[str] = None
     landless_turns: int = 0
+    #: Сколько подарков персонаж получил ЗА ЖИЗНЬ. Источник убывающей отдачи
+    #: (см. ``GIFT_OPINION_BY_COUNT``). В снапшот идёт вместе с остальными
+    #: полями персонажа — иначе после загрузки мира вассал снова оказывался бы
+    #: «свежим» и подарки ему можно было бы брать бесконечно.
+    gifts_received: int = 0
 
     @property
     def tier(self) -> Tier:
@@ -289,6 +513,16 @@ class Realm:
     crown_authority: int = 2
     tax_policy: int = 0
     is_player: bool = False
+    #: Поднятый левейс в солдатах. Потолок — ``realm_levy`` realm'а; оплата
+    #: содержания идёт отдельной строкой в ``realm_upkeep``. В снапшот идёт
+    #: обязательно: без него после загрузки королевство получило бы войска
+    #: бесплатно и на 8 золота за блок дешевле.
+    raised_levy: int = 0
+    #: Титры всех нанятых наёмников по порядку найма. Это задел для UI и для
+    #: боя: тир известен только ПОСЛЕ найма, поэтому он пишется в состояние,
+    #: а не возвращается заранее. ``default_factory=list`` — чтобы королевства
+    #: не делили один и тот же список.
+    mercenary_tiers: List[int] = field(default_factory=list)
 
     @property
     def capital_name(self) -> str:
@@ -399,14 +633,13 @@ class Hierarchy:
     Работает со списком провинций-объектов (duck typing) и с тремя
     словарями-реестрами. Ничего не знает про pygame и про отрисовку.
 
-    Про ГПСЧ. Потоки лежат на объекте, но **до этапа 3 ни один тик их не
-    трогает**: ни ``tick_counties``, ни ``tick_vassals``, ни ``tick_realms``,
-    ни ``end_turn`` не делают ни одного броска. Это осознанное ограничение,
-    а не забывчивость — иначе семь тестов детерминизма разошлись бы по
-    хешу. Броски допускаются только в новых явных методах-командах
-    («нанять гарнизон», «разорить провинцию» и т.п.), где игрок задал
-    случайность явно. Поэтому ``streams`` можно не передавать: дефолтный
-    набор потоков не влияет на состояние мира.
+    Про ГПСЧ. Потоки лежат на объекте, и **ни один тик их не трогает**: ни
+    ``tick_counties``, ни ``tick_vassals``, ни ``tick_realms``, ни ``end_turn``
+    не делают ни одного броска. Это осознанное ограничение, а не
+    забывчивость — иначе тесты детерминизма разошлись бы по хешу. Единственное
+    место, где бросок допустим, — явная команда, в которой игрок сам попросил
+    случайность: ``hire_mercenaries`` (тир наёмника). Поэтому ``streams``
+    можно не передавать: дефолтный набор потоков не влияет на состояние мира.
     """
 
     def __init__(
@@ -435,6 +668,12 @@ class Hierarchy:
         #: состоянии, а не вычисляется по ``len(self.log)``, иначе снапшот
         #: после round-trip выглядел бы иначе, чем до него.
         self.log_truncated: bool = False
+        #: Журнал израсходованных за ход действий: ключ
+        #: ``f"{turn}:{actor}:{action}"`` -> сколько раз уже выполнено.
+        #: Живёт на объекте, а не в снапшоте — см. длинное объяснение в
+        #: ``to_state``: каноническая точка сохранения — граница хода, а
+        #: ``end_turn`` обнуляет журнал, поэтому в снапшоте он всегда пуст.
+        self.action_ledger: Dict[str, int] = {}
         self._province_duchy: Dict[int, str] = {}
         self._rebuild_province_index()
 
@@ -446,6 +685,98 @@ class Hierarchy:
         if len(self.log) > LOG_KEEP:
             del self.log[:len(self.log) - LOG_KEEP]
             self.log_truncated = True
+
+    # ---------------- журнал лимитов действий ----------------
+
+    def _ledger_key(self, actor_id: str, action: str) -> str:
+        """Ключ журнала: ``turn:actor:action``.
+
+        Ход внутри ключа, а не в значении: журнал обнуляется в ``end_turn``,
+        поэтому номер хода нужен только для читаемости логов сервера и для
+        отладки. ``action`` может быть уточнён целью
+        (``gift_vassal:baron_wolf``) — тогда лимит действует на пару
+        «сюзерен-вассал», а не на сюзерена целиком.
+        """
+        return f"{self.turn}:{actor_id}:{action}"
+
+    def _ledger_exhausted(self, actor_id: str, action: str, limit: int) -> bool:
+        """Исчерпан ли лимит ``limit`` раз за ход для ``actor_id``."""
+        key = self._ledger_key(actor_id, action)
+        return self.action_ledger.get(key, 0) >= max(1, int(limit))
+
+    def _ledger_spend(self, actor_id: str, action: str) -> None:
+        """Израсходовать одну единицу лимита. Вызывается только при успехе."""
+        key = self._ledger_key(actor_id, action)
+        self.action_ledger[key] = self.action_ledger.get(key, 0) + 1
+
+    # ---------------- права и казна ----------------
+
+    def realm_owning(self, province_idx: int) -> Optional[str]:
+        """Королевство, которое ФАКТИЧЕСКИ владеет провинцией (по ``owner``).
+
+        Нейтральная провинция возвращает ``None``: платить за неё некому.
+        Если бы на карте появились два королевства одной нации, выбор детерминирован
+        (по отсортированному id) — иначе две машины разошлись бы по хешу.
+        """
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool):
+            return None
+        if not 0 <= province_idx < len(self.provinces):
+            return None
+        nation = getattr(self.province(province_idx), "owner", "neutral")
+        for realm_id in sorted(self.realms):
+            if self.realms[realm_id].nation == nation:
+                return realm_id
+        return None
+
+    def _command_ruler(self, realm_id: Optional[str],
+                       actor_id: Optional[str] = None) -> Optional[Character]:
+        """Живой правитель королевства — и только он вправе тратить его казну.
+
+        ``actor_id`` необязателен: команда провинции и так знает, чья это
+        земля, и по умолчанию действует от лица правителя. Явный ЧУЖОЙ
+        ``actor_id`` — отказ: полномочия проверяются, а не угадываются.
+        """
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if realm is None:
+            return None
+        if actor_id is not None and actor_id != realm.ruler_id:
+            return None
+        ruler = self.characters.get(realm.ruler_id or "")
+        if ruler is None or not ruler.alive:
+            return None
+        return ruler
+
+    def _realm_of_ruler(self, actor: Character) -> Optional[Realm]:
+        """Королевство под управлением персонажа (у короля), иначе ``None``."""
+        if actor.rank is not TitleRank.KING:
+            return None
+        return self.realms.get(actor.realm_id or "")
+
+    def purse_of(self, actor: Character) -> int:
+        """Сколько золота может тратить персонаж: казна realm'а или свой кошель.
+
+        Король распоряжается казной королевства (её и наполняет ``tick_realms``),
+        а герцог, у которого своего realm'а нет, — личным кошель. Оба числа
+        живут в снапшоте, поэтому подарок одинаково воспроизводится после
+        round-trip.
+        """
+        realm = self._realm_of_ruler(actor)
+        return realm.gold if realm is not None else actor.gold
+
+    def _charge_purse(self, actor: Character, amount: int) -> bool:
+        """Списать ``amount`` золота у персонажа. False — не хватило, ничего не списано."""
+        if amount <= 0:
+            return True
+        realm = self._realm_of_ruler(actor)
+        if realm is not None:
+            if realm.gold < amount:
+                return False
+            realm.gold -= amount
+            return True
+        if actor.gold < amount:
+            return False
+        actor.gold -= amount
+        return True
 
     # ---------------- индексы и доступ ----------------
 
@@ -712,6 +1043,272 @@ class Hierarchy:
         ch.loyalty = max(0, ch.loyalty - 20)
         return [f"{ch.name} лишён земли, мнение {ch.opinion_of_liege}"]
 
+    # ---------------- траты золота ----------------
+    #
+    # Шесть команд об одном контракте:
+    #
+    # * возвращают ``List[str]`` — журнал событий, как все остальные методы;
+    # * неизвестная цель (нет персонажа/провинции/realm'а) -> пустой список,
+    #   потому что клиенту нечего показывать, а лог не должен засоряться;
+    # * известная цель, но отказ по существу (нет права, не хватает золота,
+    #   исчерпан лимит) -> ОДНО событие с причиной: это то, что UI показывает
+    #   игроку. Стиль тот же, что у ``set_contract``;
+    # * ни одна не падает на мусорных входах (см. ``as_int``);
+    # * лимит «раз за ход» проверяется ПОСЛЕДНИМ и тратится только при успехе,
+    #   чтобы отказ по золоту не съедал право на действие.
+
+    def raise_levy(self, realm_id: str, blocks: object) -> List[str]:
+        """T1. Поднять левейс: сотни солдат вперёд, содержание — каждый ход.
+
+        Потолок — весь левейс realm'а (``realm_levy``): поднятое не может
+        превысить наличное. Остаток живёт в ``Realm.raised_levy`` и отдельной
+        строкой попадает в ``realm_upkeep``.
+        """
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if realm is None:
+            return []
+        actor = self._command_ruler(realm_id)
+        if actor is None:
+            return [f"{realm.name}: поднимать левейс некому"]
+        count = as_int(blocks)
+        if count is None or count <= 0:
+            return [f"{realm.name}: левейс поднимают блоками по {LEVY_BLOCK_TROOPS}, "
+                    f"а не «{blocks}»"]
+        soldiers = count * LEVY_BLOCK_TROOPS
+        levy_cap = self.realm_levy(realm_id)
+        if realm.raised_levy + soldiers > levy_cap:
+            return [f"{realm.name}: левейс исчерпан ({realm.raised_levy}/{levy_cap})"]
+        cost = count * LEVY_COST_PER_BLOCK
+        if realm.gold < cost:
+            return [f"{realm.name}: не хватает золота на левейс "
+                    f"(нужно {cost}, есть {realm.gold})"]
+        if self._ledger_exhausted(actor.id, ACTION_RAISE_LEVY, LEVY_RAISES_PER_TURN):
+            return [f"{actor.name}: левейс уже поднимали в этом ходу"]
+        self._ledger_spend(actor.id, ACTION_RAISE_LEVY)
+        realm.gold -= cost
+        realm.raised_levy += soldiers
+        return [f"{realm.name}: поднят левейс {soldiers} (казна {realm.gold})"]
+
+    def develop_county(self, province_idx: int,
+                       actor_id: Optional[str] = None) -> List[str]:
+        """T2. Застроить графство: +1 development по линейной цене.
+
+        Платит казна того королевства, которое ФАКТИЧЕСКИ владеет провинцией
+        (``province.owner``), а не того, чьё это герцогство de jure: застройка
+        идёт по факту владения, иначе можно было бы строить чужую землю.
+        """
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool):
+            return []
+        if not 0 <= province_idx < len(self.provinces):
+            return []
+        province = self.province(province_idx)
+        place = getattr(province, "name", f"#{province_idx}")
+        realm_id = self.realm_owning(province_idx)
+        if realm_id is None:
+            return [f"{place}: нейтральная земля, строить некому"]
+        realm = self.realms[realm_id]
+        actor = self._command_ruler(realm_id, actor_id)
+        if actor is None:
+            return [f"{realm.name}: {place} не под его властью"]
+        development = as_int(getattr(province, "development", 1))
+        if development is None:
+            return []
+        if development >= DEVELOPMENT_MAX:
+            return [f"{place}: застроен максимум ({DEVELOPMENT_MAX})"]
+        cost = development_upgrade_cost(development)
+        if realm.gold < cost:
+            return [f"{realm.name}: не хватает золота на застройку "
+                    f"(нужно {cost}, есть {realm.gold})"]
+        if self._ledger_exhausted(actor.id, ACTION_DEVELOP, DEVELOPMENTS_PER_TURN):
+            return [f"{actor.name}: застройка уже исчерпана на этот ход"]
+        self._ledger_spend(actor.id, ACTION_DEVELOP)
+        realm.gold -= cost
+        province.development = development + 1
+        return [f"{place}: застройка {development} → {province.development} "
+                f"(казна {realm.gold})"]
+
+    def gift_vassal(self, vassal_id: str) -> List[str]:
+        """T3. Подарок вассалу: мнение и лояльность за 60 золота.
+
+        Отдача падает по ``Character.gifts_received`` — ЗА ЖИЗНЬ, а не за ход,
+        поэтому пять подарков реальны, шестой бессмыслен и отклоняется.
+        Платит сюзерен: король — из казны realm'а, герцог — из личного кошеля
+        (у него нет своего realm'а). Лимит — один подарок одному вассалу за ход.
+        """
+        vassal = self.characters.get(vassal_id) if isinstance(vassal_id, str) else None
+        if vassal is None:
+            return []
+        if not vassal.alive:
+            return [f"{vassal.name}: мёртвым подарки не дарят"]
+        liege = self.liege_of(vassal.id)
+        if liege is None:
+            return [f"{vassal.name}: не вассал — подарок некому"]
+        if not liege.alive:
+            return [f"{vassal.name}: сюзерен мёртв"]
+        opinion_gain = gift_gain(vassal.gifts_received, GIFT_OPINION_BY_COUNT)
+        loyalty_gain = gift_gain(vassal.gifts_received, GIFT_LOYALTY_BY_COUNT)
+        if opinion_gain <= 0 and loyalty_gain <= 0:
+            return [f"{vassal.name}: отдача от подарков иссякла"]
+        # подарок адресован конкретному вассалу: лимит на пару, а не на сюзерена
+        action = f"{ACTION_GIFT}:{vassal.id}"
+        if self._ledger_exhausted(liege.id, action, GIFTS_PER_TURN):
+            return [f"{vassal.name}: подарок ему уже отправлен в этом ходу"]
+        if not self._charge_purse(liege, GIFT_COST):
+            return [f"{liege.name}: не хватает {GIFT_COST} золота на подарок "
+                    f"{vassal.name}"]
+        self._ledger_spend(liege.id, action)
+        vassal.gifts_received += 1
+        vassal.opinion_of_liege = min(100, vassal.opinion_of_liege + opinion_gain)
+        vassal.loyalty = min(100, vassal.loyalty + loyalty_gain)
+        return [f"{liege.name} → {vassal.name}: подарок №{vassal.gifts_received} "
+                f"(+{opinion_gain} мнения, +{loyalty_gain} лояльности), "
+                f"теперь {vassal.opinion_of_liege}/{vassal.loyalty}"]
+
+    def raise_crown_authority(self, realm_id: str) -> List[str]:
+        """T4. Поднять власть короны: 300 золота и 30 престижа за ступень.
+
+        Потолок — ``MAX_CROWN_AUTHORITY``. Проверяются обе цены: золота без
+        престижа не хватит так же, как престижа без золота.
+        """
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if realm is None:
+            return []
+        actor = self._command_ruler(realm_id)
+        if actor is None:
+            return [f"{realm.name}: власть короны некому поднимать"]
+        authority = as_int(realm.crown_authority)
+        if authority is None:
+            return []
+        if authority >= MAX_CROWN_AUTHORITY:
+            return [f"{realm.name}: власть короны уже предельна "
+                    f"({MAX_CROWN_AUTHORITY})"]
+        if realm.gold < CROWN_COST:
+            return [f"{realm.name}: не хватает {CROWN_COST} золота на корону "
+                    f"(есть {realm.gold})"]
+        if realm.prestige < CROWN_PRESTIGE_COST:
+            return [f"{realm.name}: не хватает {CROWN_PRESTIGE_COST} престижа "
+                    f"(есть {realm.prestige})"]
+        if self._ledger_exhausted(actor.id, ACTION_CROWN, CROWN_RAISES_PER_TURN):
+            return [f"{actor.name}: власть короны уже поднимали в этом ходу"]
+        self._ledger_spend(actor.id, ACTION_CROWN)
+        realm.gold -= CROWN_COST
+        realm.prestige -= CROWN_PRESTIGE_COST
+        realm.crown_authority = authority + 1
+        return [f"{realm.name}: власть короны {authority} → {realm.crown_authority}"]
+
+    def set_tax_policy(self, realm_id: str, policy: object) -> List[str]:
+        """T4b. Налоговая политика королевства. Тяжёлый налог — только при короне.
+
+        ``tax_policy = 1`` снимает 2 лояльности с поселений за ход и 2
+        стабильности с королевства, поэтому разрешён он только при
+        ``crown_authority >= TAX_POLICY_CROWN_AUTHORITY``. Вне диапазона
+        значение клампится — как в ``set_contract``.
+        """
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if realm is None:
+            return []
+        actor = self._command_ruler(realm_id)
+        if actor is None:
+            return [f"{realm.name}: налоговую политику некому менять"]
+        requested = as_int(policy)
+        if requested is None:
+            return [f"{realm.name}: налоговая политика должна быть числом"]
+        value = max(TAX_POLICY_MIN, min(TAX_POLICY_MAX, requested))
+        if value == realm.tax_policy:
+            return [f"{realm.name}: налоговая политика уже {value}"]
+        if value > 0 and realm.crown_authority < TAX_POLICY_CROWN_AUTHORITY:
+            return [f"{realm.name}: тяжёлый налог требует короны "
+                    f"{TAX_POLICY_CROWN_AUTHORITY}+ (сейчас {realm.crown_authority})"]
+        if self._ledger_exhausted(actor.id, ACTION_TAX_POLICY,
+                                  TAX_POLICY_CHANGES_PER_TURN):
+            return [f"{actor.name}: налоговую политику уже меняли в этом ходу"]
+        self._ledger_spend(actor.id, ACTION_TAX_POLICY)
+        realm.tax_policy = value
+        return [f"{realm.name}: налоговая политика {value}"]
+
+    def hire_mercenaries(self, realm_id: str, blocks: object) -> List[str]:
+        """T5. Нанять наёмников. Единственный потребитель ГПСЧ в экономике.
+
+        Единственное место, где эта пьеса обращается к ``self.streams`` — и
+        только потому, что игрок сам попросил случайность. Соль броска
+        целочисленная (``turn * MERC_SALT_STRIDE + index``), тир возвращается
+        в событии, но качество заранее не показывается: игрок платит за найм,
+        а не за конкретный тир.
+        """
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if realm is None:
+            return []
+        actor = self._command_ruler(realm_id)
+        if actor is None:
+            return [f"{realm.name}: наёмников не нанимает никто"]
+        count = as_int(blocks)
+        if count is None or count <= 0:
+            return [f"{realm.name}: наёмники идут блоками по "
+                    f"{MERC_COST_PER_BLOCK}, а не «{blocks}»"]
+        if count > MERC_MAX_BLOCKS_PER_TURN:
+            return [f"{realm.name}: за ход наймётся максимум "
+                    f"{MERC_MAX_BLOCKS_PER_TURN} блоков наёмников"]
+        cost = count * MERC_COST_PER_BLOCK
+        if realm.gold < cost:
+            return [f"{realm.name}: не хватает золота на наёмников "
+                    f"(нужно {cost}, есть {realm.gold})"]
+        if self._ledger_exhausted(actor.id, ACTION_HIRE_MERC, MERC_HIRES_PER_TURN):
+            return [f"{actor.name}: наёмников уже нанимали в этом ходу"]
+        self._ledger_spend(actor.id, ACTION_HIRE_MERC)
+        realm.gold -= cost
+        events: List[str] = []
+        for index in range(count):
+            salt = mercenary_salt(self.turn, index)
+            tier = mercenary_tier(self.streams.derive(MERC_QUALITY_STREAM, salt))
+            realm.mercenary_tiers.append(tier)
+            events.append(f"{realm.name}: наёмник тира {tier} "
+                          f"({MERC_BLOCK_TROOPS} солдат, блок {index + 1}/{count}), "
+                          f"всего тиров: {len(realm.mercenary_tiers)}")
+        return events
+
+    def hire_garrison(self, province_idx: int, soldiers: object,
+                      actor_id: Optional[str] = None) -> List[str]:
+        """T6. Нанять гарнизон в провинцию, не превысив потолок стен.
+
+        Солдаты сверх ``garrison_cap`` не берутся (берётся минимум из
+        «сколько просят» и «сколько влезает»), плата пропорциональна
+        содержанию той же сотни, и казна та, что реально владеет землёй.
+        """
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool):
+            return []
+        if not 0 <= province_idx < len(self.provinces):
+            return []
+        province = self.province(province_idx)
+        place = getattr(province, "name", f"#{province_idx}")
+        realm_id = self.realm_owning(province_idx)
+        if realm_id is None:
+            return [f"{place}: нейтральная земля, гарнизон платить нечему"]
+        realm = self.realms[realm_id]
+        actor = self._command_ruler(realm_id, actor_id)
+        if actor is None:
+            return [f"{realm.name}: {place} не под его властью"]
+        wanted = as_int(soldiers)
+        if wanted is None or wanted <= 0:
+            return [f"{place}: гарнизон нанимают солдатами, а не «{soldiers}»"]
+        current = as_int(getattr(province, "garrison", 0)) or 0
+        cap = self.garrison_cap(province_idx)
+        taken = min(wanted, max(0, cap - current))
+        if taken <= 0:
+            return [f"{place}: гарнизон полон ({current}/{cap})"]
+        cost = taken * GARRISON_RECRUIT_COST_PER_100 // 100
+        if realm.gold < cost:
+            return [f"{realm.name}: не хватает золота на гарнизон "
+                    f"(нужно {cost}, есть {realm.gold})"]
+        if self._ledger_exhausted(actor.id, ACTION_HIRE_GARRISON,
+                                  GARRISON_HIRES_PER_TURN):
+            return [f"{actor.name}: гарнизон уже нанимали в этом ходу"]
+        self._ledger_spend(actor.id, ACTION_HIRE_GARRISON)
+        realm.gold -= cost
+        province.garrison = current + taken
+        clipped = "" if taken == wanted else f", потолок {cap} (просили {wanted})"
+        return [f"{place}: нанято {taken} солдат в гарнизон{clipped} "
+                f"(всего {province.garrison}/{cap}, казна {realm.gold})"]
+
     # ---------------- конец хода ----------------
 
     def prosperity_cap(self, province_idx: int) -> int:
@@ -833,12 +1430,16 @@ class Hierarchy:
         * ``COURT_COST_PER_VASSAL`` за каждого прямого вассала правителя;
         * содержание гарнизонов **этого** королевства (см.
           ``garrison_upkeep``) — гарнизон больше не бесплатный;
+        * содержание ПОДНЯТОГО левейса (см. ``raise_levy``) — 8 золота за
+          сотню за ход. Это обратная сторона траты T1: поднять левейс дёшево,
+          держать его — не дёшево, иначе копил бы бесконечно;
         * ``ROYAL_COURT_BASE_COST`` плюс ``престиж // 10`` — блестящий
           двор дороже содержать, поэтому престиж стал стоком, а не
           мёртвым числом.
         """
         realm = self.realms[realm_id]
         upkeep = self.realm_levy(realm_id) // LEVY_UPKEEP_DIVISOR
+        upkeep += max(0, as_int(realm.raised_levy) or 0) // RAISED_LEVY_UPKEEP_DIVISOR
         ruler = realm.ruler_id
         if ruler:
             upkeep += COURT_COST_PER_VASSAL * len(self.vassals_of(ruler))
@@ -872,14 +1473,20 @@ class Hierarchy:
         """Один ход экономики. Порядок фиксирован — детерминизм для онлайна.
 
         Ни одна из фаз не обращается к ``self.streams``: ход — чистая
-        функция состояния, поэтому хеш мира не «дрожит» от того, откуда
+        функция состояния, поэтому хеш мира не «дрожет» от того, откуда
         взялись случайные числа. Броски живут только в командах.
+
+        Здесь же обнуляется ``action_ledger``: лимиты «раз за ход» действуют
+        внутри хода, а номер хода в ключе журнала нужен только для логов.
+        Обнуление делает каноническую точку сохранения (границу хода)
+        единственной точкой, где журнал гарантированно пуст.
         """
         events: List[str] = []
         events += self.tick_counties()
         events += self.tick_vassals()
         events += self.tick_realms()
         self.turn += 1
+        self.action_ledger.clear()
         self._append_log(events)
         return events
 
@@ -935,11 +1542,27 @@ class Hierarchy:
           его положение нужно только для продолжения бросков. При загрузке
           чужого снапшота «продолжить броски» всё равно бессмысленно, поэтому
           потоки задаются конструктором.
+        * ``action_ledger``. Журнал израсходованных «раз за ход» действий
+          обнуляется в ``end_turn``, поэтому в канонической точке сохранения
+          (граница хода) он пуст и не несёт информации. ``from_state``
+          восстанавливает ``turn``, но не журнал, так что загруженный мир
+          получает чистый счёт действий текущего хода. Известный компромисс
+          этого решения: сохранение ПОСЕРЕДИНЕ хода вернёт игроку израсходованные
+          лимиты (обход через перезагрузку). Плата за честный формат — целый
+          класс эксплойтов — несоразмерна, потому что сервер всё равно
+          пересчитывает лимиты у себя; когда формат снапшота станет версионируемым
+          по-настоящему (а не через ``.get(field, default)``), журнал добавится
+          в снапшот вместе с ростом ``STATE_VERSION``.
         * ``linked_general``. Внешняя ссылка на объект из другого слоя
           (генерал армии), которая к тому же меняется каждый ход. Сериализовать
           её нельзя — сломается контракт изоляции модуля.
         * Ничего из ``sim/``. Фолбэк ``repr`` в ``sim/serialization.py``
           закреплён тестами ``test_sim.py``, и править его отсюда нельзя.
+
+        Новые поля этапа 3 (``raised_levy``, ``mercenary_tiers``,
+        ``gifts_received``) — обычные поля dataclass, поэтому снапшот по
+        Realm/Duchy/Character остаётся полным: любое забытое поле разъехало
+        бы хеш после round-trip.
 
         Порядок ключей детерминирован (реестры — по отсортированным id),
         так что ``state_hash`` от двух одинаковых миров совпадает.
@@ -961,6 +1584,12 @@ class Hierarchy:
                 "crown_authority": r.crown_authority,
                 "tax_policy": r.tax_policy,
                 "is_player": r.is_player,
+                # траты этапа 3: без них мир грузился бы с бесплатным левейсом
+                # и без истории наёмников
+                "raised_levy": r.raised_levy,
+                # копия, а не сам список: снапшот не должен делить его
+                # с живым королевством
+                "mercenary_tiers": list(r.mercenary_tiers),
             } for r in sorted(self.realms.values(), key=lambda x: x.id)},
             "duchies": {d.id: {
                 "id": d.id,
@@ -996,6 +1625,7 @@ class Hierarchy:
                 "traits": tuple(c.traits),
                 "heir": c.heir,
                 "landless_turns": c.landless_turns,
+                "gifts_received": c.gifts_received,
             } for c in sorted(self.characters.values(), key=lambda x: x.id)},
             "contracts": {vassal_id: {
                 "liege_id": c.liege_id,
@@ -1054,6 +1684,11 @@ class Hierarchy:
                 crown_authority=data.get("crown_authority", 2),
                 tax_policy=data.get("tax_policy", 0),
                 is_player=bool(data.get("is_player", False)),
+                # старый снапшот без трат этапа 3 читается как «ничего не поднято»
+                raised_levy=as_int(data.get("raised_levy")) or 0,
+                # список, а не ссылка на поле снапшота: JSON отдаёт list,
+                # а мусор в нём обязан игнорироваться, а не ронять загрузку
+                mercenary_tiers=clean_mercenary_tiers(data.get("mercenary_tiers")),
             )
 
         duchies: Dict[str, Duchy] = {}
@@ -1109,6 +1744,7 @@ class Hierarchy:
                 traits=tuple(traits),
                 heir=data.get("heir"),
                 landless_turns=data.get("landless_turns", 0),
+                gifts_received=as_int(data.get("gifts_received")) or 0,
             )
 
         contracts: Dict[str, VassalContract] = {}
@@ -1143,6 +1779,9 @@ class Hierarchy:
         # иначе состояние, обрезанное при сохранении, после round-trip
         # выглядело бы полным и отличалось хешем от исходного.
         hierarchy.log_truncated = bool(state.get("log_truncated", False))
+        # action_ledger намеренно НЕ восстанавливается: журнал лимитов обнуляется
+        # в end_turn и в снапшот не входит (см. to_state), поэтому загруженный
+        # мир получает чистый счёт действий текущего хода.
         return hierarchy
 
 

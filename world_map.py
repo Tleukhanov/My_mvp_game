@@ -41,9 +41,51 @@ _RANK_TINT = {
 # Нации в порядке показа в панели владений: игрок всегда первый.
 _PANEL_NATION_ORDER = ("blue", "red", "green")
 
+# Порядок персонажей в списке двора: король -> герцоги -> бароны.
+_RANK_ORDER = {
+    TitleRank.KING: 0,
+    TitleRank.DUKE: 1,
+    TitleRank.BARON: 2,
+}
+
+# Цвет строки персонажа по рангу: король ярче, герцог средне, барон туше.
+_VASSAL_COLOR = {
+    TitleRank.KING: (235, 215, 165),
+    TitleRank.DUKE: (205, 190, 155),
+    TitleRank.BARON: (175, 165, 140),
+}
+
+# Тот же цвет для чужой державы, но сильно приглушённый: дерево владений
+# показывается всем, а вот выбрать персонажа чужой нации нельзя.
+_VASSAL_COLOR_FOREIGN = {
+    TitleRank.KING: (135, 125, 105),
+    TitleRank.DUKE: (120, 112, 96),
+    TitleRank.BARON: (105, 100, 88),
+}
+
+# Подсветка выбранной строки панели: заливка, рамка и яркость текста.
+_PANEL_SEL_FILL = (255, 230, 150, 55)
+_PANEL_SEL_BORDER = (255, 226, 150)
+_PANEL_SEL_TEXT = (255, 236, 190)
+
 # Размер панели владений. Задаётся один раз, потому что панель рисуется
 # в собственную поверхность этого размера.
 _PANEL_W, _PANEL_H = 700, 560
+
+# Внутренняя раскладка панели владений. Все координаты локальные, относительно
+# левого верхнего угла _panel_surface; экранные получаются прибавлением origin
+# из _panel_layout. Контент дерева занимает ~360 px из 700, поэтому правый
+# столбец (персонажи) поместился без изменения _PANEL_W/_PANEL_H — на них
+# завязаны _panel_surface и хит-тесты, их трогать нельзя.
+_PANEL_PAD = 20                     # поле слева и справа
+_PANEL_TREE_W = 372                 # ширина левого столбца (дерево владений)
+_PANEL_COL2_X = 412                 # левый край правого столбца (персонажи)
+_PANEL_COL2_W = _PANEL_W - _PANEL_COL2_X - _PANEL_PAD
+_PANEL_TREE_Y = 68                  # верх дерева владений и шапки столбцов
+_PANEL_LINE_H = 16                  # шаг строки дерева
+_PANEL_ROW_H = 13                   # шаг строки списка персонажей
+_PANEL_MAX_Y = _PANEL_H - 40        # ниже этого дерево не рисуется
+_PANEL_HINT_Y = _PANEL_H - 25       # строка подсказки
 
 # Потолок кэша строк: заполненный кэш сбрасывается целиком, иначе он
 # рос бы бесконечно при смене чисел в хинтах и тултипах.
@@ -59,6 +101,7 @@ _TC_CONTRACT = "contract"
 _TC_COUNTY_INCOME = "county_income"
 _TC_DUCHY_INCOME = "duchy_income"
 _TC_DUCHY_LEVY = "duchy_levy"
+_TC_VASSALS = "vassals"
 
 
 class WorldMapScreen:
@@ -125,6 +168,13 @@ class WorldMapScreen:
         self._battle_timer = 0.0
         self._show_ownership = False
         self._ownership_nation: str = PLAYER_NATION
+        # выбор внутри панели владений: персонаж и графство
+        self._sel_character_id: Optional[str] = None
+        self._sel_county_idx: Optional[int] = None
+        # режим панели; пока один, задел на кнопки приказов королю
+        self._own_mode: str = "browse"
+        # курсор по списку персонажей правого столбца (Up/Down)
+        self._vassal_cursor: int = 0
         self._game_over = False
         self._winner: Optional[str] = None
         self._message: Optional[str] = None
@@ -155,7 +205,12 @@ class WorldMapScreen:
         # панель владений рисуется один раз и копируется на экран целиком
         self._panel_surface = pygame.Surface((_PANEL_W, _PANEL_H), pygame.SRCALPHA)
         self._panel_dirty = True
-        # под что именно нарисована панель: (ход, нация, выделение)
+        # раскладка панели: общая для отрисовки и для хит-тестов, поэтому
+        # картинка и клик не могут разойтись. Пересобирается вместе с панелью
+        self._panel_layout: Optional[Dict] = None
+        self._panel_layout_turn: Optional[int] = None
+        # под что именно нарисована панель: (ход, нация, выделение на карте,
+        # выбор персонажа, выбор графства, курсор, режим)
         self._panel_state: Optional[Tuple] = None
         # кэш отрендеренных строк: ключ — (текст, размер шрифта, bold, цвет)
         self._text_cache: Dict[Tuple[str, int, bool, Tuple[int, int, int]],
@@ -225,7 +280,7 @@ class WorldMapScreen:
                 self._keys_held.add(event.key)
                 if event.key == pygame.K_ESCAPE:
                     if self._show_ownership:
-                        self._show_ownership = False
+                        self._close_ownership_panel()
                     elif self._show_diplomacy:
                         self._show_diplomacy = False
                         self._diplomacy_target = None
@@ -244,17 +299,23 @@ class WorldMapScreen:
                     self.cam_x, self.cam_y = 0, 0
                     self._clamp_camera()
                 elif event.key in (pygame.K_v, pygame.K_c):
-                    self._show_ownership = not self._show_ownership
                     if self._show_ownership:
+                        self._close_ownership_panel()
+                    else:
+                        self._show_ownership = True
                         # открыли панель — содержимое рисуется заново
                         self._invalidate_panel()
                 elif event.key == pygame.K_TAB:
                     self._show_diplomacy = not self._show_diplomacy
                 elif self._show_ownership:
-                    if event.key in (pygame.K_q, pygame.K_UP, pygame.K_LEFT):
+                    # Q/E и стрелки вбок листают нации, стрелки вверх/вниз
+                    # двигают курсор по списку персонажей (задел на приказы)
+                    if event.key in (pygame.K_q, pygame.K_LEFT):
                         self._cycle_ownership_nation(-1)
-                    elif event.key in (pygame.K_e, pygame.K_DOWN, pygame.K_RIGHT):
+                    elif event.key in (pygame.K_e, pygame.K_RIGHT):
                         self._cycle_ownership_nation(1)
+                    elif event.key in (pygame.K_UP, pygame.K_DOWN):
+                        self._move_vassal_cursor(-1 if event.key == pygame.K_UP else 1)
                 elif event.key == pygame.K_n and self._show_diplomacy:
                     self._cycle_diplomacy_target(1)
                 elif event.key == pygame.K_p and self._show_diplomacy:
@@ -294,7 +355,11 @@ class WorldMapScreen:
                     self._rmb_moved = False
                 elif event.button == 1:
                     mx, my = event.pos
-                    if my < SCREEN_HEIGHT - 80:
+                    # панель лежит поверх карты: клик по её строке — это
+                    # выбор в панели, а не выбор генерала под ней
+                    if self._panel_hit(mx, my) is not None:
+                        self._handle_panel_click(mx, my)
+                    elif my < SCREEN_HEIGHT - 80:
                         self._handle_map_click(mx, my)
 
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -306,7 +371,9 @@ class WorldMapScreen:
                     if not was_drag:
                         # правый клик без драга — приказ / снять выделение (RTS-стиль)
                         mx, my = event.pos
-                        if my < SCREEN_HEIGHT - 80:
+                        if self._panel_hit(mx, my) is not None:
+                            self._handle_panel_click(mx, my)
+                        elif my < SCREEN_HEIGHT - 80:
                             if self.selected_general:
                                 self._handle_map_click(mx, my, via_right=True)
                             else:
@@ -498,10 +565,58 @@ class WorldMapScreen:
             return
         if self._ownership_nation not in nations:
             self._ownership_nation = nations[0]
+            self._reset_ownership_selection()
             self._invalidate_panel()
             return
         idx = nations.index(self._ownership_nation)
         self._ownership_nation = nations[(idx + direction) % len(nations)]
+        # смена нации сбрасывает выбор и курсор: иначе выбранным остался бы
+        # персонаж чужой державы, и будущий приказ королю ушёл бы не туда
+        self._reset_ownership_selection()
+        self._invalidate_panel()
+
+    def _close_ownership_panel(self):
+        """Закрыть панель владений и сбросить её выбор (ESC или V).
+
+        Сброс обязателен: без него после закрытия остался бы «призрачный»
+        выбранный персонаж, и на следующем открытии панель подсветила бы
+        строку, по которой уже никто не кликал.
+        """
+        self._show_ownership = False
+        self._reset_ownership_selection()
+        self._invalidate_panel()
+
+    def _reset_ownership_selection(self):
+        """Снять выбор панели: персонажа, графство, режим и курсор."""
+        self._sel_character_id = None
+        self._sel_county_idx = None
+        self._own_mode = "browse"
+        self._vassal_cursor = 0
+
+    def _panel_allows_orders(self) -> bool:
+        """Можно ли выбирать персонажа в панели — только у своей нации.
+
+        Дерево владений показывается всем державам, а вот приказы королю
+        (следующий этап) должны доставаться только своим. Правило одно и
+        здесь, и в раскладке панели, и в _move_vassal_cursor.
+        """
+        return self._ownership_nation == PLAYER_NATION
+
+    def _move_vassal_cursor(self, direction: int):
+        """Сдвиг курсора по списку персонажей (Up/Down).
+
+        Курсор и выбор ходят вместе: в режиме просмотра это всё, что нужно,
+        а на этапе с приказами курсор станет целью приказа королю. У края
+        списка курсор стоит на месте.
+        """
+        vassals = self._vassals_of_nation(self._ownership_nation)
+        if not vassals:
+            return
+        idx = max(0, min(self._vassal_cursor, len(vassals) - 1))
+        self._vassal_cursor = max(0, min(idx + direction, len(vassals) - 1))
+        if self._panel_allows_orders():
+            self._sel_character_id = vassals[self._vassal_cursor].id
+            self._sel_county_idx = None
         self._invalidate_panel()
 
     def _diplomacy_action(self, relation: Relation):
@@ -701,10 +816,16 @@ class WorldMapScreen:
         return surf
 
     def _invalidate_panel(self):
-        """Сбросить кэш вычислений и пометить панель владений на перерисовку."""
+        """Сбросить кэш вычислений и пометить панель владений на перерисовку.
+
+        Раскладка сбрасывается здесь же: она считается вместе с картинкой,
+        и любое изменение выбора/курсора обязано проходить через этот метод,
+        иначе панель продолжит показывать старое состояние.
+        """
         self._turn_cache = {}
         self._turn_cache_turn = None
         self._panel_dirty = True
+        self._panel_layout = None
 
     def _turn_cached(self, key: Tuple[str, object], compute):
         """Ленивый кэш, живущий один ход.
@@ -989,79 +1110,131 @@ class WorldMapScreen:
                 out.append(duchy)
         return tuple(out)
 
-    def _render_ownership_panel(self):
-        """Панель владений: Kingdom -> Duchy -> County по выбранной нации.
+    def _vassals_of_nation(self, nation: str) -> List:
+        """Живые персонажи нации: король, потом герцоги, потом бароны.
 
-        Панель статична между ходами, поэтому она рисуется в свою поверхность
-        один раз и дальше только копируется на экран одним блитом.
+        Внутри ранга сортировка по id, чтобы порядок был детерминированным
+        и курсор по списку не прыгал между перерисовками.
         """
-        self.screen.blit(self._dim_surface, (0, 0))
+        cached = self._turn_cached((_TC_VASSALS, nation),
+                                   lambda: self._scan_vassals_of_nation(nation))
+        return list(cached)
 
-        # Панель перерисовывается либо по флажку (сменились данные владений),
-        # либо если разошлось состояние: ход, нация или выделение. Проверка
-        # состояния страхует от забытого сброса в новом месте кода.
-        prev = self._panel_state
-        if (self._panel_dirty or prev is None
-                or prev[0] != self._turn
-                or prev[1] != self._ownership_nation
-                or prev[2] is not self.selected_general):
-            self._paint_ownership_panel()
-            self._panel_dirty = False
-            self._panel_state = (self._turn, self._ownership_nation, self.selected_general)
+    def _scan_vassals_of_nation(self, nation: str) -> Tuple:
+        """Собственный поиск персонажей нации — вызывается один раз на ход."""
+        out = [ch for ch in self.hierarchy.characters.values()
+               if ch.nation == nation and ch.alive]
+        out.sort(key=lambda ch: (_RANK_ORDER.get(ch.rank, 9), ch.id))
+        return tuple(out)
 
-        pw = self._panel_surface.get_width()
-        ph = self._panel_surface.get_height()
-        px = SCREEN_WIDTH // 2 - pw // 2
-        py = SCREEN_HEIGHT // 2 - ph // 2
-        self.screen.blit(self._panel_surface, (px, py))
+    def _panel_layout_get(self) -> Dict:
+        """Раскладка панели владений (с кэшем на ход).
 
-    def _paint_ownership_panel(self):
-        """Отрисовка панели владений в _panel_surface (координаты локальные)."""
-        surface = self._panel_surface
-        pw, ph = _PANEL_W, _PANEL_H
-        surface.fill((0, 0, 0, 0))
+        Кэш живёт до _invalidate_panel(), как и сама картинка. Повторный
+        запрос ничего не считает, поэтому хит-тест мыши дёшево.
+        """
+        lay = self._panel_layout
+        if lay is not None and self._panel_layout_turn == self._turn:
+            return lay
+        lay = self._build_panel_layout()
+        self._panel_layout = lay
+        self._panel_layout_turn = self._turn
+        return lay
 
-        pygame.draw.rect(surface, (40, 35, 30), (0, 0, pw, ph), border_radius=8)
-        pygame.draw.rect(surface, COLOR_WHITE, (0, 0, pw, ph), 2, border_radius=8)
+    def _build_panel_layout(self) -> Dict:
+        """Раскладка панели в экранных координатах — единственный источник геометрии.
 
-        title = self._cached_text(self.font_title, "OWNERSHIP", (220, 200, 160))
-        surface.blit(title, (pw // 2 - title.get_width() // 2, 10))
+        Словарь на выходе:
+        ``panel``       — прямоугольник панели на экране;
+        ``title``       — заголовок, ``nation`` — строка нации;
+        ``realm``       — шапка королевства или None;
+        ``duchies``     — строки герцогств, ``contracts`` — строки контрактов;
+        ``counties``    — строки графств (province_idx);
+        ``vassals``     — правый столбец: живые персонажи нации (char_id);
+        ``vassal_box``  — прямоугольник всего правого столбца;
+        ``hint``        — строка подсказки, ``notes`` — служебные пояснения.
+
+        Каждая строка — это dict с ключами ``kind`` (``realm``/``duchy``/
+        ``contract``/``county``/``vassal``), ``rect`` (экранный прямоугольник),
+        ``text``, ``color``, ``font`` и идентификатором: ``char_id`` персонажа,
+        ``duchy_id`` герцогства, ``county_idx`` провинции, ``index`` для
+        строки персонажей. Одну и ту же раскладку читают и отрисовка, и
+        _panel_hit, поэтому клик по строке попадает ровно туда же, куда нарисовано.
+        """
+        px = SCREEN_WIDTH // 2 - _PANEL_W // 2
+        py = SCREEN_HEIGHT // 2 - _PANEL_H // 2
+
+        def R(x: int, y: int, w: int, h: int) -> pygame.Rect:
+            """Локальный прямоугольник панели -> экранный."""
+            return pygame.Rect(px + x, py + y, w, h)
 
         nation = self._ownership_nation
         nation_obj = WORLD_NATIONS.get(nation)
         realm = self._realm_of_nation(nation)
         nation_color = nation_obj.color if nation_obj else COLOR_WHITE
+        # приказы королю имеет смысл отдавать только своей нации: дерево чужих
+        # держав читается, но персонажи в нём некликабельны (см. selectable)
+        own = self._panel_allows_orders()
 
-        if nation_obj is not None:
-            label = self._cached_text(self.font_hud, f"Nation: {nation_obj.name}",
-                                      nation_color)
-            surface.blit(label, (20, 42))
+        lay: Dict = {
+            "origin": (px, py),
+            "panel": R(0, 0, _PANEL_W, _PANEL_H),
+            "title": R(0, 8, _PANEL_W, 20),
+            "nation": R(_PANEL_PAD, 42, _PANEL_TREE_W, _PANEL_LINE_H),
+            "divider": R(_PANEL_COL2_X - _PANEL_PAD, _PANEL_TREE_Y - 6, 1,
+                         _PANEL_MAX_Y - _PANEL_TREE_Y),
+            "vassal_box": R(_PANEL_COL2_X, _PANEL_TREE_Y, _PANEL_COL2_W, 0),
+            "vassal_head": {
+                "kind": "vassal_head",
+                "rect": R(_PANEL_COL2_X, _PANEL_TREE_Y, _PANEL_COL2_W, _PANEL_LINE_H),
+                "text": "COURT", "color": (220, 200, 160), "font": self.font_small,
+            },
+            "hint": {
+                "kind": "hint",
+                "rect": R(_PANEL_PAD, _PANEL_HINT_Y, _PANEL_TREE_W, _PANEL_ROW_H + 2),
+                "text": "Q/E/Left/Right: nation | Up/Down: court | V: close",
+                "color": (170, 155, 130), "font": self.font_small,
+            },
+            "realm": None,
+            "duchies": [],
+            "contracts": [],
+            "counties": [],
+            "vassals": [],
+            "notes": [],
+        }
 
-        x = 20
-        y = 68
-        line_h = 16
-        max_y = ph - 40
+        x = _PANEL_PAD
+        y = _PANEL_TREE_Y
+        line_h = _PANEL_LINE_H
+        max_y = _PANEL_MAX_Y
 
         if realm is None:
-            no_realm = self._cached_text(self.font_hud, "Королевство не учтено",
-                                         COLOR_HUD_TEXT_DIM)
-            surface.blit(no_realm, (x, y))
+            lay["notes"].append({
+                "kind": "note", "rect": R(x, y, _PANEL_TREE_W, line_h),
+                "text": "Королевство не учтено", "color": COLOR_HUD_TEXT_DIM,
+                "font": self.font_hud,
+            })
         else:
             ruler = self.hierarchy.characters.get(realm.ruler_id)
             ruler_name = ruler.name if ruler else "—"
-            head = self._cached_text(
-                self.font_hud,
-                f"{realm.name}  gold:{realm.gold}  prestige:{realm.prestige}  "
-                f"stability:{realm.stability}  crown:{realm.crown_authority}  ({ruler_name})",
-                nation_color)
-            surface.blit(head, (x, y))
+            lay["realm"] = {
+                "kind": "realm", "rect": R(x, y, _PANEL_TREE_W, line_h),
+                "realm_id": realm.id, "duchy_id": None, "county_idx": None,
+                "char_id": None, "index": None,
+                "text": f"{realm.name}  gold:{realm.gold}  prestige:{realm.prestige}  "
+                        f"stability:{realm.stability}  crown:{realm.crown_authority}  "
+                        f"({ruler_name})",
+                "color": nation_color, "font": self.font_hud,
+            }
             y += line_h + 2
 
             duchies = self._duchies_of_nation(nation)
             if not duchies:
-                empty = self._cached_text(self.font_small, "нет владений",
-                                          COLOR_HUD_TEXT_DIM)
-                surface.blit(empty, (x + 14, y))
+                lay["notes"].append({
+                    "kind": "note", "rect": R(x + 14, y, _PANEL_TREE_W - 14, line_h),
+                    "text": "нет владений", "color": COLOR_HUD_TEXT_DIM,
+                    "font": self.font_small,
+                })
                 y += line_h
             for duchy in duchies:
                 if y > max_y:
@@ -1071,13 +1244,16 @@ class WorldMapScreen:
                     holder_text = "без держателя"
                 else:
                     holder_text = f"{holder.name}, {holder.rank.value}"
-                duchy_line = self._cached_text(
-                    self.font_hud,
-                    f"\u2514 Duchy {duchy.name} ({holder_text}) "
-                    f"income:{self._duchy_income(duchy.id)} "
-                    f"levy:{self._duchy_levy(duchy.id)}",
-                    (205, 190, 155))
-                surface.blit(duchy_line, (x + 14, y))
+                lay["duchies"].append({
+                    "kind": "duchy", "rect": R(x + 14, y, _PANEL_TREE_W - 14, line_h),
+                    "duchy_id": duchy.id, "county_idx": None, "index": None,
+                    "char_id": holder.id if holder is not None else None,
+                    "selectable": own,
+                    "text": f"└ Duchy {duchy.name} ({holder_text}) "
+                            f"income:{self._duchy_income(duchy.id)} "
+                            f"levy:{self._duchy_levy(duchy.id)}",
+                    "color": (205, 190, 155), "font": self.font_hud,
+                })
                 y += line_h
 
                 # контракт и мнение персонажа, если они есть
@@ -1085,33 +1261,229 @@ class WorldMapScreen:
                     contract = self._contract_of(holder.id)
                     if contract is not None:
                         spec = CONTRACT_LEVELS[contract.level]
-                        info = self._cached_text(
-                            self.font_small,
-                            f"   contract: {spec['name']} tax{spec['tax']}%/levy{spec['levy']}% "
-                            f"opinion:{holder.opinion_of_liege} loyalty:{holder.loyalty}",
-                            (170, 155, 130))
-                        surface.blit(info, (x + 28, y))
+                        lay["contracts"].append({
+                            "kind": "contract", "rect": R(x + 28, y, _PANEL_TREE_W - 28,
+                                                          line_h - 2),
+                            "duchy_id": duchy.id, "county_idx": None, "index": None,
+                            "char_id": holder.id, "selectable": own,
+                            "text": f"   contract: {spec['name']} tax{spec['tax']}%/"
+                                    f"levy{spec['levy']}% "
+                                    f"opinion:{holder.opinion_of_liege} "
+                                    f"loyalty:{holder.loyalty}",
+                            "color": (170, 155, 130), "font": self.font_small,
+                        })
                         y += line_h - 2
 
-                    for i in self.hierarchy.counties_of_duchy(duchy.id):
-                        if y > max_y:
-                            break
-                        prov = self.provinces[i]
-                        col = (150, 200, 150) if prov.owner == nation else COLOR_HUD_TEXT_DIM
-                        county_line = self._cached_text(
-                            self.font_small,
-                            f"\u251c #{i} {prov.name}  owner:{prov.owner} "
-                            f"hearths:{getattr(prov, 'hearths', 0)} "
-                            f"inc:{self._county_income(i)} "
-                            f"loy:{getattr(prov, 'loyalty', 0)} "
-                            f"gar:{getattr(prov, 'garrison', 0)}",
-                            col)
-                        surface.blit(county_line, (x + 28, y))
-                        y += line_h - 3
+                for i in self.hierarchy.counties_of_duchy(duchy.id):
+                    if y > max_y:
+                        break
+                    prov = self.provinces[i]
+                    col = (150, 200, 150) if prov.owner == nation else COLOR_HUD_TEXT_DIM
+                    lay["counties"].append({
+                        "kind": "county", "rect": R(x + 28, y, _PANEL_TREE_W - 28,
+                                                     line_h - 3),
+                        "county_idx": i, "duchy_id": duchy.id, "char_id": None,
+                        "index": None, "selectable": True,
+                        "text": f"├ #{i} {prov.name}  owner:{prov.owner} "
+                                f"hearths:{getattr(prov, 'hearths', 0)} "
+                                f"inc:{self._county_income(i)} "
+                                f"loy:{getattr(prov, 'loyalty', 0)} "
+                                f"gar:{getattr(prov, 'garrison', 0)}",
+                        "color": col, "font": self.font_small,
+                    })
+                    y += line_h - 3
 
-        hint = self._cached_text(self.font_small, "Q/E: nation | V: close",
-                                 (170, 155, 130))
-        surface.blit(hint, (20, ph - 25))
+        # правый столбец: живые персонажи нации. Персонажи чужой державы
+        # показываются тусклыми и выбирать их нельзя
+        palette = _VASSAL_COLOR if own else _VASSAL_COLOR_FOREIGN
+        if not own:
+            lay["vassal_head"]["text"] = "COURT (только чтение)"
+            lay["vassal_head"]["color"] = COLOR_HUD_TEXT_DIM
+        vy = _PANEL_TREE_Y + line_h + 2
+        for i, ch in enumerate(self._vassals_of_nation(nation)):
+            if vy > max_y:
+                break
+            lay["vassals"].append({
+                "kind": "vassal", "rect": R(_PANEL_COL2_X, vy, _PANEL_COL2_W, _PANEL_ROW_H),
+                "char_id": ch.id, "duchy_id": ch.duchy_id, "county_idx": ch.province_idx,
+                "index": i, "rank": ch.rank.value, "selectable": own,
+                # слева от имени место под маркер курсора
+                "text": f"  {ch.name} ({ch.rank.value}) loy:{ch.loyalty} "
+                        f"op:{ch.opinion_of_liege}",
+                "color": palette.get(ch.rank, (180, 170, 145)),
+                "font": self.font_small,
+            })
+            vy += _PANEL_ROW_H
+        lay["vassal_box"] = R(_PANEL_COL2_X, _PANEL_TREE_Y, _PANEL_COL2_W,
+                              max(0, vy - _PANEL_TREE_Y))
+        return lay
+
+    def _panel_hit(self, mx: int, my: int) -> Optional[Dict]:
+        """Что под курсором в панели владений.
+
+        None — курсор мимо панели, событие можно отдавать карте. Иначе строка
+        (dict с kind/rect/идентификатором) либо kind="vassal_box"/"panel" для
+        пустого места внутри панели. Панель занимает середину экрана, а
+        фильтр кликов смотрит только на нижнюю полосу HUD, поэтому без этой
+        проверки клик по строке уезжал бы в _handle_map_click и выбирал
+        генерала, оказавшегося под панелью.
+        """
+        if not self._show_ownership:
+            return None
+        lay = self._panel_layout_get()
+        if not lay["panel"].collidepoint(mx, my):
+            return None
+        # строки не пересекаются, порядок групп неважен
+        for key in ("vassals", "counties", "contracts", "duchies"):
+            for row in lay[key]:
+                if row["rect"].collidepoint(mx, my):
+                    return row
+        realm = lay["realm"]
+        if realm is not None and realm["rect"].collidepoint(mx, my):
+            return realm
+        box = lay["vassal_box"]
+        if box.collidepoint(mx, my):
+            return {"kind": "vassal_box", "rect": box.copy()}
+        return {"kind": "panel", "rect": lay["panel"].copy()}
+
+    def _handle_panel_click(self, mx: int, my: int):
+        """Клик по панели владений: пока только выбор и подсветка строки.
+
+        Персонаж выбирается только у своей нации: дерево чужих держав
+        показывается, но строки в нём не активируются. Это защита от ошибки
+        следующего этапа, где у короля появятся приказы — приказ чужому
+        вассалу отдать уже не получится.
+        """
+        hit = self._panel_hit(mx, my)
+        if hit is None:
+            return
+        kind = hit.get("kind")
+        if kind in ("vassal", "duchy", "contract"):
+            char_id = hit.get("char_id")
+            # selectable = False у чужой нации: строка видна, но не выбирается
+            if not char_id or not hit.get("selectable"):
+                return
+            if hit.get("index") is not None:
+                self._vassal_cursor = hit["index"]
+            self._sel_character_id = char_id
+            self._sel_county_idx = None
+            self._own_mode = "browse"
+        elif kind == "county":
+            self._sel_county_idx = hit.get("county_idx")
+            self._sel_character_id = None
+            self._own_mode = "browse"
+        else:
+            # пустое место панели — снять выбор
+            self._sel_character_id = None
+            self._sel_county_idx = None
+            self._own_mode = "browse"
+        self._invalidate_panel()
+
+    def _render_ownership_panel(self):
+        """Панель владений: Kingdom -> Duchy -> County + список персонажей.
+
+        Панель статична между ходами, поэтому она рисуется в свою поверхность
+        один раз и дальше только копируется на экран одним блитом. Геометрия
+        берётся из _panel_layout — той же, что использует _panel_hit.
+        """
+        self.screen.blit(self._dim_surface, (0, 0))
+
+        # Панель перерисовывается либо по флажку (сменились данные владений),
+        # либо если разошлось состояние: ход, нация, выделение на карте или
+        # выбор в панели. Проверка состояния страхует от забытого сброса.
+        prev = self._panel_state
+        if (self._panel_dirty or prev is None
+                or prev[0] != self._turn
+                or prev[1] != self._ownership_nation
+                or prev[2] is not self.selected_general
+                or prev[3] != self._sel_character_id
+                or prev[4] != self._sel_county_idx
+                or prev[5] != self._vassal_cursor
+                or prev[6] != self._own_mode):
+            self._paint_ownership_panel()
+            self._panel_dirty = False
+            self._panel_state = (self._turn, self._ownership_nation, self.selected_general,
+                                 self._sel_character_id, self._sel_county_idx,
+                                 self._vassal_cursor, self._own_mode)
+
+        px, py = self._panel_layout_get()["origin"]
+        self.screen.blit(self._panel_surface, (px, py))
+
+    def _paint_ownership_panel(self):
+        """Отрисовка панели владений в _panel_surface (координаты локальные).
+
+        Раскладка строк берётся из _panel_layout, поэтому нарисованное и
+        проверяемое кликом всегда совпадают.
+        """
+        surface = self._panel_surface
+        pw, ph = _PANEL_W, _PANEL_H
+        lay = self._panel_layout_get()
+        ox, oy = lay["origin"]
+        surface.fill((0, 0, 0, 0))
+
+        pygame.draw.rect(surface, (40, 35, 30), (0, 0, pw, ph), border_radius=8)
+        pygame.draw.rect(surface, COLOR_WHITE, (0, 0, pw, ph), 2, border_radius=8)
+        pygame.draw.rect(surface, (90, 80, 66), lay["divider"].move(-ox, -oy))
+
+        title = self._cached_text(self.font_title, "OWNERSHIP", (220, 200, 160))
+        surface.blit(title, (pw // 2 - title.get_width() // 2, 10))
+
+        nation_obj = WORLD_NATIONS.get(self._ownership_nation)
+        if nation_obj is not None:
+            label = self._cached_text(self.font_hud, f"Nation: {nation_obj.name}",
+                                      nation_obj.color)
+            surface.blit(label, lay["nation"].move(-ox, -oy).topleft)
+
+        # служебные пояснения («нет владений» и т.п.) — не строки выбора
+        for note in lay["notes"]:
+            self._blit_panel_text(surface, note, ox, oy)
+
+        if lay["realm"] is not None:
+            self._blit_panel_text(surface, lay["realm"], ox, oy)
+
+        head = lay["vassal_head"]
+        surface.blit(self._cached_text(head["font"], head["text"], head["color"]),
+                     head["rect"].move(-ox, -oy).topleft)
+
+        for group in (lay["duchies"], lay["contracts"], lay["counties"], lay["vassals"]):
+            for row in group:
+                local = row["rect"].move(-ox, -oy)
+                if row["kind"] == "vassal" and row.get("index") == self._vassal_cursor:
+                    mark = _PANEL_SEL_BORDER if row.get("selectable") else (120, 112, 96)
+                    surface.blit(self._cached_text(self.font_small, ">", mark),
+                                 local.topleft)
+                if self._panel_row_selected(row):
+                    hl = pygame.Surface(local.size, pygame.SRCALPHA)
+                    hl.fill(_PANEL_SEL_FILL)
+                    surface.blit(hl, local.topleft)
+                    pygame.draw.rect(surface, _PANEL_SEL_BORDER, local, 1)
+                self._blit_panel_text(surface, row, ox, oy)
+
+        hint = lay["hint"]
+        surface.blit(self._cached_text(hint["font"], hint["text"], hint["color"]),
+                     hint["rect"].move(-ox, -oy).topleft)
+
+    def _panel_row_selected(self, row) -> bool:
+        """Отмечена ли строка панели текущим выбором.
+
+        По персонажу отмечаются все строки, где он встречается (строка
+        герцогства, контракт и строка двора): выбор одного и того же лица
+        должен выглядеть одинаково в обеих колонках.
+        """
+        if row["kind"] == "county":
+            return self._sel_county_idx is not None and \
+                self._sel_county_idx == row["county_idx"]
+        char_id = row.get("char_id")
+        return char_id is not None and self._sel_character_id == char_id
+
+    def _blit_panel_text(self, surface, row, ox: int, oy: int):
+        """Текст строки панели из кэша шрифтов — с учётом выделения."""
+        color = row["color"]
+        if self._panel_row_selected(row):
+            color = _PANEL_SEL_TEXT
+        text = self._cached_text(row["font"], row["text"], color)
+        surface.blit(text, row["rect"].move(-ox, -oy).topleft)
+
 
     def _render_diplomacy_panel(self):
         self.screen.blit(self._dim_surface, (0, 0))

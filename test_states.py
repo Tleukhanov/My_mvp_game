@@ -27,7 +27,7 @@ import collections
 import copy
 import dataclasses
 import random
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -35,30 +35,68 @@ from sim import dumps, from_jsonable, loads, new_streams, register_enum, state_h
 from states import (
     CONTRACT_LEVELS,
     COUNTY_FIELDS,
+    COURT_COST_PER_VASSAL,
+    CROWN_COST,
+    CROWN_PRESTIGE_COST,
+    CROWN_RAISES_PER_TURN,
+    DEVELOPMENTS_PER_TURN,
+    DEVELOPMENT_MAX,
+    DEV_COST_BASE,
+    DEV_COST_STEP,
     DUCHY_DEFS,
     GARRISON_ATTRITION,
     GARRISON_CAP_PER_FORT,
+    GARRISON_HIRES_PER_TURN,
     GARRISON_IS_FREE_THRESHOLD,
+    GARRISON_RECRUIT_COST_PER_100,
     GARRISON_UPKEEP_PER_100,
+    GIFTS_PER_TURN,
+    GIFT_COST,
+    GIFT_LOYALTY,
+    GIFT_LOYALTY_BY_COUNT,
+    GIFT_OPINION,
+    GIFT_OPINION_BY_COUNT,
     HIERARCHY_DEFAULT_SEED,
     LANDLESS_OPINION_DECAY,
+    LEVY_BLOCK_TROOPS,
+    LEVY_COST_PER_BLOCK,
+    LEVY_RAISES_PER_TURN,
+    LEVY_UPKEEP_DIVISOR,
     LOG_KEEP,
     LOYALTY_COLLAPSE,
     LOYALTY_TAX_BREAK,
     LOYALTY_TAX_FLOOR,
+    MAX_CROWN_AUTHORITY,
+    MERC_BLOCK_TROOPS,
+    MERC_COST_PER_BLOCK,
+    MERC_HIRES_PER_TURN,
+    MERC_MAX_BLOCKS_PER_TURN,
+    MERC_QUALITY_STREAM,
+    MERC_SALT_STRIDE,
+    MERC_TIER_THRESHOLDS,
+    RAISED_LEVY_UPKEEP_DIVISOR,
     REBELLION_LOYALTY,
     ROYAL_COURT_BASE_COST,
     ROYAL_COURT_PRESTIGE_DIVISOR,
     STATE_VERSION,
+    TAX_POLICY_CROWN_AUTHORITY,
+    TAX_POLICY_MAX,
+    TAX_POLICY_MIN,
     VASSAL_REBELLION_LOYALTY,
     Character,
     Hierarchy,
     Tier,
     TitleRank,
     VassalContract,
+    as_int,
     build_default_hierarchy,
+    clean_mercenary_tiers,
     development_tax_multiplier,
+    development_upgrade_cost,
+    gift_gain,
     loyalty_tax_multiplier,
+    mercenary_salt,
+    mercenary_tier,
     prosperity_tax_multiplier,
     security_tax_multiplier,
 )
@@ -1862,3 +1900,1083 @@ class TestGarrisonUpkeep:
         assert a.state_fingerprint() == b.state_fingerprint()
         # потоки — внешний источник энтропии, в снапшот они не попадают
         assert "streams" not in a.to_state()
+
+# --------------------------------------------------------------------------
+# Траты золота (этап 3)
+# --------------------------------------------------------------------------
+
+
+class TestExpenditures:
+    """Шесть способов потратить золото — и общий контракт команд.
+
+    Контекст этапа: до него золото было только входящим (net +22 золота за ход
+    на старте, +169 в насыщении, к 100 ходу 16 тысяч в казне), то есть ресурс
+    не стоил ничего. Здесь проверяется, что каждая из шести трат:
+
+    * списывает ровно свою цену и даёт ровно свой эффект;
+    * упирается в осмысленный потолок, а не в «бесконечность»;
+    * требует права (вассал либо тот королевство, которому земля реально
+      принадлежит);
+    * отказывает без золота и НЕ меняет состояние при отказе;
+    * не падает на мусоре во входных данных;
+    * ограничена «не чаще N раз за ход на актёра» журналом ``action_ledger``.
+
+    Отдельно — детерминизм найма наёмников (единственного потребителя ГПСЧ)
+    и регрессия детерминизма после трат.
+    """
+
+    REALM = "kingdom_riven"
+    RULER = "king_rurik"
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    # ---------------- хелперы ----------------
+
+    @property
+    def realm(self):
+        return self.h.realms[self.REALM]
+
+    def fund(self, gold: int = 10000, realm_id: Optional[str] = None):
+        """Положить в казну королевства ровно ``gold``."""
+        realm = self.h.realms[realm_id or self.REALM]
+        realm.gold = gold
+        return realm
+
+    def owned(self, realm_id: Optional[str] = None) -> List[int]:
+        return sorted(self.h.provinces_of_realm(realm_id or self.REALM))
+
+    def neutral_index(self) -> int:
+        for idx, province in enumerate(self.h.provinces):
+            if province.owner == "neutral":
+                return idx
+        raise AssertionError("на карте не осталось нейтральных земель")
+
+    def capital(self) -> int:
+        return self.realm.capital_idx
+
+    def assert_refused(self, events) -> None:
+        """Отказ — это ОДНО событие с причиной, а не пустой список.
+
+        Пустой список означает «некому/нечего»: неизвестная цель. Отказ по
+        существу (нет права, не хватает золота, исчерпан лимит) обязан
+        объясняться — иначе UI нечего показать игроку.
+        """
+        assert isinstance(events, list), events
+        assert len(events) == 1, events
+        assert isinstance(events[0], str) and events[0], events
+
+    # ==================================================================
+    # T1. Подъём левейса
+    # ==================================================================
+
+    def test_levy_constants_are_the_documented_ones(self):
+        assert LEVY_BLOCK_TROOPS == 100
+        assert LEVY_COST_PER_BLOCK == 100
+        assert RAISED_LEVY_UPKEEP_DIVISOR == 12
+        # 8 золота за сотню за ход — заявленная цена содержания
+        assert LEVY_BLOCK_TROOPS // RAISED_LEVY_UPKEEP_DIVISOR == 8
+
+    def test_raise_levy_adds_soldiers_and_charges_gold(self):
+        self.fund(1000)
+        events = self.h.raise_levy(self.REALM, 2)
+        assert events, "успешная трата обязана попасть в журнал"
+        assert self.realm.raised_levy == 2 * LEVY_BLOCK_TROOPS
+        assert self.realm.gold == 1000 - 2 * LEVY_COST_PER_BLOCK
+
+    def test_raise_levy_starts_at_zero_and_lives_in_the_snapshot(self):
+        assert self.realm.raised_levy == 0
+        assert "raised_levy" in self.h.to_state()["realms"][self.REALM]
+
+    def test_raise_levy_is_capped_by_realm_levy(self):
+        cap = self.h.realm_levy(self.REALM)
+        self.fund(100000)
+        self.h.raise_levy(self.REALM, cap // LEVY_BLOCK_TROOPS)
+        filled = cap // LEVY_BLOCK_TROOPS * LEVY_BLOCK_TROOPS
+        assert self.realm.raised_levy == filled
+        before = (self.realm.gold, self.realm.raised_levy)
+        # остаток в два десятка солдат добрать нельзя: блок — это сотня,
+        # поэтому «подобрать левейс до конца» невозможно by design
+        events = self.h.raise_levy(self.REALM, 1)
+        assert events, "левейс сверх наличного обязан быть отказом"
+        assert (self.realm.gold, self.realm.raised_levy) == before
+        assert filled <= cap
+
+    def test_raise_levy_refused_without_gold_and_changes_nothing(self):
+        self.fund(LEVY_COST_PER_BLOCK - 1)
+        before_gold, before_levy = self.realm.gold, self.realm.raised_levy
+        events = self.h.raise_levy(self.REALM, 1)
+        assert events
+        assert self.realm.gold == before_gold
+        assert self.realm.raised_levy == before_levy
+
+    def test_raise_levy_rejects_zero_and_negative_blocks(self):
+        self.fund(1000)
+        for blocks in (0, -1, -100):
+            events = self.h.raise_levy(self.REALM, blocks)
+            assert events, blocks
+            assert self.realm.raised_levy == 0, blocks
+            assert self.realm.gold == 1000, blocks
+
+    def test_raise_levy_survives_junk_blocks(self):
+        self.fund(1000)
+        for junk in (None, "abc", True, [1], object()):
+            events = self.h.raise_levy(self.REALM, junk)
+            assert isinstance(events, list), junk
+            assert events, junk
+            assert self.realm.raised_levy == 0, junk
+        assert self.realm.gold == 1000
+
+    def test_raise_levy_truncates_float_blocks(self):
+        self.fund(1000)
+        assert self.h.raise_levy(self.REALM, 2.9)
+        assert self.realm.raised_levy == 2 * LEVY_BLOCK_TROOPS
+
+    def test_raise_levy_on_unknown_realm_is_noop(self):
+        assert self.h.raise_levy("kingdom_of_narnia", 1) == []
+
+    def test_raised_levy_grows_realm_upkeep(self):
+        self.fund(100000)
+        base = self.h.realm_upkeep(self.REALM)
+        self.h.raise_levy(self.REALM, 3)
+        after = self.h.realm_upkeep(self.REALM)
+        assert after - base == 3 * LEVY_BLOCK_TROOPS // RAISED_LEVY_UPKEEP_DIVISOR
+        assert after > base
+
+    def test_realm_upkeep_of_empty_levy_is_unchanged(self):
+        # содержание без поднятого левейса складывается ровно как до этапа 3
+        h = make_hierarchy()
+        realm = h.realms[self.REALM]
+        ruler = realm.ruler_id
+        assert h.realm_upkeep(self.REALM) == \
+            h.realm_levy(self.REALM) // LEVY_UPKEEP_DIVISOR + \
+            realm.raised_levy // RAISED_LEVY_UPKEEP_DIVISOR + \
+            COURT_COST_PER_VASSAL * len(h.vassals_of(ruler)) + \
+            h.garrison_upkeep(self.REALM) + ROYAL_COURT_BASE_COST + \
+            realm.prestige // ROYAL_COURT_PRESTIGE_DIVISOR
+
+    def test_raise_levy_refused_when_ruler_is_dead(self):
+        self.fund(1000)
+        self.h.characters[self.RULER].alive = False
+        assert self.h.raise_levy(self.REALM, 1)
+        assert self.realm.raised_levy == 0
+        assert self.realm.gold == 1000
+
+    def test_raised_levy_never_exceeds_the_cap_over_many_turns(self):
+        self.fund(1000000)
+        for _ in range(30):
+            self.h.raise_levy(self.REALM, 1)
+            self.h.end_turn()
+        assert self.realm.raised_levy <= self.h.realm_levy(self.REALM)
+
+    # ==================================================================
+    # T2. Застройка графа
+    # ==================================================================
+
+    def test_development_cost_is_linear_and_bounded(self):
+        assert DEV_COST_BASE == 40
+        assert DEV_COST_STEP == 10
+        assert DEVELOPMENT_MAX == 10
+        costs = [development_upgrade_cost(dev) for dev in range(1, DEVELOPMENT_MAX)]
+        assert costs == [50, 60, 70, 80, 90, 100, 110, 120, 130]
+        assert all(b > a for a, b in zip(costs, costs[1:]))
+        # полная застройка 1..10 стоит 810 золота на графство (9 ступеней)
+        assert sum(costs) == 810
+
+    def test_develop_county_raises_development_and_charges_gold(self):
+        idx = self.capital()
+        self.fund(1000)
+        before = self.h.county_income(idx)
+        events = self.h.develop_county(idx)
+        assert events
+        assert self.h.provinces[idx].development == 2
+        assert self.realm.gold == 1000 - development_upgrade_cost(1)
+        assert self.h.county_income(idx) > before, "застройка обязана повышать доход"
+
+    def test_develop_county_price_follows_current_development(self):
+        idx = self.capital()
+        self.fund(100000)
+        self.h.provinces[idx].development = 7
+        gold = self.realm.gold
+        assert self.h.develop_county(idx)
+        assert self.realm.gold == gold - development_upgrade_cost(7)
+        assert self.h.provinces[idx].development == 8
+
+    def test_develop_county_refused_at_max(self):
+        idx = self.capital()
+        self.fund(10000)
+        self.h.provinces[idx].development = DEVELOPMENT_MAX
+        events = self.h.develop_county(idx)
+        assert events
+        assert self.h.provinces[idx].development == DEVELOPMENT_MAX
+        assert self.realm.gold == 10000
+
+    def test_develop_county_refused_without_gold(self):
+        idx = self.capital()
+        self.fund(DEV_COST_BASE + DEV_COST_STEP - 1)
+        events = self.h.develop_county(idx)
+        assert events
+        assert self.h.provinces[idx].development == 1
+        assert self.realm.gold == DEV_COST_BASE + DEV_COST_STEP - 1
+
+    def test_develop_county_refused_for_a_foreign_actor(self):
+        idx = self.capital()
+        self.fund(10000)
+        events = self.h.develop_county(idx, "king_erik")
+        assert events, "чужой король не должен застраивать чужое графство"
+        assert self.h.provinces[idx].development == 1
+        assert self.realm.gold == 10000
+
+    def test_develop_county_accepts_the_real_ruler(self):
+        idx = self.capital()
+        self.fund(10000)
+        assert self.h.develop_county(idx, self.RULER)
+        assert self.h.provinces[idx].development == 2
+
+    def test_develop_county_refused_on_neutral_province(self):
+        idx = self.neutral_index()
+        gold_before = {r.id: r.gold for r in self.h.realms.values()}
+        events = self.h.develop_county(idx)
+        assert events, "нейтральная провинция обязана быть отказом"
+        assert self.h.provinces[idx].development == 1
+        assert {r.id: r.gold for r in self.h.realms.values()} == gold_before
+
+    def test_develop_county_pays_the_owning_realm_not_the_neighbour(self):
+        idx = self.capital()
+        assert self.h.realm_owning(idx) == self.REALM
+        others = [r.id for r in self.h.realms.values() if r.id != self.REALM]
+        before = {r_id: self.h.realms[r_id].gold for r_id in others}
+        self.fund(10000)
+        assert self.h.develop_county(idx)
+        assert {r_id: self.h.realms[r_id].gold for r_id in others} == before
+
+    def test_develop_county_on_unknown_province_is_noop(self):
+        for junk in (-1, 50, 9999, None, "3", True):
+            assert self.h.develop_county(junk) == [], junk
+
+    def test_develop_county_refused_when_ruler_is_dead(self):
+        idx = self.capital()
+        self.fund(10000)
+        self.h.characters[self.RULER].alive = False
+        assert self.h.develop_county(idx)
+        assert self.h.provinces[idx].development == 1
+
+    def test_development_never_exceeds_max_over_a_hundred_turns(self):
+        self.fund(1000000)
+        for _ in range(100):
+            self.h.develop_county(self.capital())
+            self.h.end_turn()
+        assert self.h.provinces[self.capital()].development <= DEVELOPMENT_MAX
+
+    # ==================================================================
+    # T3. Подарок вассалу
+    # ==================================================================
+
+    def test_gift_constants(self):
+        assert (GIFT_COST, GIFT_OPINION, GIFT_LOYALTY) == (60, 15, 10)
+        assert GIFT_OPINION_BY_COUNT == (15, 8, 4, 2, 1)
+        assert GIFT_LOYALTY_BY_COUNT == (10, 5, 3, 1, 1)
+
+    def test_gift_gives_opinion_and_loyalty(self):
+        vassal = self.h.characters["duke_brenna"]
+        self.fund(5000)
+        opinion, loyalty = vassal.opinion_of_liege, vassal.loyalty
+        events = self.h.gift_vassal("duke_brenna")
+        assert events
+        assert vassal.opinion_of_liege == min(100, opinion + GIFT_OPINION)
+        assert vassal.loyalty == min(100, loyalty + GIFT_LOYALTY)
+
+    def test_gift_charges_the_liege_purse(self):
+        # король платит из казны королевства
+        self.fund(5000)
+        assert self.h.gift_vassal("duke_brenna")
+        assert self.realm.gold == 5000 - GIFT_COST
+        # герцог без своего realm'а — из личного кошеля
+        duke = self.h.characters["duke_orso"]
+        personal = duke.gold
+        assert self.h.gift_vassal("baron_wolf")
+        assert duke.gold == personal - GIFT_COST
+        assert self.h.purse_of(duke) == personal - GIFT_COST
+
+    def test_gift_counts_received(self):
+        vassal = self.h.characters["duke_brenna"]
+        assert vassal.gifts_received == 0
+        for expected in range(1, len(GIFT_OPINION_BY_COUNT) + 1):
+            self.fund(5000)
+            assert self.h.gift_vassal("duke_brenna")
+            self.h.end_turn()
+            assert vassal.gifts_received == expected
+
+    def test_gift_keeps_opinion_and_loyalty_clamped(self):
+        vassal = self.h.characters["duke_brenna"]
+        vassal.opinion_of_liege = 95
+        vassal.loyalty = 95
+        self.fund(5000)
+        assert self.h.gift_vassal("duke_brenna")
+        assert vassal.opinion_of_liege == 100
+        assert vassal.loyalty == 100
+
+    def test_gift_returns_diminish_15_8_4_2_1(self):
+        # отдача падает ЗА ЖИЗНЬ: 15, 8, 4, 2, 1 и дальше ноль
+        assert [gift_gain(i, GIFT_OPINION_BY_COUNT) for i in range(5)] == [15, 8, 4, 2, 1]
+        assert gift_gain(5, GIFT_OPINION_BY_COUNT) == 0
+        assert gift_gain(99, GIFT_OPINION_BY_COUNT) == 0
+        assert all(gift_gain(i + 1, GIFT_OPINION_BY_COUNT) <
+                   gift_gain(i, GIFT_OPINION_BY_COUNT) for i in range(4))
+
+    def test_gift_returns_actually_diminish_on_a_live_vassal(self):
+        vassal = self.h.characters["duke_brenna"]
+        gains = []
+        for _ in range(len(GIFT_OPINION_BY_COUNT)):
+            self.fund(5000)
+            vassal.opinion_of_liege = 0
+            assert self.h.gift_vassal("duke_brenna")
+            gains.append(vassal.opinion_of_liege)
+            self.h.end_turn()
+        assert gains == list(GIFT_OPINION_BY_COUNT)
+
+    def test_gift_sixth_is_refused_without_charge(self):
+        vassal = self.h.characters["duke_brenna"]
+        for _ in range(len(GIFT_OPINION_BY_COUNT)):
+            self.fund(5000)
+            assert self.h.gift_vassal("duke_brenna")
+            self.h.end_turn()
+        self.fund(5000)
+        snapshot = (vassal.opinion_of_liege, vassal.loyalty,
+                    vassal.gifts_received, self.realm.gold)
+        events = self.h.gift_vassal("duke_brenna")
+        assert events, "бессмысленный подарок обязан быть отказом"
+        assert (vassal.opinion_of_liege, vassal.loyalty,
+                vassal.gifts_received, self.realm.gold) == snapshot
+
+    def test_gift_twice_to_the_same_vassal_in_one_turn_is_refused(self):
+        vassal = self.h.characters["duke_brenna"]
+        self.fund(5000)
+        assert self.h.gift_vassal("duke_brenna")
+        snapshot = (vassal.opinion_of_liege, vassal.loyalty, self.realm.gold)
+        events = self.h.gift_vassal("duke_brenna")
+        assert events, "второй подарок тому же вассалу за ход запрещён"
+        assert (vassal.opinion_of_liege, vassal.loyalty,
+                self.realm.gold) == snapshot
+        assert vassal.gifts_received == 1
+
+    def test_gift_to_different_vassals_in_one_turn_is_allowed(self):
+        self.fund(5000)
+        assert self.h.gift_vassal("duke_brenna")
+        assert self.h.gift_vassal("duke_theon")
+        assert self.h.characters["duke_brenna"].gifts_received == 1
+        assert self.h.characters["duke_theon"].gifts_received == 1
+        assert self.realm.gold == 5000 - 2 * GIFT_COST
+
+    def test_gift_refused_without_gold(self):
+        vassal = self.h.characters["duke_brenna"]
+        self.fund(GIFT_COST - 1)
+        events = self.h.gift_vassal("duke_brenna")
+        assert events
+        assert self.realm.gold == GIFT_COST - 1
+        assert vassal.gifts_received == 0
+        assert vassal.opinion_of_liege == 20
+
+    def test_gift_refused_to_dead_vassal(self):
+        self.fund(5000)
+        self.h.characters["duke_brenna"].alive = False
+        events = self.h.gift_vassal("duke_brenna")
+        assert events
+        assert self.realm.gold == 5000
+
+    def test_gift_refused_to_a_character_without_a_liege(self):
+        # король не вассал никому — подарок некому адресовать
+        self.fund(5000)
+        events = self.h.gift_vassal(self.RULER)
+        assert events
+        assert self.realm.gold == 5000
+
+    def test_gift_to_unknown_vassal_is_noop(self):
+        self.fund(5000)
+        assert self.h.gift_vassal("baron_ghost") == []
+        assert self.h.gift_vassal(None) == []
+        assert self.realm.gold == 5000
+
+    def test_gift_to_landless_baron_is_allowed(self):
+        # безземельный вассал — самый обиженный, подарок ему особенно в тему
+        self.fund(5000)
+        self.h.revoke_fief("baron_wolf")
+        self.h.characters["duke_orso"].gold = 500
+        assert self.h.gift_vassal("baron_wolf")
+        assert self.h.characters["baron_wolf"].gifts_received == 1
+
+    # ==================================================================
+    # T4. Корона и налоговая политика
+    # ==================================================================
+
+    def test_crown_constants(self):
+        assert (CROWN_COST, CROWN_PRESTIGE_COST, MAX_CROWN_AUTHORITY) == (300, 30, 3)
+
+    def test_crown_charges_gold_and_prestige(self):
+        self.fund(1000)
+        self.realm.prestige = 60
+        authority_before = self.realm.crown_authority
+        events = self.h.raise_crown_authority(self.REALM)
+        assert events
+        assert self.realm.gold == 1000 - CROWN_COST
+        assert self.realm.prestige == 60 - CROWN_PRESTIGE_COST
+        assert self.realm.crown_authority == authority_before + 1
+
+    def test_crown_authority_grows_at_most_to_three(self):
+        self.fund(10000)
+        self.realm.crown_authority = 0
+        for expected in (1, 2, 3):
+            self.realm.prestige = 100
+            assert self.h.raise_crown_authority(self.REALM)
+            assert self.realm.crown_authority == expected
+            self.h.end_turn()
+        events = self.h.raise_crown_authority(self.REALM)
+        assert events, "выше предела корона не растёт"
+        assert self.realm.crown_authority == MAX_CROWN_AUTHORITY
+
+    def test_crown_refused_without_prestige(self):
+        self.fund(1000)
+        self.realm.prestige = CROWN_PRESTIGE_COST - 1
+        events = self.h.raise_crown_authority(self.REALM)
+        assert events
+        assert self.realm.prestige == CROWN_PRESTIGE_COST - 1
+        assert self.realm.gold == 1000
+
+    def test_crown_refused_without_gold(self):
+        self.fund(CROWN_COST - 1)
+        self.realm.prestige = 100
+        authority = self.realm.crown_authority
+        events = self.h.raise_crown_authority(self.REALM)
+        assert events
+        assert self.realm.gold == CROWN_COST - 1
+        assert self.realm.prestige == 100
+        assert self.realm.crown_authority == authority
+
+    def test_crown_on_unknown_realm_is_noop(self):
+        assert self.h.raise_crown_authority("kingdom_of_narnia") == []
+
+    def test_crown_refused_when_ruler_is_dead(self):
+        self.fund(1000)
+        self.realm.prestige = 100
+        self.h.characters[self.RULER].alive = False
+        assert self.h.raise_crown_authority(self.REALM)
+        assert self.realm.crown_authority == 2
+
+    def test_tax_policy_one_requires_crown_authority(self):
+        assert TAX_POLICY_CROWN_AUTHORITY == 2
+        self.realm.crown_authority = 1
+        events = self.h.set_tax_policy(self.REALM, 1)
+        assert events, "тяжёлый налог без короны обязан быть отказом"
+        assert self.realm.tax_policy == 0
+        self.realm.crown_authority = TAX_POLICY_CROWN_AUTHORITY
+        assert self.h.set_tax_policy(self.REALM, 1)
+        assert self.realm.tax_policy == 1
+
+    def test_tax_policy_gate_is_reachable_only_by_strong_crown(self):
+        self.fund(10000)
+        self.realm.prestige = 100
+        self.realm.crown_authority = 2
+        assert self.h.raise_crown_authority(self.REALM)
+        assert self.realm.crown_authority == 3
+        assert self.h.set_tax_policy(self.REALM, 1)
+        self.h.end_turn()
+        assert self.h.set_tax_policy(self.REALM, 0)
+
+    def test_tax_policy_range_is_clamped(self):
+        assert (TAX_POLICY_MIN, TAX_POLICY_MAX) == (0, 1)
+        self.realm.crown_authority = 3
+        assert self.h.set_tax_policy(self.REALM, 99)
+        assert self.realm.tax_policy == TAX_POLICY_MAX
+        self.h.end_turn()
+        assert self.h.set_tax_policy(self.REALM, -42)
+        assert self.realm.tax_policy == TAX_POLICY_MIN
+
+    def test_tax_policy_out_of_range_respects_the_crown_gate(self):
+        self.realm.crown_authority = 1
+        assert self.h.set_tax_policy(self.REALM, 99)
+        assert self.realm.tax_policy == 0
+
+    def test_tax_policy_same_value_reports_no_change(self):
+        self.realm.crown_authority = 3
+        self.realm.tax_policy = 1
+        events = self.h.set_tax_policy(self.REALM, 1)
+        assert len(events) == 1
+        assert self.realm.tax_policy == 1
+
+    def test_tax_policy_costs_nothing(self):
+        # это не трата, а переключатель: деньги берутся гейтом через корону
+        self.fund(777)
+        self.realm.crown_authority = 2
+        assert self.h.set_tax_policy(self.REALM, 1)
+        assert self.realm.gold == 777
+
+    def test_tax_policy_rejects_junk_without_crashing(self):
+        for junk in (None, "high", [], True):
+            events = self.h.set_tax_policy(self.REALM, junk)
+            assert isinstance(events, list), junk
+            assert events, junk
+            assert self.realm.tax_policy == 0, junk
+
+    def test_tax_policy_on_unknown_realm_is_noop(self):
+        assert self.h.set_tax_policy("kingdom_of_narnia", 1) == []
+
+    # ==================================================================
+    # T5. Наёмники — единственный потребитель ГПСЧ
+    # ==================================================================
+
+    def test_mercenary_constants(self):
+        assert (MERC_COST_PER_BLOCK, MERC_MAX_BLOCKS_PER_TURN) == (180, 6)
+        assert MERC_BLOCK_TROOPS == 100
+        assert MERC_TIER_THRESHOLDS == (60, 90)
+        assert MERC_SALT_STRIDE > MERC_MAX_BLOCKS_PER_TURN, \
+            "иначе соли соседних ходов пересекутся"
+
+    def test_mercenary_block_costs_180(self):
+        self.fund(1000)
+        assert len(self.h.hire_mercenaries(self.REALM, 3)) == 3
+        assert self.realm.gold == 1000 - 3 * MERC_COST_PER_BLOCK
+        assert len(self.realm.mercenary_tiers) == 3
+
+    def test_mercenary_tiers_are_always_one_two_or_three(self):
+        self.fund(1000000)
+        for _ in range(20):
+            assert self.h.hire_mercenaries(self.REALM, MERC_MAX_BLOCKS_PER_TURN)
+            self.h.end_turn()
+        assert len(self.realm.mercenary_tiers) == 20 * MERC_MAX_BLOCKS_PER_TURN
+        assert set(self.realm.mercenary_tiers) <= {1, 2, 3}
+
+    def test_mercenary_events_report_the_tier(self):
+        self.fund(1000)
+        events = self.h.hire_mercenaries(self.REALM, 2)
+        assert len(events) == 2
+        for index, event in enumerate(events):
+            assert f"тира {self.realm.mercenary_tiers[index]}" in event, event
+            assert str(MERC_BLOCK_TROOPS) in event, event
+
+    def test_mercenary_block_limit_is_refused(self):
+        self.fund(100000)
+        events = self.h.hire_mercenaries(self.REALM, MERC_MAX_BLOCKS_PER_TURN + 1)
+        assert events
+        assert self.realm.gold == 100000
+        assert self.realm.mercenary_tiers == []
+
+    def test_mercenary_at_the_block_limit_is_allowed(self):
+        self.fund(100000)
+        assert len(self.h.hire_mercenaries(self.REALM, MERC_MAX_BLOCKS_PER_TURN)) == \
+            MERC_MAX_BLOCKS_PER_TURN
+
+    def test_mercenary_refused_without_gold(self):
+        self.fund(MERC_COST_PER_BLOCK - 1)
+        events = self.h.hire_mercenaries(self.REALM, 1)
+        assert events
+        assert self.realm.gold == MERC_COST_PER_BLOCK - 1
+        assert self.realm.mercenary_tiers == []
+
+    def test_mercenary_rejects_junk_blocks(self):
+        self.fund(100000)
+        for junk in (0, -3, None, "many", True, [1]):
+            events = self.h.hire_mercenaries(self.REALM, junk)
+            assert isinstance(events, list), junk
+            assert events, junk
+            assert self.realm.mercenary_tiers == [], junk
+        assert self.realm.gold == 100000
+
+    def test_mercenary_on_unknown_realm_is_noop(self):
+        assert self.h.hire_mercenaries("kingdom_of_narnia", 1) == []
+
+    def test_mercenary_tier_roll_is_integral_and_weighted(self):
+        # тысяча бросков одного генератора обязана дать примерно 60/30/10
+        rnd = new_streams(1).stream("probe")
+        counts = [0, 0, 0, 0]
+        for _ in range(1000):
+            tier = mercenary_tier(rnd)
+            assert tier in (1, 2, 3)
+            counts[tier] += 1
+        assert 520 < counts[1] < 680, counts
+        assert 230 < counts[2] < 380, counts
+        assert 40 < counts[3] < 160, counts
+
+    def test_mercenary_salt_is_integer_arithmetic_only(self):
+        assert mercenary_salt(1, 0) == 1 * MERC_SALT_STRIDE
+        assert mercenary_salt(3, 4) == 3 * MERC_SALT_STRIDE + 4
+        assert isinstance(mercenary_salt(5, 2), int)
+        assert mercenary_salt(5, 2) != mercenary_salt(2, 5)
+
+    def test_mercenary_salts_of_adjacent_turns_never_overlap(self):
+        salts = {mercenary_salt(turn, index)
+                 for turn in range(1, 120)
+                 for index in range(MERC_MAX_BLOCKS_PER_TURN)}
+        assert len(salts) == 119 * MERC_MAX_BLOCKS_PER_TURN
+
+    def test_mercenary_tiers_are_reproducible_for_the_same_seed(self):
+        a, b = seeded_hierarchy(4242), seeded_hierarchy(4242)
+        for h in (a, b):
+            h.hire_mercenaries(self.REALM, MERC_MAX_BLOCKS_PER_TURN)
+        assert a.realms[self.REALM].mercenary_tiers == b.realms[self.REALM].mercenary_tiers
+        assert len(a.realms[self.REALM].mercenary_tiers) == MERC_MAX_BLOCKS_PER_TURN
+
+    def test_mercenary_tiers_are_reproducible_after_a_shared_history(self):
+        a, b = seeded_hierarchy(4242), seeded_hierarchy(4242)
+        for h in (a, b):
+            h.end_turn()
+            h.develop_county(h.realms[self.REALM].capital_idx)
+            h.hire_mercenaries(self.REALM, MERC_MAX_BLOCKS_PER_TURN)
+        assert a.realms[self.REALM].mercenary_tiers == b.realms[self.REALM].mercenary_tiers
+
+    def test_different_seeds_give_different_mercenary_tiers(self):
+        tiers = [tuple(hire_tiers(seed)) for seed in (0, 1, 7, 999, 424242, 31337)]
+        assert len(set(tiers)) > 1, tiers
+
+    def test_turn_shift_changes_the_tier_sequence(self):
+        h = seeded_hierarchy(4242)
+        first = hire_tiers_of(h, MERC_MAX_BLOCKS_PER_TURN)
+        h.turn += 1
+        second = hire_tiers_of(h, MERC_MAX_BLOCKS_PER_TURN)
+        assert first != second, "сдвиг хода обязан менять соль, а значит и тиры"
+
+    def test_turn_shift_changes_the_tier_at_least_somewhere(self):
+        changed = []
+        for seed in (0, 1, 7, 999, 424242):
+            h = seeded_hierarchy(seed)
+            before = hire_tiers_of(h, 3)
+            h.turn += 1
+            after = hire_tiers_of(h, 3)
+            changed += [a != b for a, b in zip(before, after)]
+        assert any(changed), "ни один сдвиг хода нигде не поменял тир"
+
+    def test_hiring_mercenaries_is_the_only_spend_of_the_dice(self):
+        h = seeded_hierarchy(4242)
+        assert len(h.streams) == 0
+        assert h.streams.consumed(MERC_QUALITY_STREAM, mercenary_salt(1, 0)) == 0
+        h.hire_mercenaries(self.REALM, 2)
+        # ответвлённые потоки не попадают в len(streams): там только базовые
+        assert len(h.streams) == 0
+        assert h.streams.consumed(MERC_QUALITY_STREAM, mercenary_salt(1, 0)) > 0
+        assert h.streams.consumed(MERC_QUALITY_STREAM, mercenary_salt(1, 1)) > 0
+
+    def test_mercenary_distribution_over_many_hires_is_roughly_60_30_10(self):
+        h = make_hierarchy()
+        h.realms[self.REALM].gold = 10 ** 6
+        for _ in range(30):
+            assert h.hire_mercenaries(self.REALM, MERC_MAX_BLOCKS_PER_TURN)
+            h.end_turn()
+        tiers = h.realms[self.REALM].mercenary_tiers
+        assert len(tiers) == 180
+        share1 = tiers.count(1) / len(tiers)
+        share2 = tiers.count(2) / len(tiers)
+        share3 = tiers.count(3) / len(tiers)
+        assert 0.45 < share1 < 0.75, share1
+        assert 0.15 < share2 < 0.45, share2
+        assert 0.03 < share3 < 0.25, share3
+
+    def test_mercenary_tiers_start_empty_and_are_not_shared_between_realms(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        assert a.realms[self.REALM].mercenary_tiers == []
+        for h in (a, b):
+            h.realms[self.REALM].gold = 1000
+            h.hire_mercenaries(self.REALM, 1)
+        # правка тиров одного мира не трогает другой
+        a.realms[self.REALM].mercenary_tiers.append(3)
+        assert len(b.realms[self.REALM].mercenary_tiers) == 1
+        assert len(a.realms["kingdom_ember"].mercenary_tiers) == 0
+
+    def test_clean_mercenary_tiers_drops_junk(self):
+        assert clean_mercenary_tiers([1, 2, "3", None, True, 3.5, 3]) == [1, 2, 3]
+        assert clean_mercenary_tiers("tiers") == []
+        assert clean_mercenary_tiers(None) == []
+
+    def test_from_state_survives_broken_mercenary_tiers(self):
+        state = self.h.to_state()
+        state["realms"][self.REALM]["mercenary_tiers"] = ["a", None, 2]
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert restored.realms[self.REALM].mercenary_tiers == [2]
+
+    # ==================================================================
+    # T6. Наём гарнизона
+    # ==================================================================
+
+    def test_garrison_recruit_fee_is_four_turns_of_upkeep(self):
+        assert GARRISON_RECRUIT_COST_PER_100 == 40
+        assert GARRISON_RECRUIT_COST_PER_100 == 4 * GARRISON_UPKEEP_PER_100
+
+    def test_hire_garrison_respects_the_cap(self):
+        idx = self.capital()
+        cap = self.h.garrison_cap(idx)
+        self.h.provinces[idx].garrison = 0
+        self.fund(10000)
+        assert self.h.hire_garrison(idx, cap * 3)
+        assert self.h.provinces[idx].garrison == cap
+
+    def test_hire_garrison_charges_proportionally(self):
+        idx = self.capital()
+        self.h.provinces[idx].garrison = 0
+        self.fund(10000)
+        assert self.h.hire_garrison(idx, 250)
+        assert self.h.provinces[idx].garrison == 250
+        assert self.realm.gold == 10000 - 250 * GARRISON_RECRUIT_COST_PER_100 // 100
+
+    def test_hire_garrison_takes_only_the_free_slots_left(self):
+        idx = self.capital()
+        cap = self.h.garrison_cap(idx)
+        self.h.provinces[idx].garrison = cap - 40
+        self.fund(10000)
+        events = self.h.hire_garrison(idx, 200)
+        assert events
+        assert self.h.provinces[idx].garrison == cap
+
+    def test_hire_garrison_refused_on_full_garrison(self):
+        idx = self.capital()
+        self.h.provinces[idx].garrison = self.h.garrison_cap(idx)
+        self.fund(10000)
+        events = self.h.hire_garrison(idx, 50)
+        assert events
+        assert self.h.provinces[idx].garrison == self.h.garrison_cap(idx)
+        assert self.realm.gold == 10000
+
+    def test_hire_garrison_refused_for_a_foreign_actor(self):
+        idx = self.capital()
+        before = self.h.provinces[idx].garrison
+        self.fund(10000)
+        events = self.h.hire_garrison(idx, 50, "king_erik")
+        assert events, "чужой король не должен нанимать гарнизон в чужое графство"
+        assert self.h.provinces[idx].garrison == before
+        assert self.realm.gold == 10000
+
+    def test_hire_garrison_refused_on_neutral_province(self):
+        idx = self.neutral_index()
+        before = self.h.provinces[idx].garrison
+        self.fund(10000)
+        events = self.h.hire_garrison(idx, 50)
+        assert events
+        assert self.h.provinces[idx].garrison == before
+
+    def test_hire_garrison_refused_without_gold(self):
+        idx = self.capital()
+        before = self.h.provinces[idx].garrison
+        self.fund(GARRISON_RECRUIT_COST_PER_100 // 100 - 1)
+        events = self.h.hire_garrison(idx, 100)
+        assert events
+        assert self.h.provinces[idx].garrison == before
+
+    def test_hire_garrison_rejects_junk(self):
+        idx = self.capital()
+        before = self.h.provinces[idx].garrison
+        self.fund(10000)
+        for junk in (0, -5, None, "many", True):
+            events = self.h.hire_garrison(idx, junk)
+            assert isinstance(events, list), junk
+            assert events, junk
+            assert self.h.provinces[idx].garrison == before, junk
+
+    def test_hire_garrison_on_unknown_province_is_noop(self):
+        self.fund(10000)
+        for junk in (-1, 50, 9999, None, "3"):
+            assert self.h.hire_garrison(junk, 50) == [], junk
+
+    def test_hire_garrison_refused_when_ruler_is_dead(self):
+        idx = self.capital()
+        before = self.h.provinces[idx].garrison
+        self.fund(10000)
+        self.h.characters[self.RULER].alive = False
+        assert self.h.hire_garrison(idx, 50)
+        assert self.h.provinces[idx].garrison == before
+
+    def test_hire_garrison_grows_the_upkeep_of_the_owning_realm(self):
+        idx = self.capital()
+        self.h.provinces[idx].garrison = 0
+        self.fund(10000)
+        base = self.h.garrison_upkeep(self.REALM)
+        assert self.h.hire_garrison(idx, 100)
+        assert self.h.garrison_upkeep(self.REALM) - base == GARRISON_UPKEEP_PER_100
+
+    # ==================================================================
+    # Лимиты «не чаще N раз за ход»
+    # ==================================================================
+
+    def test_limits_are_configurable_per_action(self):
+        assert LEVY_RAISES_PER_TURN == 2
+        assert DEVELOPMENTS_PER_TURN == 2
+        assert GARRISON_HIRES_PER_TURN == 2
+        assert GIFTS_PER_TURN == 1
+        assert CROWN_RAISES_PER_TURN == 1
+        assert MERC_HIRES_PER_TURN == 1
+
+    def test_second_call_of_the_same_action_is_refused_and_reopened_by_end_turn(self):
+        self.fund(100000)
+        self.realm.prestige = 100
+        assert self.h.raise_crown_authority(self.REALM)
+        snapshot = (self.realm.gold, self.realm.crown_authority,
+                    self.realm.prestige)
+        events = self.h.raise_crown_authority(self.REALM)
+        assert events, "вторая корона за ход обязана быть отказом"
+        assert (self.realm.gold, self.realm.crown_authority,
+                self.realm.prestige) == snapshot
+        self.h.end_turn()
+        self.realm.prestige = 100
+        assert self.h.raise_crown_authority(self.REALM), "после end_turn можно снова"
+
+    def test_levy_limit_is_two_per_turn(self):
+        self.fund(100000)
+        assert self.h.raise_levy(self.REALM, 1)
+        assert self.h.raise_levy(self.REALM, 1)
+        self.assert_refused(self.h.raise_levy(self.REALM, 1))
+        assert self.realm.raised_levy == 2 * LEVY_BLOCK_TROOPS
+        self.h.end_turn()
+        assert self.h.raise_levy(self.REALM, 1)
+
+    def test_development_limit_is_two_per_turn(self):
+        self.fund(100000)
+        first, second = self.owned()[:2]
+        assert self.h.develop_county(first)
+        assert self.h.develop_county(second)
+        self.assert_refused(self.h.develop_county(first))
+        assert self.h.provinces[first].development == 2
+        self.h.end_turn()
+        assert self.h.develop_county(first)
+
+    def test_garrison_limit_is_two_per_turn(self):
+        self.fund(100000)
+        first, second = self.owned()[:2]
+        for idx in (first, second):
+            self.h.provinces[idx].garrison = 0
+        assert self.h.hire_garrison(first, 10)
+        assert self.h.hire_garrison(second, 10)
+        self.assert_refused(self.h.hire_garrison(first, 10))
+        assert self.h.provinces[first].garrison == 10
+        self.h.end_turn()
+        assert self.h.hire_garrison(first, 10)
+
+    def test_mercenary_limit_is_one_hire_per_turn(self):
+        self.fund(100000)
+        assert len(self.h.hire_mercenaries(self.REALM, 2)) == 2
+        self.assert_refused(self.h.hire_mercenaries(self.REALM, 1))
+        assert len(self.realm.mercenary_tiers) == 2
+        self.h.end_turn()
+        assert len(self.h.hire_mercenaries(self.REALM, 1)) == 1
+
+    def test_tax_policy_limit_is_one_change_per_turn(self):
+        self.realm.crown_authority = 2
+        assert self.h.set_tax_policy(self.REALM, 1)
+        self.assert_refused(self.h.set_tax_policy(self.REALM, 0))
+        assert self.realm.tax_policy == 1
+        self.h.end_turn()
+        assert self.h.set_tax_policy(self.REALM, 0)
+
+    def test_a_refused_action_does_not_spend_the_allowance(self):
+        # отказ по золоту не должен съедать право на действие
+        self.fund(0)
+        self.assert_refused(self.h.raise_levy(self.REALM, 1))
+        self.fund(100000)
+        assert self.h.raise_levy(self.REALM, 1), "право на левейс ещё осталось"
+
+    def test_limits_are_per_actor_not_global(self):
+        # лимит герцога не расходует лимит короля
+        self.fund(100000)
+        self.h.characters["duke_orso"].gold = 10000
+        assert self.h.gift_vassal("duke_brenna")
+        assert self.h.gift_vassal("baron_wolf")
+        assert self.h.gift_vassal("baron_gray")
+
+    def test_action_ledger_is_cleared_by_end_turn(self):
+        self.fund(100000)
+        self.h.develop_county(self.capital())
+        assert self.h.action_ledger, "после траты журнал непуст"
+        self.h.end_turn()
+        assert self.h.action_ledger == {}
+
+    def test_action_ledger_is_not_part_of_the_snapshot(self):
+        # каноническая точка сохранения — граница хода, а там журнал пуст
+        self.fund(100000)
+        self.h.develop_county(self.capital())
+        state = self.h.to_state()
+        assert "action_ledger" not in state
+        assert "action_ledger" not in all_keys(state)
+        assert set(state) == {
+            "version", "turn", "log", "log_truncated",
+            "realms", "duchies", "characters", "contracts", "counties",
+        }
+
+    def test_snapshot_at_turn_boundary_keeps_fingerprint_and_empty_ledger(self):
+        self.fund(100000)
+        self.h.develop_county(self.capital())
+        self.h.end_turn()
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.action_ledger == {}
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    # ==================================================================
+    # Новые поля в снапшоте
+    # ==================================================================
+
+    def test_new_fields_survive_round_trip(self):
+        self.fund(100000)
+        self.h.raise_levy(self.REALM, 2)
+        self.h.hire_mercenaries(self.REALM, 3)
+        self.h.gift_vassal("duke_brenna")
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.realms[self.REALM].raised_levy == self.realm.raised_levy
+        assert restored.realms[self.REALM].mercenary_tiers == \
+            self.realm.mercenary_tiers
+        assert restored.characters["duke_brenna"].gifts_received == 1
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_new_fields_survive_json_round_trip(self):
+        self.fund(100000)
+        self.h.raise_levy(self.REALM, 1)
+        self.h.hire_mercenaries(self.REALM, 2)
+        restored = Hierarchy.from_state(loads(dumps(self.h.to_state())), copy_provinces())
+        assert restored.realms[self.REALM].raised_levy == LEVY_BLOCK_TROOPS
+        assert restored.realms[self.REALM].mercenary_tiers == \
+            self.realm.mercenary_tiers
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_old_snapshot_without_new_fields_loads_as_zero(self):
+        state = self.h.to_state()
+        state["realms"] = {
+            key: {name: value for name, value in data.items()
+                  if name not in ("raised_levy", "mercenary_tiers")}
+            for key, data in state["realms"].items()}
+        state["characters"] = {
+            key: {name: value for name, value in data.items()
+                  if name != "gifts_received"}
+            for key, data in state["characters"].items()}
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert restored.realms[self.REALM].raised_levy == 0
+        assert restored.realms[self.REALM].mercenary_tiers == []
+        assert restored.characters["duke_brenna"].gifts_received == 0
+
+    def test_fingerprint_tracks_new_fields(self):
+        a, b, c = make_hierarchy(), make_hierarchy(), make_hierarchy()
+        before = a.state_fingerprint()
+        a.realms[self.REALM].raised_levy += 1
+        assert a.state_fingerprint() != before
+        b.characters["duke_brenna"].gifts_received += 1
+        assert b.state_fingerprint() != before
+        c.realms[self.REALM].mercenary_tiers.append(2)
+        assert c.state_fingerprint() != before
+
+    def test_mercenary_tiers_in_snapshot_are_a_copy_not_the_live_list(self):
+        self.fund(1000)
+        self.h.hire_mercenaries(self.REALM, 1)
+        state = self.h.to_state()
+        state["realms"][self.REALM]["mercenary_tiers"].append(3)
+        assert len(self.realm.mercenary_tiers) == 1
+
+    # ==================================================================
+    # Регрессия детерминизма
+    # ==================================================================
+
+    def test_thirty_turns_with_spending_hash_equal(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        for h in (a, b):
+            for _ in range(30):
+                h.develop_county(h.realms[self.REALM].capital_idx)
+                h.hire_garrison(h.realms[self.REALM].capital_idx, 40)
+                h.raise_levy(self.REALM, 1)
+                h.gift_vassal("duke_brenna")
+                h.hire_mercenaries(self.REALM, 2)
+                h.end_turn()
+        assert a.turn == b.turn == 31
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+    def test_ticks_still_never_roll_the_dice(self):
+        h = make_hierarchy()
+        h.realms[self.REALM].gold = 100000
+        assert h.hire_mercenaries(self.REALM, 2)
+        for _ in range(12):
+            h.end_turn()
+        assert len(h.streams) == 0, "фаза хода создала именованный поток"
+        assert h.streams.consumed(MERC_QUALITY_STREAM, mercenary_salt(13, 0)) == 0
+
+    def test_summary_keys_are_unchanged_by_the_stage(self):
+        # точный набор ключей summary зафиксирован тестами детерминизма
+        h = make_hierarchy()
+        h.realms[self.REALM].gold = 100000
+        h.develop_county(h.realms[self.REALM].capital_idx)
+        h.hire_mercenaries(self.REALM, 1)
+        h.gift_vassal("duke_brenna")
+        summary = h.summary()
+        assert set(summary) == {"turn", "realms", "duchies", "characters"}
+        assert set(summary["realms"][self.REALM]) == {"gold", "prestige",
+                                                      "stability", "held"}
+        assert set(summary["duchies"]["emberfall"]) == {"holder", "income"}
+        assert set(summary["characters"]["duke_brenna"]) == {"rank", "loyalty",
+                                                             "opinion", "gold"}
+
+    def test_states_does_not_import_global_random(self):
+        source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "states.py"), encoding="utf-8").read()
+        assert "import random" not in source
+
+    # ==================================================================
+    # Длинная дистанция
+    # ==================================================================
+
+    def test_hundred_turns_of_spending_stay_healthy(self):
+        h = make_hierarchy()
+        realm = h.realms[self.REALM]
+        for _ in range(100):
+            realm.gold = max(realm.gold, 1000)  # «игрок не копит, а тратит»
+            h.develop_county(realm.capital_idx)
+            h.hire_garrison(realm.capital_idx, 40)
+            h.raise_levy(self.REALM, 1)
+            if realm.gold > 2000:
+                h.hire_mercenaries(self.REALM, 2)
+            h.end_turn()
+        assert h.turn == 101
+        for other in h.realms.values():
+            assert other.gold >= 0, other.id
+            assert other.gold < 10 ** 7, f"{other.id}: инфляция"
+            assert h.realm_income(other.id) > 0, other.id
+        assert realm.raised_levy <= h.realm_levy(self.REALM)
+        assert realm.mercenary_tiers, "наёмников так и не наняли"
+        assert all(1 <= p.development <= DEVELOPMENT_MAX for p in h.provinces)
+        assert all(p.garrison >= 0 for p in h.provinces)
+        assert sum(1 for i in range(50) if h.county_income(i) > 0) >= 40
+        for province in h.provinces:
+            assert 0 <= province.loyalty <= 100, province.name
+
+    def test_a_spending_king_keeps_a_tighter_treasury_than_a_hoarder(self):
+        spender, hoarder = make_hierarchy(), make_hierarchy()
+        for _ in range(100):
+            spender.develop_county(spender.realms[self.REALM].capital_idx)
+            spender.hire_garrison(spender.realms[self.REALM].capital_idx, 40)
+            spender.raise_levy(self.REALM, 1)
+            spender.hire_mercenaries(self.REALM, 2)
+            spender.end_turn()
+            hoarder.end_turn()
+        # у скупого казна раздувается, у расточителя держится в узде
+        assert hoarder.realms[self.REALM].gold > spender.realms[self.REALM].gold
+        assert spender.realms[self.REALM].gold >= 0
+        assert spender.realms[self.REALM].gold < 10 ** 4
+        assert hoarder.realms[self.REALM].gold > 10 ** 4
+
+    def test_fingerprint_reproducible_with_a_seeded_mercenary_hire(self):
+        a, b = seeded_hierarchy(20240), seeded_hierarchy(20240)
+        for h in (a, b):
+            for _ in range(6):
+                h.hire_mercenaries(self.REALM, 4)
+                h.end_turn()
+        assert a.realms[self.REALM].mercenary_tiers == \
+            b.realms[self.REALM].mercenary_tiers
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+
+def seeded_hierarchy(seed: int) -> Hierarchy:
+    """Иерархия на свежей копии карты с явным зерном ГПСЧ и полной казной."""
+    hierarchy = build_default_hierarchy(copy_provinces(), streams=new_streams(seed))
+    for realm in hierarchy.realms.values():
+        realm.gold = 100000
+    return hierarchy
+
+
+def hire_tiers_of(hierarchy: Hierarchy, blocks: int) -> List[int]:
+    """Найти ``blocks`` наёмников и вернуть только тиры этого найма."""
+    realm = hierarchy.realms[TestExpenditures.REALM]
+    before = len(realm.mercenary_tiers)
+    hierarchy.hire_mercenaries(TestExpenditures.REALM, blocks)
+    return list(realm.mercenary_tiers[before:])
+
+
+def hire_tiers(seed: int) -> List[int]:
+    return hire_tiers_of(seeded_hierarchy(seed), MERC_MAX_BLOCKS_PER_TURN)
