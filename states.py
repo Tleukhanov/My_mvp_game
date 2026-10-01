@@ -4,10 +4,13 @@
 титульные ожидания) и Mount & Blade: Bannerlord (экономика владений,
 лояльность как множитель налога, деревни привязаны к графству).
 
-Модуль намеренно чистый: только стандартная библиотека, без ``pygame``
-и без импортов ``world_data``. Он оперирует любым объектом-провинцией,
-у которого есть ``name``, ``owner`` и ``troops``, поэтому его можно
-перенести в отдельный серверный процесс без правок.
+Модуль чистый в смысле слоёв: без ``pygame`` и без импортов ``world_data``.
+Он оперирует любым объектом-провинцией, у которого есть ``name``,
+``owner`` и ``troops``, поэтому его можно перенести в отдельный серверный
+процесс без правок. Единственная внешняя зависимость — пакет ``sim``,
+который сам по себе состоит только из стандартной библиотеки и потому
+не создаёт цикла импортов (``sim/__init__.py`` импортирует лишь свои
+собственные подмодули и ничего из корня проекта).
 
 Ключевые решения:
 
@@ -18,6 +21,19 @@
   владеть частью чужого герцогства, и это видно игроку.
 * Числа целочисленные либо из конечного набора уровней — чтобы
   :func:`sim.hashing.state_hash` не «дрожал» из-за плавающей точки.
+
+Хеширование состояния
+---------------------
+
+**Хешировать надо :meth:`Hierarchy.to_state`, а не сам объект.**
+
+``Hierarchy`` — обычный класс, а не dataclass, поэтому
+:func:`sim.hashing.canonical` доходит до ветки ``return repr(obj)``, а
+``repr`` экземпляра содержит адрес памяти. Два одинаковых мира давали бы
+разные хеши, а ``sim.serialization.to_jsonable`` схлопывал бы иерархию в
+строку ``'<states.Hierarchy object at 0x...>'`` — то есть в потерю всего
+состояния. Правильный путь один: получить plain-dict через ``to_state()``
+и уже его хешировать. Штатная точка входа — :meth:`state_fingerprint`.
 """
 
 from __future__ import annotations
@@ -26,6 +42,10 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from sim.hashing import state_hash
+from sim.rng import NamedStreams, new_streams
+from sim.serialization import register_enum
 
 
 class Tier(IntEnum):
@@ -85,7 +105,62 @@ DEVELOPMENT_STEP = 0.1
 #: бесконечно и экономика теряет смысл.
 LEVY_UPKEEP_DIVISOR = 6
 COURT_COST_PER_VASSAL = 10
-ROYAL_COURT_COST = 30
+ROYAL_COURT_BASE_COST = 30
+#: Содержание двора растёт с престижем: блестящий двор дороже кормить.
+#: Престиж копится в ``tick_realms`` и больше нигде не тратился, то есть
+#: был мёртвым числом; теперь он — реальный сток, а не украшение UI.
+ROYAL_COURT_PRESTIGE_DIVISOR = 10
+
+#: Золота за ход за каждые 100 солдат гарнизона. До этапа 0.4 гарнизон не
+#: списывался НИГДЕ, при этом давал +2 лояльности и +1 безопасности за ход,
+#: то есть поднимал доход поселения примерно с 7 до 48 — «трата на гарнизон»
+#: была фиктивной кнопкой. Теперь гарнизон стоит денег.
+GARRISON_UPKEEP_PER_100 = 10
+
+#: Солдат гарнизона гниёт за ход, если казна не тянет содержание.
+#: 40 — примерно половина деревянной стоты: без денег гарнизон рассыпается
+#: быстро, но не мгновенно, чтобы игрок видел последствия, а не откат.
+GARRISON_ATTRITION = 40
+
+#: Потолок гарнизона на каждую ступень укреплений: ``garrison <= fort_level
+#: * GARRISON_CAP_PER_FORT``. Даёт смысл полю ``fort_level``, которое до сих
+#: пор читалось только при инициализации: деревня 0, город 100, столица 200.
+GARRISON_CAP_PER_FORT = 100
+
+#: Сколько солдат в гарнизоне содержится бесплатно. Сознательно 0: стартовые
+#: гарнизоны платные сразу. Альтернатива (сделать старт бесплатным и брать
+#: деньги только с добавленных солдат) раздувала бы стартовый баланс на
+#: ~30-40 золота в ход и отдавала игроку бесплатный доход в первые ходы.
+#: Порог оставлен как «живой» параметр на будущую настройку.
+GARRISON_IS_FREE_THRESHOLD = 0
+
+#: Версия снапшота состояния. Рост числа означает смену формата; старые
+#: снапшоты читаются через ``.get(field, default)`` и потому не ломаются.
+STATE_VERSION = 1
+
+#: Сколько записей журнала уезжает в снапшот. Длинный лог — это данные для
+#: отладки, а не состояние мира, поэтому в провод он попадает урезанным.
+LOG_KEEP = 50
+
+#: Зерно дефолтных потоков ГПСЧ. Ноль выбран как «нейтральное» значение:
+#: с ним и без явного зерна воспроизводимая симуляция остаётся
+#: воспроизводимой. Тики ГПСЧ НЕ трогают (см. ``Hierarchy.streams``).
+HIERARCHY_DEFAULT_SEED = 0
+
+#: Девять полей поселения, которые иерархия действительно знает. Всё
+#: остальное у провинции — геометрия и данные мирового слоя, сюда не входит.
+COUNTY_FIELD_DEFAULTS: Dict[str, object] = {
+    "duchy_id": None,
+    "hearths": 0,
+    "prosperity": 0,
+    "loyalty": 0,
+    "security": 0,
+    "development": 1,
+    "fort_level": 0,
+    "garrison": 0,
+    "villages": 0,
+}
+COUNTY_FIELDS: Tuple[str, ...] = tuple(COUNTY_FIELD_DEFAULTS)
 
 #: Население поселений (hearths). Масштаб подобран так, чтобы доход
 #: с одного графства был единицами, а не сотнями — иначе казна
@@ -183,6 +258,19 @@ _RANK_TO_TIER = {
     TitleRank.DUKE: Tier.DUCHY,
     TitleRank.KING: Tier.REALM,
 }
+
+#: Регистрируем Enum'ы в реестре ``sim.serialization`` на уровне модуля.
+#: ``register_enum`` идемпотентен (обычная запись в dict), поэтому повторный
+#: импорт states.py ничего не ломает. Без регистрации ``from_jsonable``
+#: не смогла бы отличить ``TitleRank`` от любого другого Enum и вернула бы
+#: голую строку вместо члена перечисления.
+#:
+#: Обратите внимание: ``from_state`` перечисления восстанавливает ЯВНО
+#: (``TitleRank(...)`` / ``Tier(...)``), а не через реестр. Реестр нужен
+#: для внешних потребителей (``sim.loads``), а не для нас — так версия
+#: формата не зависит от того, успел ли кто-то импортировать states.
+register_enum(TitleRank)
+register_enum(Tier)
 
 
 @dataclass
@@ -310,6 +398,15 @@ class Hierarchy:
 
     Работает со списком провинций-объектов (duck typing) и с тремя
     словарями-реестрами. Ничего не знает про pygame и про отрисовку.
+
+    Про ГПСЧ. Потоки лежат на объекте, но **до этапа 3 ни один тик их не
+    трогает**: ни ``tick_counties``, ни ``tick_vassals``, ни ``tick_realms``,
+    ни ``end_turn`` не делают ни одного броска. Это осознанное ограничение,
+    а не забывчивость — иначе семь тестов детерминизма разошлись бы по
+    хешу. Броски допускаются только в новых явных методах-командах
+    («нанять гарнизон», «разорить провинцию» и т.п.), где игрок задал
+    случайность явно. Поэтому ``streams`` можно не передавать: дефолтный
+    набор потоков не влияет на состояние мира.
     """
 
     def __init__(
@@ -319,6 +416,7 @@ class Hierarchy:
         realms: Optional[Dict[str, Realm]] = None,
         characters: Optional[Dict[str, Character]] = None,
         contracts: Optional[Dict[str, VassalContract]] = None,
+        streams: Optional[NamedStreams] = None,
     ):
         self.provinces = provinces
         self.duchies: Dict[str, Duchy] = duchies if duchies is not None else {}
@@ -326,10 +424,28 @@ class Hierarchy:
         self.characters: Dict[str, Character] = characters if characters is not None else {}
         #: ключ — id вассала, значение — контракт с сюзереном.
         self.contracts: Dict[str, VassalContract] = contracts if contracts is not None else {}
+        #: именованные потоки ГПСЧ. ВНЕШНИЙ источник энтропии: снапшот
+        #: его не содержит (см. ``to_state``), при восстановлении потоки
+        #: задаются заново конструктором.
+        self.streams: NamedStreams = streams if streams is not None else new_streams(
+            HIERARCHY_DEFAULT_SEED)
         self.turn: int = 1
         self.log: List[str] = []
+        #: True, если журнал хоть раз упирался в ``LOG_KEEP``. Хранится в
+        #: состоянии, а не вычисляется по ``len(self.log)``, иначе снапшот
+        #: после round-trip выглядел бы иначе, чем до него.
+        self.log_truncated: bool = False
         self._province_duchy: Dict[int, str] = {}
         self._rebuild_province_index()
+
+    # ---------------- журнал ----------------
+
+    def _append_log(self, entries: Sequence[str]) -> None:
+        """Дописать события в журнал, подрезав его до ``LOG_KEEP``."""
+        self.log.extend(entries)
+        if len(self.log) > LOG_KEEP:
+            del self.log[:len(self.log) - LOG_KEEP]
+            self.log_truncated = True
 
     # ---------------- индексы и доступ ----------------
 
@@ -467,6 +583,42 @@ class Hierarchy:
         base = getattr(p, "hearths", 0) // 2
         return max(0, int(base * development_tax_multiplier(dev)))
 
+    def garrison_cap(self, province_idx: int) -> int:
+        """Потолок гарнизона: ``(fort_level + 1) * GARRISON_CAP_PER_FORT``.
+
+        Даёт ``fort_level`` смысл: деревня держит сотню, город — две,
+        крепость-столица — три. Без стен гарнизон всё равно держать
+        можно, но дороже и меньше.
+
+        ВАЖНО: потолок НЕ применяется автоматически в тиках. Причина
+        чистая: существующие тесты (``test_loyalty_rises_with_garrison``)
+        ставят гарнизон в деревню и ждут от него роста лояльности — то
+        есть «нелегальный» гарнизон должен продолжать работать. Сжимать
+        гарнизон до потолка будет команда найма (этап 3), где игрок
+        задаёт число солдат явно; до тех пор порог только спрашивается,
+        но не принуждает.
+        """
+        fort = max(0, int(getattr(self.province(province_idx), "fort_level", 0)))
+        return (fort + 1) * GARRISON_CAP_PER_FORT
+
+    def garrison_upkeep(self, realm_id: str) -> int:
+        """Содержание гарнизонов королевства за ход, в золоте.
+
+        Считается **только по провинциям ЭТОГО realm'а** — гарнизоны
+        нейтральных и чужих земель никто не кормит. Первые
+        ``GARRISON_IS_FREE_THRESHOLD`` солдат на провинцию бесплатны
+        (сейчас это ноль, то есть платный весь гарнизон).
+        """
+        total = 0
+        for idx in self.provinces_of_realm(realm_id):
+            billable = max(0, int(getattr(self.province(idx), "garrison", 0))
+                           - GARRISON_IS_FREE_THRESHOLD)
+            # пропорционально, а не «по сотням»: иначе гарнизон в 99 солдат
+            # бесплатен, а разорённое королевство стягивает войска до 99
+            # и больше не платит ничего (обход содержания)
+            total += billable * GARRISON_UPKEEP_PER_100 // 100
+        return total
+
     def duchy_income(self, duchy_id: str) -> int:
         return sum(self.county_income(i) for i in self.counties_of_duchy(duchy_id))
 
@@ -572,15 +724,38 @@ class Hierarchy:
 
         Равновесие без гарнизона — около 55 лояльности (поселение не
         умирает, но и не процветает); с гарнизоном лояльность растёт до
-        100. Поэтому гарнизон стоит денег, а его отсутствие не убивает
-        поселение, но лишает его полного дохода.
+        100. Поэтому гарнизон стоит денег (см. ``garrison_upkeep``), а его
+        отсутствие не убивает поселение, но лишает его полного дохода.
+
+        Здесь же — атриция гарнизонов. Проверка «может ли королевство
+        заплатить» делается по золоту, которое доступно **на момент входа
+        в фазу**: порядок ``end_turn`` такой (``tick_counties`` ->
+        ``tick_vassals`` -> ``tick_realms``), поэтому здесь видно золото
+        ПРОШЛОГО хода, а текущий доход ещё не начислен. Это нормально и
+        полностью детерминировано — простое сравнение с золотом после
+        начисления зависело бы от ``tick_realms``, который ещё не шёл.
         """
         events: List[str] = []
+        # индекс нация -> королевство: иначе на каждую провинцию пришлось бы
+        # перебирать все realm'ы. Строится заново каждый тик, чтобы внешний
+        # код мог спокойно перекрашивать карту между ходами.
+        realm_of_nation = {realm.nation: realm_id for realm_id, realm in self.realms.items()}
+        # казна прошлого хода: не хватило — гарнизон гниёт
+        broke = {realm_id for realm_id in self.realms
+                 if self.realms[realm_id].gold < self.garrison_upkeep(realm_id)}
         for idx, p in enumerate(self.provinces):
             loyalty = getattr(p, "loyalty", 70)
             garrison = getattr(p, "garrison", 0)
             prosperity = getattr(p, "prosperity", 0)
             security = getattr(p, "security", 10)
+
+            # атриция: казна не тянет содержание — гарнизон рассыпается
+            realm_id = realm_of_nation.get(getattr(p, "owner", None))
+            if garrison > 0 and realm_id is not None and realm_id in broke:
+                garrison = max(0, garrison - GARRISON_ATTRITION)
+                p.garrison = garrison
+                if garrison == 0:
+                    events.append(f"Гарнизон #{idx} рассыпался: казна пуста")
 
             if garrison > 0:
                 loyalty += 2
@@ -650,13 +825,26 @@ class Hierarchy:
         return events
 
     def realm_upkeep(self, realm_id: str) -> int:
-        """Содержание королевства: левейс на стену, двор вассалов, резиденция."""
+        """Содержание королевства: левейс на стену, двор вассалов, гарнизоны.
+
+        Из чего складывается:
+
+        * левейс realm'а, делённый на ``LEVY_UPKEEP_DIVISOR``;
+        * ``COURT_COST_PER_VASSAL`` за каждого прямого вассала правителя;
+        * содержание гарнизонов **этого** королевства (см.
+          ``garrison_upkeep``) — гарнизон больше не бесплатный;
+        * ``ROYAL_COURT_BASE_COST`` плюс ``престиж // 10`` — блестящий
+          двор дороже содержать, поэтому престиж стал стоком, а не
+          мёртвым числом.
+        """
         realm = self.realms[realm_id]
         upkeep = self.realm_levy(realm_id) // LEVY_UPKEEP_DIVISOR
         ruler = realm.ruler_id
         if ruler:
             upkeep += COURT_COST_PER_VASSAL * len(self.vassals_of(ruler))
-        return upkeep + ROYAL_COURT_COST
+        upkeep += self.garrison_upkeep(realm_id)
+        return upkeep + ROYAL_COURT_BASE_COST + max(0, realm.prestige) // \
+            ROYAL_COURT_PRESTIGE_DIVISOR
 
     def tick_realms(self) -> List[str]:
         """Казна королевств: доход минус содержание левейса и двора."""
@@ -681,13 +869,18 @@ class Hierarchy:
         return events
 
     def end_turn(self) -> List[str]:
-        """Один ход экономики. Порядок фиксирован — детерминизм для онлайна."""
+        """Один ход экономики. Порядок фиксирован — детерминизм для онлайна.
+
+        Ни одна из фаз не обращается к ``self.streams``: ход — чистая
+        функция состояния, поэтому хеш мира не «дрожит» от того, откуда
+        взялись случайные числа. Броски живут только в командах.
+        """
         events: List[str] = []
         events += self.tick_counties()
         events += self.tick_vassals()
         events += self.tick_realms()
         self.turn += 1
-        self.log.extend(events)
+        self._append_log(events)
         return events
 
     def rebellions(self) -> List[str]:
@@ -712,6 +905,246 @@ class Hierarchy:
                            for c in sorted(self.characters.values(), key=lambda x: x.id)},
         }
 
+    # ---------------- сериализация состояния ----------------
+
+    def to_state(self) -> Dict[str, object]:
+        """Снапшот состояния в виде plain-dict, пригодный для хеша и JSON.
+
+        Возвращаемый словарь — единственный честный представитель мира:
+        ``sim.hashing.state_hash`` и ``sim.serialization.to_jsonable`` умеют
+        канонизировать dict, но не класс ``Hierarchy``.
+
+        Что внутри: ``version``, ``turn``, урезанный ``log`` с признаком
+        усечения, все поля ``Realm``/``Duchy``/``Character``, контракты
+        (только ``liege_id``/``vassal_id``/``level``) и девять полей
+        поселения по каждой провинции.
+
+        Чего здесь НЕТ и почему:
+
+        * ``self.provinces`` целиком. Геометрия (полигоны, центроиды, имена
+          соседей, ``troops``) принадлежит мировому слою; ``states.py`` по
+          контракту о ней не знает и оперирует любым duck-объектом. Если бы
+          мы тащили геометрию в снапшот, иерархия перестала бы переноситься
+          в отдельный серверный процесс, а карта и её 149 тестов зависели бы
+          от порядка сохранения. Провинции приходят в ``from_state`` параметром.
+        * ``_province_duchy``. Производный кэш «индекс провинции -> герцогство»,
+          целиком восстанавливается вызовом ``_rebuild_province_index()`` в
+          конструкторе. Хранить его — значило бы хранить redundancy, которая
+          может разойтись с ``duchies``.
+        * ``streams``. ГПСЧ — внешний источник энтропии, а не состояние мира:
+          его положение нужно только для продолжения бросков. При загрузке
+          чужого снапшота «продолжить броски» всё равно бессмысленно, поэтому
+          потоки задаются конструктором.
+        * ``linked_general``. Внешняя ссылка на объект из другого слоя
+          (генерал армии), которая к тому же меняется каждый ход. Сериализовать
+          её нельзя — сломается контракт изоляции модуля.
+        * Ничего из ``sim/``. Фолбэк ``repr`` в ``sim/serialization.py``
+          закреплён тестами ``test_sim.py``, и править его отсюда нельзя.
+
+        Порядок ключей детерминирован (реестры — по отсортированным id),
+        так что ``state_hash`` от двух одинаковых миров совпадает.
+        """
+        state: Dict[str, object] = {
+            "version": STATE_VERSION,
+            "turn": self.turn,
+            "log": list(self.log[-LOG_KEEP:]),
+            "log_truncated": self.log_truncated or len(self.log) > LOG_KEEP,
+            "realms": {r.id: {
+                "id": r.id,
+                "name": r.name,
+                "nation": r.nation,
+                "ruler_id": r.ruler_id,
+                "capital_idx": r.capital_idx,
+                "gold": r.gold,
+                "prestige": r.prestige,
+                "stability": r.stability,
+                "crown_authority": r.crown_authority,
+                "tax_policy": r.tax_policy,
+                "is_player": r.is_player,
+            } for r in sorted(self.realms.values(), key=lambda x: x.id)},
+            "duchies": {d.id: {
+                "id": d.id,
+                "name": d.name,
+                # de_jure_provinces — tuple: иначе JSON вернул бы список
+                # и round-trip тихо сменил бы тип поля.
+                "de_jure_provinces": tuple(d.de_jure_provinces),
+                "holder_id": d.holder_id,
+                "realm_id": d.realm_id,
+                "development": d.development,
+                "siege_safety": d.siege_safety,
+            } for d in sorted(self.duchies.values(), key=lambda x: x.id)},
+            "characters": {c.id: {
+                "id": c.id,
+                "name": c.name,
+                "nation": c.nation,
+                # enum как его собственное имя: не полагаемся на реестр
+                # register_enum и не тащим служебные теги в формат.
+                "rank": c.rank.name,
+                "realm_id": c.realm_id,
+                "duchy_id": c.duchy_id,
+                "province_idx": c.province_idx,
+                "gold": c.gold,
+                "influence": c.influence,
+                "loyalty": c.loyalty,
+                "opinion_of_liege": c.opinion_of_liege,
+                "contract_level": c.contract_level,
+                "martial": c.martial,
+                "stewardship": c.stewardship,
+                "diplomacy": c.diplomacy,
+                "age": c.age,
+                "alive": c.alive,
+                "traits": tuple(c.traits),
+                "heir": c.heir,
+                "landless_turns": c.landless_turns,
+            } for c in sorted(self.characters.values(), key=lambda x: x.id)},
+            "contracts": {vassal_id: {
+                "liege_id": c.liege_id,
+                "vassal_id": c.vassal_id,
+                "level": c.level,
+            } for vassal_id, c in sorted(self.contracts.items())},
+            "counties": {
+                idx: {name: getattr(p, name, default)
+                      for name, default in COUNTY_FIELD_DEFAULTS.items()}
+                for idx, p in enumerate(self.provinces)
+            },
+        }
+        return state
+
+    def state_fingerprint(self) -> str:
+        """Хеш состояния мира. Единственная точка хеширования иерархии.
+
+        Именно ``state_hash(self.to_state())``, а НЕ ``state_hash(self)``:
+        ``Hierarchy`` не dataclass, поэтому ``canonical`` уходит в
+        ``repr(obj)``, а ``repr`` содержит адрес памяти — два одинаковых
+        мира получили бы разные хеши. См. докстринг модуля.
+        """
+        return state_hash(self.to_state())
+
+    @staticmethod
+    def from_state(state: Dict[str, object], provinces: Sequence,
+                   streams: Optional[NamedStreams] = None) -> "Hierarchy":
+        """Восстановить иерархию из снапшота ``to_state()``.
+
+        ``provinces`` — внешний мир: список тех же duck-объектов, что и при
+        сохранении. Иерархия не создаёт и не копирует провинции, а только
+        переносит на них девять полей поселения. Геометрия, владельцы и
+        войска остаются такими, какими были в мировом слое.
+
+        Все поля читаются через ``.get(field, default)``: старый или
+        частично заполненный снапшот обязан загружаться, а не падать. Отсюда
+        же дефолты берутся у самих dataclass — источник правды один.
+
+        enum'ы восстанавливаются ЯВНО (``TitleRank(...)`` / ``Tier(...)``), а
+        не через реестр ``sim.serialization``: так восстановление не зависит
+        от того, был ли импортирован модуль с ``register_enum``. Ключи
+        ``counties`` приходят из JSON строками — приводим к ``int``.
+        """
+        realms: Dict[str, Realm] = {}
+        for realm_id, data in dict(state.get("realms") or {}).items():
+            data = dict(data)
+            realms[realm_id] = Realm(
+                id=data.get("id", realm_id),
+                name=data.get("name", realm_id),
+                nation=data.get("nation", "neutral"),
+                ruler_id=data.get("ruler_id"),
+                capital_idx=data.get("capital_idx"),
+                gold=data.get("gold", 500),
+                prestige=data.get("prestige", 0),
+                stability=data.get("stability", 100),
+                crown_authority=data.get("crown_authority", 2),
+                tax_policy=data.get("tax_policy", 0),
+                is_player=bool(data.get("is_player", False)),
+            )
+
+        duchies: Dict[str, Duchy] = {}
+        for duchy_id, data in dict(state.get("duchies") or {}).items():
+            data = dict(data)
+            duchies[duchy_id] = Duchy(
+                id=data.get("id", duchy_id),
+                name=data.get("name", duchy_id),
+                # обратно в tuple: JSON отдаёт list
+                de_jure_provinces=tuple(data.get("de_jure_provinces") or ()),
+                holder_id=data.get("holder_id"),
+                realm_id=data.get("realm_id"),
+                development=data.get("development", 1),
+                siege_safety=data.get("siege_safety", 0),
+            )
+
+        characters: Dict[str, Character] = {}
+        for ch_id, data in dict(state.get("characters") or {}).items():
+            data = dict(data)
+            raw_rank = data.get("rank", TitleRank.BARON.name)
+            if isinstance(raw_rank, TitleRank):
+                rank = raw_rank
+            else:
+                try:
+                    rank = TitleRank[raw_rank]
+                except KeyError:
+                    try:
+                        rank = TitleRank(raw_rank)
+                    except ValueError:
+                        rank = TitleRank.BARON
+            traits = data.get("traits") or ()
+            if isinstance(traits, str):
+                traits = (traits,)
+            characters[ch_id] = Character(
+                id=data.get("id", ch_id),
+                name=data.get("name", ch_id),
+                nation=data.get("nation", "neutral"),
+                rank=rank,
+                realm_id=data.get("realm_id"),
+                duchy_id=data.get("duchy_id"),
+                province_idx=data.get("province_idx"),
+                gold=data.get("gold", 0),
+                influence=data.get("influence", 10),
+                loyalty=data.get("loyalty", 70),
+                opinion_of_liege=data.get("opinion_of_liege", 20),
+                contract_level=data.get("contract_level", 2),
+                martial=data.get("martial", 5),
+                stewardship=data.get("stewardship", 5),
+                diplomacy=data.get("diplomacy", 5),
+                age=data.get("age", 30),
+                alive=bool(data.get("alive", True)),
+                # обратно в tuple: JSON отдаёт list
+                traits=tuple(traits),
+                heir=data.get("heir"),
+                landless_turns=data.get("landless_turns", 0),
+            )
+
+        contracts: Dict[str, VassalContract] = {}
+        for vassal_id, data in dict(state.get("contracts") or {}).items():
+            data = dict(data)
+            contracts[vassal_id] = VassalContract(
+                liege_id=data.get("liege_id", ""),
+                vassal_id=data.get("vassal_id", vassal_id),
+                level=data.get("level", 2),
+            )
+
+        hierarchy = Hierarchy(provinces, duchies, realms, characters, contracts,
+                              streams=streams)
+
+        for raw_idx, data in dict(state.get("counties") or {}).items():
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= idx < len(provinces):
+                continue
+            province = provinces[idx]
+            # только белый список полей: битый снапшот не должен уметь
+            # дописать в провинцию произвольный атрибут
+            for name, default in COUNTY_FIELD_DEFAULTS.items():
+                setattr(province, name, dict(data).get(name, default))
+
+        hierarchy.turn = int(state.get("turn", 1))
+        log = state.get("log") or []
+        hierarchy.log = list(log)
+        # признак усечения берём из снапшота, а не вычисляем заново:
+        # иначе состояние, обрезанное при сохранении, после round-trip
+        # выглядело бы полным и отличалось хешем от исходного.
+        hierarchy.log_truncated = bool(state.get("log_truncated", False))
+        return hierarchy
+
 
 def _duchy_province_map() -> Dict[int, str]:
     """Индекс провинции -> id герцогства (de jure)."""
@@ -722,12 +1155,24 @@ def _duchy_province_map() -> Dict[int, str]:
     return mapping
 
 
-def build_default_hierarchy(provinces: Sequence) -> Hierarchy:
+def build_default_hierarchy(provinces: Sequence,
+                           streams: Optional[NamedStreams] = None) -> Hierarchy:
     """Строит иерархию по текущей карте: 3 королевства, 6 герцогов, 12 баронов.
 
     Провинции получают ``duchy_id``, ``hearths``, ``prosperity``, ``loyalty``,
-    ``security``, ``development``, ``garrison`` и ``villages`` с дефолтами —
-    старые тесты, читающие ``owner``/``region_type``, продолжают работать.
+    ``security``, ``development``, ``fort_level``, ``garrison`` и ``villages``
+    с дефолтами — старые тесты, читающие ``owner``/``region_type``,
+    продолжают работать.
+
+    ``fort_level`` выставляется как 0/1/2 (деревня/город/столица), и именно
+    он задаёт потолок гарнизона в ``garrison_cap``: до этапа 0.4 поле было
+    заполнено, но не читалось нигде, то есть было мёртвым. Стартовый
+    гарнизон (0/100/200) ровно упирается в этот потолок.
+
+    ``streams`` — симметрично конструктору ``Hierarchy``: ``None`` означает
+    ``new_streams(HIERARCHY_DEFAULT_SEED)``. Параметр нужен для явной
+    фиксации зерна в тестах и реплеях; на стартовое состояние он не влияет,
+    потому что ни одна фаза хода ГПСЧ не трогает.
     """
     duchies: Dict[str, Duchy] = {}
     realms: Dict[str, Realm] = {}
@@ -803,7 +1248,7 @@ def build_default_hierarchy(provinces: Sequence) -> Hierarchy:
             p.fort_level = 1
             p.garrison = 100
 
-    return Hierarchy(provinces, duchies, realms, characters, contracts)
+    return Hierarchy(provinces, duchies, realms, characters, contracts, streams=streams)
 
 
 def auto_inherit(hierarchy: Hierarchy) -> List[str]:

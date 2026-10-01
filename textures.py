@@ -96,6 +96,34 @@ RIVER_DARK = (90, 110, 145)
 RIVER_LIGHT = (165, 185, 210)
 
 
+#: Кэш шрифтов модульного уровня. SysFont на каждого генерала каждый кадр —
+#: это 2-6 мс чистого пересоздания одних и тех же объектов Font.
+_FONT_CACHE: Dict[Tuple[object, int], pygame.font.Font] = {}
+
+
+def _cached_font(name, size: int) -> pygame.font.Font:
+    """Шрифт из кэша по паре (имя, размер).
+
+    Готовый объект Font переиспользуется, поэтому подписи генералов больше не
+    пересоздают шрифт каждый кадр. Если pygame.font ещё не инициализирован —
+    инициализируем на лету. Если системного шрифта с таким именем нет,
+    результат отката (шрифт по умолчанию) тоже кэшируется, чтобы не повторять
+    исключение каждый кадр.
+    """
+    key = (name, int(size))
+    font = _FONT_CACHE.get(key)
+    if font is not None:
+        return font
+    if not pygame.font.get_init():
+        pygame.font.init()
+    try:
+        font = pygame.font.SysFont(name, int(size))
+    except Exception:
+        font = pygame.font.SysFont(None, int(size))
+    _FONT_CACHE[key] = font
+    return font
+
+
 #: Текстуры провинций рисуются в уменьшенном разрешении и растягиваются.
 #: Пергамент — фон под подписями, детализация ему не нужна, а экономия
 #: в 4 раза по пикселям превращает минуту ожидания в пару секунд.
@@ -416,10 +444,7 @@ class GeneralIcon:
             pygame.draw.polygon(surface, (150, 145, 130), flag, 1)
         # табличка с именем под флагом
         if label:
-            try:
-                f = pygame.font.SysFont("serif", max(10, int(12 * s)))
-            except Exception:
-                f = pygame.font.SysFont(None, max(10, int(12 * s)))
+            f = _cached_font("serif", max(10, int(12 * s)))
             txt = f.render(label, True, (240, 230, 200))
             bg = pygame.Surface((txt.get_width() + 6, txt.get_height() + 2), pygame.SRCALPHA)
             bg.fill((20, 18, 12, 190))

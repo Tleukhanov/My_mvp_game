@@ -2,7 +2,7 @@ import pygame
 import sys
 import math
 import random
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from world_data import (
     SCREEN_WIDTH, SCREEN_HEIGHT,
     COLOR_OCEAN, COLOR_OCEAN_LIGHT, COLOR_LAND, COLOR_RIVER,
@@ -40,6 +40,25 @@ _RANK_TINT = {
 
 # Нации в порядке показа в панели владений: игрок всегда первый.
 _PANEL_NATION_ORDER = ("blue", "red", "green")
+
+# Размер панели владений. Задаётся один раз, потому что панель рисуется
+# в собственную поверхность этого размера.
+_PANEL_W, _PANEL_H = 700, 560
+
+# Потолок кэша строк: заполненный кэш сбрасывается целиком, иначе он
+# рос бы бесконечно при смене чисел в хинтах и тултипах.
+_TEXT_CACHE_LIMIT = 2000
+
+# Маркер «в кэше ничего нет» — им кэшируются и значения None.
+_MISSING = object()
+
+# Ключи кэша вычислений: (метка, аргумент) -> значение.
+_TC_DUCHIES = "duchies"
+_TC_HOLDER = "holder"
+_TC_CONTRACT = "contract"
+_TC_COUNTY_INCOME = "county_income"
+_TC_DUCHY_INCOME = "duchy_income"
+_TC_DUCHY_LEVY = "duchy_levy"
 
 
 class WorldMapScreen:
@@ -113,6 +132,37 @@ class WorldMapScreen:
 
         self.tex_manager = TextureManager()
         self._build_province_offsets()
+        self._build_static_surfaces()
+
+    def _build_static_surfaces(self):
+        """Поверхности, которые больше не меняются: затемнения и панель владений.
+
+        Затемнение раньше создавалось заново в каждом кадре: это ~6.7 МБ
+        аллокации плюс fill и blit на 1.66 млн пикселей — 8-16 мс на кадр.
+        Теперь оно готовится один раз после set_mode и просто блитится.
+        """
+        def _dim(alpha: int) -> pygame.Surface:
+            surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            surf.fill((0, 0, 0, alpha))
+            return surf
+
+        # общее затемнение панелей владений и дипломатии
+        self._dim_surface = _dim(120)
+        # затемнение финала партии
+        self._dim_surface_strong = _dim(150)
+        # мягкое затемнение под всплывающим текстом
+        self._dim_surface_soft = _dim(80)
+        # панель владений рисуется один раз и копируется на экран целиком
+        self._panel_surface = pygame.Surface((_PANEL_W, _PANEL_H), pygame.SRCALPHA)
+        self._panel_dirty = True
+        # под что именно нарисована панель: (ход, нация, выделение)
+        self._panel_state: Optional[Tuple] = None
+        # кэш отрендеренных строк: ключ — (текст, размер шрифта, bold, цвет)
+        self._text_cache: Dict[Tuple[str, int, bool, Tuple[int, int, int]],
+                               pygame.Surface] = {}
+        # ленивый кэш вычислений, привязанный к номеру хода
+        self._turn_cache: Dict[Tuple[str, object], object] = {}
+        self._turn_cache_turn: Optional[int] = None
 
     def _build_connection_index(self):
         self._conn_by_province = {}
@@ -167,6 +217,7 @@ class WorldMapScreen:
 
     def _handle_events(self):
         for event in pygame.event.get():
+            sel_before = self.selected_general
             if event.type == pygame.QUIT:
                 self.running = False
 
@@ -194,6 +245,9 @@ class WorldMapScreen:
                     self._clamp_camera()
                 elif event.key in (pygame.K_v, pygame.K_c):
                     self._show_ownership = not self._show_ownership
+                    if self._show_ownership:
+                        # открыли панель — содержимое рисуется заново
+                        self._invalidate_panel()
                 elif event.key == pygame.K_TAB:
                     self._show_diplomacy = not self._show_diplomacy
                 elif self._show_ownership:
@@ -276,6 +330,10 @@ class WorldMapScreen:
                         self.cam_y = self._rmb_cam_start[1] - dy
                         self._clamp_camera()
 
+            if self.selected_general is not sel_before:
+                # смена выделения тоже считается поводом перерисовать панель
+                self._invalidate_panel()
+
     def _handle_map_click(self, mx: int, my: int, via_right: bool = False):
         if my >= SCREEN_HEIGHT - 80:
             return
@@ -339,11 +397,13 @@ class WorldMapScreen:
             target.owner = general.nation
             general.province_idx = target_idx
             general.moved = True
+            self._invalidate_panel()
             self._show_msg(f"{target.name} захвачена!")
         elif target.owner == general.nation:
             target.troops += general.troops // 10
             general.province_idx = target_idx
             general.moved = True
+            self._invalidate_panel()
         else:
             rel = self.diplomacy.get_relation(general.nation, target.owner)
             if rel == Relation.WAR:
@@ -352,6 +412,7 @@ class WorldMapScreen:
                     target.troops = 0
                     general.province_idx = target_idx
                     general.moved = True
+                    self._invalidate_panel()
                     self._show_msg(f"{target.name} захвачена!")
                 else:
                     self._start_battle_with_region(general, target)
@@ -405,6 +466,7 @@ class WorldMapScreen:
             general.troops = max(0, general.troops - losses)
             region.troops = max(0, region.troops - int(region.troops * 0.3))
             self._battle_result = f"{general.name} отбит от {region.name}!"
+        self._invalidate_panel()
         self._battle_timer = 3.0
 
     def _show_msg(self, msg: str):
@@ -436,9 +498,11 @@ class WorldMapScreen:
             return
         if self._ownership_nation not in nations:
             self._ownership_nation = nations[0]
+            self._invalidate_panel()
             return
         idx = nations.index(self._ownership_nation)
         self._ownership_nation = nations[(idx + direction) % len(nations)]
+        self._invalidate_panel()
 
     def _diplomacy_action(self, relation: Relation):
         if not self._diplomacy_target:
@@ -454,6 +518,8 @@ class WorldMapScreen:
             g.moved = False
         self._ai_turn()
         self._tick_ownership()
+        # ход сменился: кэш вычислений и панель владений больше не действительны
+        self._invalidate_panel()
 
     def _tick_ownership(self):
         """Экономика владений за ход. В лог идёт всё, на экран — только важное."""
@@ -610,6 +676,73 @@ class WorldMapScreen:
         self._zoom_cache[ckey] = scaled
         return scaled
 
+    # ---------------- кэши ----------------
+
+    def _cached_text(self, font, text: str, color) -> pygame.Surface:
+        """Отрисованная строка из кэша.
+
+        Ключ — (текст, размер шрифта, bold, цвет). Шрифты экрана создаются
+        один раз в __init__ и больше не меняются, поэтому такая четвёрка
+        однозначно задаёт картинку: заголовки, хинты и подписи городов
+        перестают прогоняться через font.render каждый кадр.
+        """
+        try:
+            size = font.get_point_size()
+        except Exception:
+            size = font.get_height()
+        key = (text, size, bool(font.get_bold()), tuple(color))
+        surf = self._text_cache.get(key)
+        if surf is None:
+            if len(self._text_cache) >= _TEXT_CACHE_LIMIT:
+                # дешевле сбросить целиком, чем следить за устаревшими ключами
+                self._text_cache.clear()
+            surf = font.render(text, True, color)
+            self._text_cache[key] = surf
+        return surf
+
+    def _invalidate_panel(self):
+        """Сбросить кэш вычислений и пометить панель владений на перерисовку."""
+        self._turn_cache = {}
+        self._turn_cache_turn = None
+        self._panel_dirty = True
+
+    def _turn_cached(self, key: Tuple[str, object], compute):
+        """Ленивый кэш, живущий один ход.
+
+        Владения нации, доходы и levy между ходами не меняются, но считались
+        заново каждый кадр. Кэш живёт до смены номера хода или явного сброса
+        (захват провинции, смена нации панели).
+        """
+        if self._turn_cache_turn != self._turn:
+            self._turn_cache = {}
+            self._turn_cache_turn = self._turn
+        val = self._turn_cache.get(key, _MISSING)
+        if val is _MISSING:
+            # маркер нужен, чтобы кэшировать и None — «без держателя» и т.п.
+            val = compute()
+            self._turn_cache[key] = val
+        return val
+
+    def _county_income(self, idx: int) -> int:
+        return self._turn_cached((_TC_COUNTY_INCOME, idx),
+                                 lambda: self.hierarchy.county_income(idx))
+
+    def _duchy_income(self, duchy_id: str) -> int:
+        return self._turn_cached((_TC_DUCHY_INCOME, duchy_id),
+                                 lambda: self.hierarchy.duchy_income(duchy_id))
+
+    def _duchy_levy(self, duchy_id: str) -> int:
+        return self._turn_cached((_TC_DUCHY_LEVY, duchy_id),
+                                 lambda: self.hierarchy.duchy_levy(duchy_id))
+
+    def _holder_of_duchy(self, duchy_id: str):
+        return self._turn_cached((_TC_HOLDER, duchy_id),
+                                 lambda: self.hierarchy.holder_of_duchy(duchy_id))
+
+    def _contract_of(self, vassal_id: str):
+        return self._turn_cached((_TC_CONTRACT, vassal_id),
+                                 lambda: self.hierarchy.contract_of(vassal_id))
+
     def _render(self):
         view_h = SCREEN_HEIGHT - 80
         ocean = self.tex_manager.get_ocean_texture(SCREEN_WIDTH, view_h)
@@ -702,9 +835,9 @@ class WorldMapScreen:
                 pygame.draw.circle(self.screen, (240, 235, 215), (sx, sy), 4)
                 pygame.draw.circle(self.screen, (20, 18, 12), (sx, sy), 2)
             name = prov.name
-            # тень + светлый текст
-            shadow = font.render(name, True, (25, 22, 12))
-            text = font.render(name, True, (242, 236, 214))
+            # тень + светлый текст (строки из кэша — подписи не меняются)
+            shadow = self._cached_text(font, name, (25, 22, 12))
+            text = self._cached_text(font, name, (242, 236, 214))
             self.screen.blit(shadow, (sx + 8 + 1, sy - 12 + 1))
             self.screen.blit(text, (sx + 8, sy - 12))
 
@@ -751,15 +884,16 @@ class WorldMapScreen:
         hud_y = SCREEN_HEIGHT - 80
         pygame.draw.rect(self.screen, COLOR_HUD_BG, (0, hud_y, SCREEN_WIDTH, 80))
 
-        turn_text = self.font_hud.render(
+        turn_text = self._cached_text(
+            self.font_hud,
             f"Turn: {self._turn} | LMB/RMB: select+move | Wheel:+/-: zoom | WASD: pan | SPACE: turn | TAB: dipl | V: holdings | 0: reset",
-            True, COLOR_HUD_TEXT
+            COLOR_HUD_TEXT
         )
         self.screen.blit(turn_text, (12, hud_y + 4))
         # тултип ховера
         if self._hover_province is not None:
             lines = self._hover_tip_lines(self._hover_province)
-            tips = [self.font_hud.render(t, True, (245, 238, 218)) for t in lines]
+            tips = [self._cached_text(self.font_hud, t, (245, 238, 218)) for t in lines]
             tw = max(t.get_width() for t in tips)
             th = sum(t.get_height() for t in tips)
             tx = min(max(self._mouse_pos[0] + 14, 4), SCREEN_WIDTH - tw - 8)
@@ -773,17 +907,19 @@ class WorldMapScreen:
                 cy += t.get_height()
 
         nation = WORLD_NATIONS[PLAYER_NATION]
-        info = self.font_hud.render(
+        info = self._cached_text(
+            self.font_hud,
             f"{nation.name} | Gold: {nation.gold}",
-            True, nation.color
+            nation.color
         )
         self.screen.blit(info, (12, hud_y + 22))
 
         generals_info = [f"{g.name}({g.troops})" for g in self.generals
                          if g.nation == PLAYER_NATION]
-        gen_text = self.font_hud.render(
+        gen_text = self._cached_text(
+            self.font_hud,
             f"Generals: {', '.join(generals_info)}",
-            True, COLOR_HUD_TEXT_DIM
+            COLOR_HUD_TEXT_DIM
         )
         self.screen.blit(gen_text, (12, hud_y + 40))
 
@@ -794,7 +930,7 @@ class WorldMapScreen:
         for nation_key in ["red", "blue", "green"]:
             count = provinces_count.get(nation_key, 0)
             n = WORLD_NATIONS[nation_key]
-            rt = self.font_hud.render(f"{n.name}: {count}", True, n.color)
+            rt = self._cached_text(self.font_hud, f"{n.name}: {count}", n.color)
             rx -= rt.get_width() + 16
             self.screen.blit(rt, (rx, hud_y + 4))
 
@@ -802,9 +938,10 @@ class WorldMapScreen:
             sel = self.selected_general
             adj = self._adjacent_provinces(sel.province_idx)
             adj_names = [self.provinces[i].name[:8] for i in adj[:5]]
-            sel_text = self.font_hud.render(
+            sel_text = self._cached_text(
+                self.font_hud,
                 f"Selected: {sel.name} | Adjacent: {', '.join(adj_names)}",
-                True, COLOR_GENERAL_SELECTED
+                COLOR_GENERAL_SELECTED
             )
             self.screen.blit(sel_text, (SCREEN_WIDTH // 2 - sel_text.get_width() // 2, hud_y + 60))
 
@@ -839,27 +976,56 @@ class WorldMapScreen:
 
     def _duchies_of_nation(self, nation: str) -> List:
         """Герцогства, реально принадлежащие нации (de facto, не de jure)."""
+        cached = self._turn_cached((_TC_DUCHIES, nation),
+                                   lambda: self._scan_duchies_of_nation(nation))
+        return list(cached)
+
+    def _scan_duchies_of_nation(self, nation: str) -> Tuple:
+        """Собственно поиск владений нации — вызывается один раз на ход."""
         owned = {i for i, p in enumerate(self.provinces) if p.owner == nation}
         out = []
         for duchy in sorted(self.hierarchy.duchies.values(), key=lambda d: d.name):
             if owned & set(duchy.de_jure_provinces):
                 out.append(duchy)
-        return out
+        return tuple(out)
 
     def _render_ownership_panel(self):
-        """Панель владений: Kingdom -> Duchy -> County по выбранной нации."""
-        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 120))
-        self.screen.blit(overlay, (0, 0))
+        """Панель владений: Kingdom -> Duchy -> County по выбранной нации.
 
-        pw, ph = 700, 560
+        Панель статична между ходами, поэтому она рисуется в свою поверхность
+        один раз и дальше только копируется на экран одним блитом.
+        """
+        self.screen.blit(self._dim_surface, (0, 0))
+
+        # Панель перерисовывается либо по флажку (сменились данные владений),
+        # либо если разошлось состояние: ход, нация или выделение. Проверка
+        # состояния страхует от забытого сброса в новом месте кода.
+        prev = self._panel_state
+        if (self._panel_dirty or prev is None
+                or prev[0] != self._turn
+                or prev[1] != self._ownership_nation
+                or prev[2] is not self.selected_general):
+            self._paint_ownership_panel()
+            self._panel_dirty = False
+            self._panel_state = (self._turn, self._ownership_nation, self.selected_general)
+
+        pw = self._panel_surface.get_width()
+        ph = self._panel_surface.get_height()
         px = SCREEN_WIDTH // 2 - pw // 2
         py = SCREEN_HEIGHT // 2 - ph // 2
-        pygame.draw.rect(self.screen, (40, 35, 30), (px, py, pw, ph), border_radius=8)
-        pygame.draw.rect(self.screen, COLOR_WHITE, (px, py, pw, ph), 2, border_radius=8)
+        self.screen.blit(self._panel_surface, (px, py))
 
-        title = self.font_title.render("OWNERSHIP", True, (220, 200, 160))
-        self.screen.blit(title, (px + pw // 2 - title.get_width() // 2, py + 10))
+    def _paint_ownership_panel(self):
+        """Отрисовка панели владений в _panel_surface (координаты локальные)."""
+        surface = self._panel_surface
+        pw, ph = _PANEL_W, _PANEL_H
+        surface.fill((0, 0, 0, 0))
+
+        pygame.draw.rect(surface, (40, 35, 30), (0, 0, pw, ph), border_radius=8)
+        pygame.draw.rect(surface, COLOR_WHITE, (0, 0, pw, ph), 2, border_radius=8)
+
+        title = self._cached_text(self.font_title, "OWNERSHIP", (220, 200, 160))
+        surface.blit(title, (pw // 2 - title.get_width() // 2, 10))
 
         nation = self._ownership_nation
         nation_obj = WORLD_NATIONS.get(nation)
@@ -867,60 +1033,64 @@ class WorldMapScreen:
         nation_color = nation_obj.color if nation_obj else COLOR_WHITE
 
         if nation_obj is not None:
-            label = self.font_hud.render(f"Nation: {nation_obj.name}", True, nation_color)
-            self.screen.blit(label, (px + 20, py + 42))
+            label = self._cached_text(self.font_hud, f"Nation: {nation_obj.name}",
+                                      nation_color)
+            surface.blit(label, (20, 42))
 
-        x = px + 20
-        y = py + 68
+        x = 20
+        y = 68
         line_h = 16
-        max_y = py + ph - 40
+        max_y = ph - 40
 
         if realm is None:
-            no_realm = self.font_hud.render("Королевство не учтено", True, COLOR_HUD_TEXT_DIM)
-            self.screen.blit(no_realm, (x, y))
+            no_realm = self._cached_text(self.font_hud, "Королевство не учтено",
+                                         COLOR_HUD_TEXT_DIM)
+            surface.blit(no_realm, (x, y))
         else:
             ruler = self.hierarchy.characters.get(realm.ruler_id)
             ruler_name = ruler.name if ruler else "—"
-            head = self.font_hud.render(
+            head = self._cached_text(
+                self.font_hud,
                 f"{realm.name}  gold:{realm.gold}  prestige:{realm.prestige}  "
                 f"stability:{realm.stability}  crown:{realm.crown_authority}  ({ruler_name})",
-                True, nation_color)
-            self.screen.blit(head, (x, y))
+                nation_color)
+            surface.blit(head, (x, y))
             y += line_h + 2
 
             duchies = self._duchies_of_nation(nation)
             if not duchies:
-                empty = self.font_small.render("нет владений", True, COLOR_HUD_TEXT_DIM)
-                self.screen.blit(empty, (x + 14, y))
+                empty = self._cached_text(self.font_small, "нет владений",
+                                          COLOR_HUD_TEXT_DIM)
+                surface.blit(empty, (x + 14, y))
                 y += line_h
             for duchy in duchies:
                 if y > max_y:
                     break
-                holder = self.hierarchy.holder_of_duchy(duchy.id)
+                holder = self._holder_of_duchy(duchy.id)
                 if holder is None:
                     holder_text = "без держателя"
-                    holder_color = COLOR_HUD_TEXT_DIM
                 else:
                     holder_text = f"{holder.name}, {holder.rank.value}"
-                    holder_color = COLOR_HUD_TEXT
-                duchy_line = self.font_hud.render(
+                duchy_line = self._cached_text(
+                    self.font_hud,
                     f"\u2514 Duchy {duchy.name} ({holder_text}) "
-                    f"income:{self.hierarchy.duchy_income(duchy.id)} "
-                    f"levy:{self.hierarchy.duchy_levy(duchy.id)}",
-                    True, (205, 190, 155))
-                self.screen.blit(duchy_line, (x + 14, y))
+                    f"income:{self._duchy_income(duchy.id)} "
+                    f"levy:{self._duchy_levy(duchy.id)}",
+                    (205, 190, 155))
+                surface.blit(duchy_line, (x + 14, y))
                 y += line_h
 
                 # контракт и мнение персонажа, если они есть
                 if holder is not None:
-                    contract = self.hierarchy.contract_of(holder.id)
+                    contract = self._contract_of(holder.id)
                     if contract is not None:
                         spec = CONTRACT_LEVELS[contract.level]
-                        info = self.font_small.render(
+                        info = self._cached_text(
+                            self.font_small,
                             f"   contract: {spec['name']} tax{spec['tax']}%/levy{spec['levy']}% "
                             f"opinion:{holder.opinion_of_liege} loyalty:{holder.loyalty}",
-                            True, (170, 155, 130))
-                        self.screen.blit(info, (x + 28, y))
+                            (170, 155, 130))
+                        surface.blit(info, (x + 28, y))
                         y += line_h - 2
 
                     for i in self.hierarchy.counties_of_duchy(duchy.id):
@@ -928,24 +1098,23 @@ class WorldMapScreen:
                             break
                         prov = self.provinces[i]
                         col = (150, 200, 150) if prov.owner == nation else COLOR_HUD_TEXT_DIM
-                        county_line = self.font_small.render(
+                        county_line = self._cached_text(
+                            self.font_small,
                             f"\u251c #{i} {prov.name}  owner:{prov.owner} "
                             f"hearths:{getattr(prov, 'hearths', 0)} "
-                            f"inc:{self.hierarchy.county_income(i)} "
+                            f"inc:{self._county_income(i)} "
                             f"loy:{getattr(prov, 'loyalty', 0)} "
                             f"gar:{getattr(prov, 'garrison', 0)}",
-                            True, col)
-                        self.screen.blit(county_line, (x + 28, y))
+                            col)
+                        surface.blit(county_line, (x + 28, y))
                         y += line_h - 3
 
-        hint = self.font_small.render(
-            "Q/E: nation | V: close", True, (170, 155, 130))
-        self.screen.blit(hint, (px + 20, py + ph - 25))
+        hint = self._cached_text(self.font_small, "Q/E: nation | V: close",
+                                 (170, 155, 130))
+        surface.blit(hint, (20, ph - 25))
 
     def _render_diplomacy_panel(self):
-        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 120))
-        self.screen.blit(overlay, (0, 0))
+        self.screen.blit(self._dim_surface, (0, 0))
 
         pw, ph = 450, 320
         px = SCREEN_WIDTH // 2 - pw // 2
@@ -953,7 +1122,7 @@ class WorldMapScreen:
         pygame.draw.rect(self.screen, (40, 35, 30), (px, py, pw, ph), border_radius=8)
         pygame.draw.rect(self.screen, COLOR_WHITE, (px, py, pw, ph), 2, border_radius=8)
 
-        title = self.font_title.render("DIPLOMACY", True, (220, 200, 160))
+        title = self._cached_text(self.font_title, "DIPLOMACY", (220, 200, 160))
         self.screen.blit(title, (px + pw // 2 - title.get_width() // 2, py + 10))
 
         if self._diplomacy_target:
@@ -962,13 +1131,13 @@ class WorldMapScreen:
             rel_name = self.diplomacy.get_relation_name(PLAYER_NATION, self._diplomacy_target)
             rel_color = self.diplomacy.get_relation_color(PLAYER_NATION, self._diplomacy_target)
 
-            target_text = self.font_hud.render(
-                f"Target: {target_nation.name}", True, target_nation.color
+            target_text = self._cached_text(
+                self.font_hud, f"Target: {target_nation.name}", target_nation.color
             )
             self.screen.blit(target_text, (px + 20, py + 45))
 
-            current_text = self.font_hud.render(
-                f"Current: {rel_name}", True, rel_color
+            current_text = self._cached_text(
+                self.font_hud, f"Current: {rel_name}", rel_color
             )
             self.screen.blit(current_text, (px + 20, py + 68))
 
@@ -980,23 +1149,24 @@ class WorldMapScreen:
             ]
             for i, (key, text, color) in enumerate(actions):
                 ay = py + 100 + i * 32
-                key_text = self.font_hud.render(f"[{key}]", True, COLOR_HUD_TEXT_DIM)
-                act_text = self.font_hud.render(text, True, color)
+                key_text = self._cached_text(self.font_hud, f"[{key}]", COLOR_HUD_TEXT_DIM)
+                act_text = self._cached_text(self.font_hud, text, color)
                 self.screen.blit(key_text, (px + 30, ay))
                 self.screen.blit(act_text, (px + 70, ay))
         else:
-            no_target = self.font_hud.render("Press N/P to select target", True, COLOR_HUD_TEXT_DIM)
+            no_target = self._cached_text(self.font_hud, "Press N/P to select target",
+                                          COLOR_HUD_TEXT_DIM)
             self.screen.blit(no_target, (px + 20, py + 55))
 
-        hint = self.font_small.render("N: next | P: prev | 1-4: action | ESC: close", True, (170, 155, 130))
+        hint = self._cached_text(self.font_small,
+                                 "N: next | P: prev | 1-4: action | ESC: close",
+                                 (170, 155, 130))
         self.screen.blit(hint, (px + 20, py + ph - 25))
 
     def _render_overlay_text(self, text: str):
-        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 80))
-        self.screen.blit(overlay, (0, 0))
+        self.screen.blit(self._dim_surface_soft, (0, 0))
 
-        rendered = self.font_title.render(text, True, COLOR_WHITE)
+        rendered = self._cached_text(self.font_title, text, COLOR_WHITE)
         tx = SCREEN_WIDTH // 2 - rendered.get_width() // 2
         ty = 30
         bg = pygame.Surface((rendered.get_width() + 20, rendered.get_height() + 10), pygame.SRCALPHA)
@@ -1005,15 +1175,13 @@ class WorldMapScreen:
         self.screen.blit(rendered, (tx, ty))
 
     def _render_game_over(self):
-        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        self.screen.blit(overlay, (0, 0))
+        self.screen.blit(self._dim_surface_strong, (0, 0))
 
         color = COLOR_GENERAL_MOVABLE if self._winner == "VICTORY" else (200, 60, 60)
-        text = self.font_title.render(self._winner, True, color)
+        text = self._cached_text(self.font_title, self._winner, color)
         tx = SCREEN_WIDTH // 2 - text.get_width() // 2
         ty = SCREEN_HEIGHT // 2 - text.get_height() // 2
         self.screen.blit(text, (tx, ty))
 
-        hint = self.font_hud.render("Press ESC to quit", True, COLOR_WHITE)
+        hint = self._cached_text(self.font_hud, "Press ESC to quit", COLOR_WHITE)
         self.screen.blit(hint, (SCREEN_WIDTH // 2 - hint.get_width() // 2, ty + 40))

@@ -25,20 +25,31 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import collections
 import copy
+import dataclasses
 import random
 from typing import Dict, List, Sequence, Tuple
 
 import pytest
 
-from sim import state_hash
+from sim import dumps, from_jsonable, loads, new_streams, register_enum, state_hash, to_jsonable
 from states import (
     CONTRACT_LEVELS,
+    COUNTY_FIELDS,
     DUCHY_DEFS,
+    GARRISON_ATTRITION,
+    GARRISON_CAP_PER_FORT,
+    GARRISON_IS_FREE_THRESHOLD,
+    GARRISON_UPKEEP_PER_100,
+    HIERARCHY_DEFAULT_SEED,
     LANDLESS_OPINION_DECAY,
+    LOG_KEEP,
     LOYALTY_COLLAPSE,
     LOYALTY_TAX_BREAK,
     LOYALTY_TAX_FLOOR,
     REBELLION_LOYALTY,
+    ROYAL_COURT_BASE_COST,
+    ROYAL_COURT_PRESTIGE_DIVISOR,
+    STATE_VERSION,
     VASSAL_REBELLION_LOYALTY,
     Character,
     Hierarchy,
@@ -65,6 +76,13 @@ EXPECTED_RANKS: Dict[TitleRank, int] = {TitleRank.KING: 3, TitleRank.DUKE: 6, Ti
 
 #: Индексы столиц на текущей карте (RegionType.CAPITAL).
 CAPITAL_INDICES: Tuple[int, ...] = (10, 32, 42)
+
+#: Ключи, которых в снапшоте быть НЕ должно ни на каком уровне вложенности.
+#: Геометрия — мирового слоя, ``_province_duchy`` — производный кэш,
+#: ``streams`` — внешний ГПСЧ, ``linked_general`` — внешняя ссылка.
+FORBIDDEN_STATE_KEYS: Tuple[str, ...] = (
+    "provinces", "polygon", "_centroid", "streams", "linked_general",
+)
 
 
 # --------------------------------------------------------------------------
@@ -1118,3 +1136,729 @@ class TestDeterminism:
         h2.end_turn()
         assert state_hash(h1.summary()) != before
         assert state_hash(h1.summary()) == state_hash(h2.summary())
+# --------------------------------------------------------------------------
+# Сериализация состояния (этап 0.1-0.2)
+# --------------------------------------------------------------------------
+
+
+def all_keys(obj) -> set:
+    """Рекурсивно собрать ВСЕ ключи словарей внутри снапшота."""
+    found = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            found.add(key)
+            found |= all_keys(value)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            found |= all_keys(item)
+    return found
+
+
+class TestStateSerialization:
+    """``to_state`` -> ``from_state`` обязан сохранять мир побайтно.
+
+    Главный контракт здесь — **одинаковый ``state_fingerprint()`` до и
+    после round-trip**. Именно он ловит тихую потерю данных: если забыть
+    поле, хеш разъедется и это будет единственный сигнал.
+    """
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    # --- состав снапшота ---
+
+    def test_state_has_exact_top_level_keys(self):
+        assert set(self.h.to_state()) == {
+            "version", "turn", "log", "log_truncated",
+            "realms", "duchies", "characters", "contracts", "counties",
+        }
+
+    def test_version_is_one_and_integer(self):
+        version = self.h.to_state()["version"]
+        assert version == STATE_VERSION == 1
+        assert isinstance(version, int) and not isinstance(version, bool)
+
+    def test_no_world_layer_keys_anywhere_in_state(self):
+        # рекурсивная проверка: запрещённого ключа не должно быть ни на
+        # каком уровне вложенности, а не только в корне снапшота
+        found = all_keys(self.h.to_state())
+        for banned in FORBIDDEN_STATE_KEYS:
+            assert banned not in found, banned
+
+    def test_province_duchy_cache_is_not_serialized(self):
+        # производный кэш обязан восстанавливаться, а не храниться
+        state = self.h.to_state()
+        assert "_province_duchy" not in state
+        assert "_province_duchy" not in all_keys(state)
+        assert self.h._province_duchy, "кэш у живой иерархии обязан быть непустым"
+
+    def test_counties_cover_every_province_with_nine_fields(self):
+        counties = self.h.to_state()["counties"]
+        assert set(counties) == set(range(len(self.h.provinces)))
+        expected = {"duchy_id", "hearths", "prosperity", "loyalty", "security",
+                    "development", "fort_level", "garrison", "villages"}
+        assert set(COUNTY_FIELDS) == expected
+        assert len(COUNTY_FIELDS) == 9
+        for idx, data in counties.items():
+            assert set(data) == expected, idx
+
+    def test_counties_keys_are_ints_in_fresh_snapshot(self):
+        counties = self.h.to_state()["counties"]
+        assert all(isinstance(k, int) for k in counties)
+
+    def test_contract_snapshot_has_exactly_three_fields(self):
+        contracts = self.h.to_state()["contracts"]
+        assert len(contracts) == EXPECTED_CONTRACT_COUNT
+        for vassal_id, data in contracts.items():
+            assert set(data) == {"liege_id", "vassal_id", "level"}, vassal_id
+            assert data["vassal_id"] == vassal_id
+        assert contracts["baron_volkov"]["liege_id"] == "duke_aldric"
+
+    def test_realm_duchy_character_snapshots_are_complete(self):
+        state = self.h.to_state()
+        for realm_id, realm in self.h.realms.items():
+            assert set(state["realms"][realm_id]) == {
+                f.name for f in dataclasses.fields(realm)}
+        for duchy_id, duchy in self.h.duchies.items():
+            assert set(state["duchies"][duchy_id]) == {
+                f.name for f in dataclasses.fields(duchy)}
+        for ch_id, ch in self.h.characters.items():
+            assert set(state["characters"][ch_id]) == {
+                f.name for f in dataclasses.fields(ch)}
+
+    def test_log_is_capped_and_flagged_when_truncated(self):
+        for _ in range(60):
+            for p in self.h.provinces:
+                p.loyalty = 0
+            self.h.end_turn()
+        assert len(self.h.log) == LOG_KEEP
+        assert self.h.log_truncated is True
+        state = self.h.to_state()
+        assert len(state["log"]) == LOG_KEEP
+        assert state["log_truncated"] is True
+
+    def test_short_log_is_not_flagged(self):
+        self.h.end_turn()
+        state = self.h.to_state()
+        assert len(state["log"]) <= LOG_KEEP
+        assert state["log_truncated"] is False
+
+    # --- round-trip ---
+
+    def test_in_memory_round_trip_preserves_fingerprint(self):
+        """ГЛАВНЫЙ ТЕСТ: никакое поле не теряется по дороге."""
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_json_round_trip_preserves_fingerprint(self):
+        """То же, но через настоящий JSON — со строковыми ключами county."""
+        state = loads(dumps(self.h.to_state()))
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_round_trip_preserves_fingerprint_after_several_turns(self):
+        for _ in range(9):
+            self.h.end_turn()
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+        assert restored.turn == self.h.turn
+
+    def test_round_trip_preserves_fingerprint_with_truncated_log(self):
+        for _ in range(60):
+            for p in self.h.provinces:
+                p.loyalty = 0
+            self.h.end_turn()
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+        assert restored.log_truncated is True
+        assert len(restored.log) == LOG_KEEP
+        # и повторный round-trip тоже стабилен (идемпотентность)
+        again = Hierarchy.from_state(restored.to_state(), copy_provinces())
+        assert again.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_round_trip_restores_income_and_upkeep(self):
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        for realm_id in self.h.realms:
+            assert restored.realm_income(realm_id) == self.h.realm_income(realm_id)
+            assert restored.realm_upkeep(realm_id) == self.h.realm_upkeep(realm_id)
+        for idx in range(len(self.h.provinces)):
+            assert restored.county_income(idx) == self.h.county_income(idx)
+
+    def test_round_trip_restores_dictionaries_by_id(self):
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert set(restored.realms) == set(self.h.realms)
+        assert set(restored.duchies) == set(self.h.duchies)
+        assert set(restored.characters) == set(self.h.characters)
+        assert set(restored.contracts) == set(self.h.contracts)
+        assert len(restored.characters) == EXPECTED_CHARACTER_COUNT
+
+    # --- восстановление типов ---
+
+    def test_from_state_restores_de_jure_provinces_as_tuple(self):
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        for duchy in restored.duchies.values():
+            assert isinstance(duchy.de_jure_provinces, tuple), duchy.id
+        assert restored.duchies["ravenhold"].de_jure_provinces == (10, 11, 12, 13, 14)
+
+    def test_from_state_restores_traits_as_tuple(self):
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        for ch in restored.characters.values():
+            assert isinstance(ch.traits, tuple), ch.id
+        self.h.characters["king_erik"].traits = ("crave", "brave")
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.characters["king_erik"].traits == ("crave", "brave")
+
+    def test_from_state_restores_county_keys_as_int_after_json(self):
+        state = loads(dumps(self.h.to_state()))
+        assert all(isinstance(k, str) for k in state["counties"]), "JSON обязан дать строки"
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert set(restored.to_state()["counties"]) == set(range(50))
+        assert all(isinstance(k, int) for k in restored.to_state()["counties"])
+
+    def test_from_state_restores_enums_explicitly(self):
+        state = loads(dumps(self.h.to_state()))
+        restored = Hierarchy.from_state(state, copy_provinces())
+        for ch_id, ch in self.h.characters.items():
+            got = restored.characters[ch_id].rank
+            assert got is ch.rank, ch_id
+            assert isinstance(got, TitleRank)
+        assert restored.characters["king_erik"].tier is Tier.REALM
+        assert restored.characters["duke_aldric"].tier is Tier.DUCHY
+
+    def test_from_state_rebuilds_province_duchy_index(self):
+        state = self.h.to_state()
+        index = dict(self.h._province_duchy)
+        index.clear()
+        self.h._province_duchy = index
+        restored = Hierarchy.from_state(state, copy_provinces())
+        # индекс восстановлен конструктором из de jure герцогств
+        assert restored.duchy_of(0) == "northmark"
+        assert restored.duchy_of(13) == "ravenhold"
+        assert restored.duchy_of(49) == "goldfield"
+
+    def test_from_state_accepts_both_enum_spellings(self):
+        state = self.h.to_state()
+        by_name = loads(dumps(state))
+        by_value = {k: dict(v) for k, v in state["characters"].items()}
+        for data in by_value.values():
+            data["rank"] = TitleRank[data["rank"]].value  # "king" вместо "KING"
+        state["characters"] = by_value
+        restored_name = Hierarchy.from_state(by_name, copy_provinces())
+        restored_value = Hierarchy.from_state(state, copy_provinces())
+        assert restored_name.characters["king_erik"].rank is TitleRank.KING
+        assert restored_value.characters["king_erik"].rank is TitleRank.KING
+
+    def test_from_state_falls_back_on_broken_rank(self):
+        state = {**self.h.to_state()}
+        state["characters"] = {k: dict(v) for k, v in state["characters"].items()}
+        state["characters"]["king_erik"]["rank"] = "НЕВАЛИДНЫЙ_РАНГ"
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert restored.characters["king_erik"].rank is TitleRank.BARON
+
+    # --- терпимость к неполным снапшотам ---
+
+    def test_from_state_tolerates_partial_snapshot(self):
+        partial = {
+            "version": 1,
+            "realms": {"kingdom_ember": {"nation": "red", "gold": 7}},
+            "characters": {"king_erik": {"name": "Erik", "nation": "red"}},
+            "duchies": {"ravenhold": {"name": "Ravenhold"}},
+            "contracts": {"king_erik": {}},
+            "counties": {"3": {"hearths": 500, "loyalty": 80}},
+        }
+        provinces = copy_provinces()
+        h = Hierarchy.from_state(partial, provinces)
+        realm = h.realms["kingdom_ember"]
+        assert realm.gold == 7
+        assert realm.ruler_id is None and realm.capital_idx is None
+        assert realm.crown_authority == 2 and realm.stability == 100
+        assert h.characters["king_erik"].rank is TitleRank.BARON
+        assert h.characters["king_erik"].loyalty == 70
+        assert h.duchies["ravenhold"].de_jure_provinces == ()
+        assert h.contracts["king_erik"].level == 2
+        assert h.turn == 1 and h.log == []
+        assert provinces[3].hearths == 500
+        assert provinces[3].loyalty == 80
+        # остальные восьминараторные поля взяты из дефолтов
+        assert provinces[3].development == 1 and provinces[3].fort_level == 0
+
+    def test_from_state_survives_completely_empty_snapshot(self):
+        h = Hierarchy.from_state({}, copy_provinces())
+        assert h.turn == 1 and h.log == []
+        assert h.realms == {} and h.duchies == {}
+        assert h.characters == {} and h.contracts == {}
+        assert h.state_fingerprint() == Hierarchy.from_state({}, copy_provinces()).state_fingerprint()
+
+    def test_from_state_ignores_out_of_range_and_bad_county_keys(self):
+        state = self.h.to_state()
+        state["counties"]["9999"] = dict(state["counties"][0])
+        state["counties"]["не число"] = dict(state["counties"][0])
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert set(restored.to_state()["counties"]) == set(range(50))
+
+    def test_from_state_cannot_inject_arbitrary_attributes(self):
+        # битый снапшот не должен уметь дописать в провинцию что попало
+        state = {"counties": {"0": {"hearths": 10, "зловред": "boom"}}}
+        provinces = copy_provinces()
+        Hierarchy.from_state(state, provinces)
+        assert provinces[0].hearths == 10
+        assert not hasattr(provinces[0], "зловред")
+
+    # --- честный хеш ---
+
+    def test_fingerprint_equal_for_two_independent_builds(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        assert a.state_fingerprint() == b.state_fingerprint()
+        for _ in range(8):
+            a.end_turn()
+            b.end_turn()
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+    def test_fingerprint_differs_when_gold_differs(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        before = a.state_fingerprint()
+        b.realms["kingdom_ember"].gold += 1
+        assert b.state_fingerprint() != before
+        b.realms["kingdom_ember"].gold -= 1
+        assert b.state_fingerprint() == before
+
+    def test_fingerprint_tracks_county_and_character_changes(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        before = a.state_fingerprint()
+        a.provinces[3].garrison += 40
+        assert a.state_fingerprint() != before
+        b.characters["baron_volkov"].loyalty += 1
+        assert b.state_fingerprint() != before
+
+    def test_fingerprint_is_sha1_hex(self):
+        fp = self.h.state_fingerprint()
+        assert isinstance(fp, str) and len(fp) == 40
+        assert all(ch in "0123456789abcdef" for ch in fp)
+
+    def test_fingerprint_equals_state_hash_of_to_state(self):
+        state = self.h.to_state()
+        assert self.h.state_fingerprint() == state_hash(state)
+
+    def test_hashing_the_object_directly_is_the_old_bug(self):
+        """Зафиксированный баг: repr(Hierarchy) содержит адрес памяти.
+
+        ``canonical`` не умеет dataclass'ы и ``Hierarchy`` не dataclass,
+        поэтому ``state_hash(иерархия)`` уходит в ``repr`` и «залипает» на
+        ``0x...``. Тест существует, чтобы никто не вернул этот путь.
+        """
+        a, b = make_hierarchy(), make_hierarchy()
+        assert state_hash(a.summary()) == state_hash(b.summary())
+        assert state_hash(a) != state_hash(b), "repr() содержит адрес — это ожидаемо"
+        assert a.state_fingerprint() == b.state_fingerprint(), \
+            "правильный путь — хешировать to_state()"
+
+    def test_to_jsonable_no_longer_collapses_hierarchy(self):
+        # раньше: '<states.Hierarchy object at 0x...>' — потеря всего мира
+        payload = to_jsonable(self.h.to_state())
+        assert isinstance(payload, dict)
+        assert payload["version"] == 1
+        assert len(payload["characters"]) == EXPECTED_CHARACTER_COUNT
+        assert json_dumps_round_trips(payload)
+
+    # --- регистрация enum ---
+
+    def test_register_enum_title_rank_round_trip(self):
+        rank = TitleRank.KING
+        assert from_jsonable(to_jsonable(rank)) is TitleRank.KING
+        assert from_jsonable(to_jsonable(TitleRank.DUKE)) is TitleRank.DUKE
+        assert from_jsonable(to_jsonable(TitleRank.BARON)) is TitleRank.BARON
+
+    def test_register_enum_tier_round_trip(self):
+        assert from_jsonable(to_jsonable(Tier.REALM)) is Tier.REALM
+        assert from_jsonable(to_jsonable(Tier.COUNTY)) is Tier.COUNTY
+
+    def test_register_enum_is_idempotent(self):
+        for _ in range(3):
+            register_enum(TitleRank)
+            register_enum(Tier)
+        assert from_jsonable(to_jsonable(TitleRank.KING)) is TitleRank.KING
+
+    def test_enum_registry_contains_states_enums(self):
+        register_enum(TitleRank)
+        register_enum(Tier)
+        from sim import registered_enums
+        assert {"TitleRank", "Tier"} <= registered_enums()
+
+    def test_registered_enums_survive_a_json_hierarchy_snapshot(self):
+        restored = Hierarchy.from_state(loads(dumps(self.h.to_state())), copy_provinces())
+        ranks = {ch.rank for ch in restored.characters.values()}
+        assert ranks == {TitleRank.KING, TitleRank.DUKE, TitleRank.BARON}
+
+
+def json_dumps_round_trips(payload) -> bool:
+    """Признак «это честный dict, а не строка от repr»."""
+    return loads(dumps(payload)) == payload
+
+
+# --------------------------------------------------------------------------
+# Содержание гарнизонов и баланс (этап 0.3-0.5)
+# --------------------------------------------------------------------------
+
+
+class TestGarrisonUpkeep:
+    """Гарнизон стоит денег, потолок задаётся стенами, престиж — сток.
+
+    Контекст правки: до неё гарнизон не списывался НИГДЕ, при этом давал
+    +2 лояльности и +1 безопасности за ход, то есть поднимал доход
+    поселения примерно с 7 до 48. «Трата на гарнизон» была фиктивной
+    кнопкой, а ``fort_level`` не читался нигде.
+    """
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    # --- потолок по стенам ---
+
+    def test_garrison_cap_scales_with_fort_level(self):
+        for idx, p in enumerate(self.h.provinces):
+            expected = (p.fort_level + 1) * GARRISON_CAP_PER_FORT
+            assert self.h.garrison_cap(idx) == expected, idx
+        self.h.provinces[0].fort_level = 3
+        assert self.h.garrison_cap(0) == 4 * GARRISON_CAP_PER_FORT
+        self.h.provinces[0].fort_level = 0
+        assert self.h.garrison_cap(0) == GARRISON_CAP_PER_FORT
+
+    def test_start_garrisons_respect_the_cap(self):
+        for idx, p in enumerate(self.h.provinces):
+            assert 0 <= p.garrison <= self.h.garrison_cap(idx), (idx, p.garrison)
+
+    def test_cap_scales_village_city_capital(self):
+        capitals = [i for i in CAPITAL_INDICES]
+        cities = [i for i, p in enumerate(self.h.provinces)
+                  if p.region_type is RegionType.CITY]
+        villages = [i for i, p in enumerate(self.h.provinces)
+                    if p.region_type is RegionType.VILLAGE]
+        # деревня держит сотню, город — две, крепость — три
+        assert self.h.garrison_cap(capitals[0]) == 3 * GARRISON_CAP_PER_FORT
+        assert self.h.garrison_cap(cities[0]) == 2 * GARRISON_CAP_PER_FORT
+        assert self.h.garrison_cap(villages[0]) == 1 * GARRISON_CAP_PER_FORT
+
+    # --- содержание ---
+
+    def test_garrison_upkeep_is_zero_without_garrisons(self):
+        for p in self.h.provinces:
+            p.garrison = 0
+        for realm in self.h.realms.values():
+            assert self.h.garrison_upkeep(realm.id) == 0
+
+    def test_garrison_upkeep_grows_with_number_of_garrisons(self):
+        h = make_hierarchy()
+        for p in h.provinces:
+            p.garrison = 0
+        owned = h.provinces_of_realm("kingdom_ember")
+        bills = []
+        for soldiers in (0, 100, 200, 300):
+            for idx in owned:
+                h.provinces[idx].garrison = soldiers
+            bills.append(h.garrison_upkeep("kingdom_ember"))
+        assert bills[0] == 0
+        assert all(b > a for a, b in zip(bills, bills[1:])), bills
+        assert bills[1] == len(owned) * GARRISON_UPKEEP_PER_100
+
+    def test_garrison_upkeep_counts_only_own_provinces(self):
+        h = make_hierarchy()
+        h.realms["kingdom_ember"].gold = 99999
+        for p in h.provinces:
+            p.garrison = 0
+        owned = h.provinces_of_realm("kingdom_ember")
+        h.provinces[owned[0]].garrison = 100
+        foreign = [i for i in range(50) if i not in owned][0]
+        h.provinces[foreign].garrison = 100
+        assert h.garrison_upkeep("kingdom_ember") == GARRISON_UPKEEP_PER_100
+
+    def test_realm_upkeep_grows_with_garrison_count(self):
+        h = make_hierarchy()
+        for p in h.provinces:
+            p.garrison = 0
+        owned = h.provinces_of_realm("kingdom_riven")
+        before = h.realm_upkeep("kingdom_riven")
+        for idx in owned:
+            h.provinces[idx].garrison = 200
+        after = h.realm_upkeep("kingdom_riven")
+        assert after > before
+        assert after - before == len(owned) * 2 * GARRISON_UPKEEP_PER_100
+
+    def test_garrison_is_paid_from_first_soldier(self):
+        # GARRISON_IS_FREE_THRESHOLD == 0: стартовые гарнизоны платные сразу
+        assert GARRISON_IS_FREE_THRESHOLD == 0
+        h = make_hierarchy()
+        for p in h.provinces:
+            p.garrison = 0
+        owned = h.provinces_of_realm("kingdom_thorn")
+        h.provinces[owned[0]].garrison = 100
+        assert h.garrison_upkeep("kingdom_thorn") == GARRISON_UPKEEP_PER_100
+
+    def test_start_upkeep_includes_garrison_bill(self):
+        for realm in self.h.realms.values():
+            assert self.h.garrison_upkeep(realm.id) > 0, realm.id
+        assert self.h.realm_upkeep("kingdom_riven") > 0
+
+    # --- атриция ---
+
+    def test_attrition_applies_when_treasury_is_empty(self):
+        self.h.realms["kingdom_riven"].gold = 0
+        city, capital = 28, 32
+        before = (self.h.provinces[city].garrison, self.h.provinces[capital].garrison)
+        assert min(before) > GARRISON_ATTRITION
+        self.h.tick_counties()
+        after = (self.h.provinces[city].garrison, self.h.provinces[capital].garrison)
+        assert after == (before[0] - GARRISON_ATTRITION,
+                         before[1] - GARRISON_ATTRITION)
+
+    def test_attrition_never_goes_below_zero(self):
+        """Гарнизон не уходит в минус, даже когда казна давно пуста.
+
+        И не останавливается на «бесплатном остатке»: счёт пропорциональный,
+        поэтому сто солдат глохнут до нуля, а не замирают на 60.
+        """
+        h = make_hierarchy()
+        for realm in h.realms.values():
+            realm.gold = 0
+        owned = sorted({i for realm_id in h.realms
+                        for i in h.provinces_of_realm(realm_id)})
+        untouched = {i: h.provinces[i].garrison for i in range(50) if i not in owned}
+        for i in owned:
+            h.provinces[i].garrison = 100
+        for _ in range(10):
+            h.tick_counties()
+            assert all(p.garrison >= 0 for p in h.provinces)
+        assert all(h.provinces[i].garrison == 0 for i in owned)
+        # нейтральные земли не платят ни одному королевству и не тронуты
+        assert all(h.provinces[i].garrison == g for i, g in untouched.items())
+
+    def test_broke_realm_is_drained_to_zero(self):
+        """Разорённое королевство гарнизон НЕ сохраняет.
+
+        Счёт пропорциональный (``billable * 10 // 100``), поэтому нет
+        «безплатного остатка» меньше сотни, в котором атриция
+        останавливается. Раньше округление вниз позволяло королевству
+        дойти до нуля содержания, оставив себе войска.
+        """
+        h = make_hierarchy()
+        for realm in h.realms.values():
+            realm.gold = 0
+        owned = sorted(h.provinces_of_realm("kingdom_riven"))
+        for i in owned:
+            h.provinces[i].garrison = 400
+        history = []
+        for _ in range(30):
+            h.tick_counties()
+            history.append(sum(h.provinces[i].garrison for i in owned))
+        assert history[0] < 400 * len(owned), "хоть что-то должно было сгореть"
+        assert all(b <= a for a, b in zip(history, history[1:])), "убывание обязано быть монотонным"
+        assert history[-1] == 0, f"гарнизон должен сгореть полностью, осталось {history[-1]}"
+        assert h.garrison_upkeep("kingdom_riven") == 0, "счёт схлопнулся в ноль"
+
+    def test_small_garrison_is_paid_for_and_decays(self):
+        """Гарнизон меньше сотни тоже стоит денег и тоже гниёт.
+
+        Формула ``(garrison // 100) * 10`` делала 99 солдат бесплатными и
+        бессмертными: при любой казне атриции не было, и разорённое
+        королевство замирало на остатке. Счёт пропорциональный.
+        """
+        h = make_hierarchy()
+        for realm in h.realms.values():
+            realm.gold = 0
+        owned = sorted({i for realm_id in h.realms
+                        for i in h.provinces_of_realm(realm_id)})
+        for i in owned:
+            h.provinces[i].garrison = 99
+        # 99 * 10 // 100 = 9 золота за провинцию, а не ноль
+        bill = h.garrison_upkeep("kingdom_riven")
+        riven_owned = sorted(h.provinces_of_realm("kingdom_riven"))
+        assert bill == len(riven_owned) * 9, bill
+        for _ in range(5):
+            h.tick_counties()
+        assert all(h.provinces[i].garrison <= 99 for i in owned), "малый гарнизон обязан гнить"
+        assert any(h.provinces[i].garrison < 99 for i in riven_owned)
+
+    def test_garrison_upkeep_is_proportional_not_per_hundred(self):
+        h = make_hierarchy()
+        realm = h.realms["kingdom_riven"]
+        owned = sorted(h.provinces_of_realm(realm.id))
+        for i in owned:
+            h.provinces[i].garrison = 0
+        h.provinces[owned[0]].garrison = 50
+        half = h.garrison_upkeep(realm.id)
+        h.provinces[owned[0]].garrison = 100
+        full = h.garrison_upkeep(realm.id)
+        assert full == 2 * half, (half, full)
+
+    def test_no_attrition_when_treasury_covers_the_bill(self):
+        realm = self.h.realms["kingdom_riven"]
+        bill = self.h.garrison_upkeep(realm.id)
+        before = [self.h.provinces[i].garrison for i in (28, 32)]
+        realm.gold = bill
+        self.h.tick_counties()
+        assert [self.h.provinces[i].garrison for i in (28, 32)] == before
+        realm.gold = bill - 1
+        self.h.tick_counties()
+        assert [self.h.provinces[i].garrison for i in (28, 32)] == [
+            g - GARRISON_ATTRITION for g in before]
+
+    def test_attrition_touches_only_the_broke_realm(self):
+        broke = self.h.realms["kingdom_riven"]
+        broke.gold = 0
+        solvent_idx = self.h.provinces_of_realm("kingdom_ember")[0]
+        before_solvent = self.h.provinces[solvent_idx].garrison
+        before_broke = [self.h.provinces[i].garrison for i in (28, 32)]
+        self.h.tick_counties()
+        assert self.h.provinces[solvent_idx].garrison == before_solvent
+        assert [self.h.provinces[i].garrison for i in (28, 32)] == [
+            g - GARRISON_ATTRITION for g in before_broke]
+
+    def test_attrition_skips_neutral_provinces(self):
+        # у нейтральных земель нет королевства — платить некому
+        neutral = [i for i, p in enumerate(self.h.provinces) if p.owner == "neutral"]
+        before = [self.h.provinces[i].garrison for i in neutral]
+        for realm in self.h.realms.values():
+            realm.gold = 0
+        self.h.tick_counties()
+        assert [self.h.provinces[i].garrison for i in neutral] == before
+
+    def test_ticks_never_roll_the_dice(self):
+        """КРИТИЧНОЕ ПРАВИЛО этапа 0.3: ни один тик не трогает ГПСЧ."""
+        h = make_hierarchy()
+        assert len(h.streams) == 0
+        for _ in range(12):
+            h.end_turn()
+        assert len(h.streams) == 0, "фаза хода создала именованный поток"
+        assert h.streams.consumed("anything") == 0
+
+    # --- престиж как сток ---
+
+    def test_royal_court_cost_grows_with_prestige(self):
+        realm = self.h.realms["kingdom_ember"]
+        realm.prestige = 0
+        baseline = self.h.realm_upkeep(realm.id)
+        costs = []
+        for prestige in (0, 10, 30, 60, 100):
+            realm.prestige = prestige
+            costs.append(self.h.realm_upkeep(realm.id))
+        assert all(b > a for a, b in zip(costs, costs[1:])), costs
+        assert costs[0] == baseline
+        assert costs[-1] == baseline + 100 // ROYAL_COURT_PRESTIGE_DIVISOR
+        assert ROYAL_COURT_BASE_COST == 30
+
+    def test_prestige_divisor_scales_the_increment(self):
+        realm = self.h.realms["kingdom_ember"]
+        realm.prestige = 0
+        base = self.h.realm_upkeep(realm.id)
+        realm.prestige = 50
+        assert self.h.realm_upkeep(realm.id) == base + \
+            50 // ROYAL_COURT_PRESTIGE_DIVISOR
+
+    def test_prestige_is_capped_so_court_cost_is_bounded(self):
+        # потолок ставит tick_realms, поэтому «накручиваем» престиж только
+        # честным путём — через него самого
+        h = make_hierarchy()
+        realm = h.realms["kingdom_ember"]
+        for _ in range(200):
+            h.tick_realms()
+        assert realm.prestige == 100
+        max_cost = h.realm_upkeep(realm.id)
+        assert max_cost - 100 // ROYAL_COURT_PRESTIGE_DIVISOR > 0
+        realm.prestige = 0
+        min_cost = h.realm_upkeep(realm.id)
+        assert max_cost > min_cost
+
+    # --- баланс на длинной дистанции ---
+
+    def balance_scenario(self, turns: int, seed: int, rnd_garrison: bool):
+        h = make_hierarchy()
+        rng = random.Random(seed)
+        for _ in range(turns):
+            if rnd_garrison:
+                h.provinces[rng.randrange(50)].garrison = 120
+            h.end_turn()
+        return h
+
+    def assert_healthy(self, h: Hierarchy, turns: int):
+        assert h.turn == turns + 1
+        for realm in h.realms.values():
+            assert realm.gold > 0, realm.id
+            assert realm.gold < 10 ** 7, f"{realm.id}: инфляция"
+            assert 0 <= realm.prestige <= 100, realm.id
+            assert 0 <= realm.stability <= 100, realm.id
+            assert h.realm_income(realm.id) > 0, realm.id
+        positive = sum(1 for idx in range(50) if h.county_income(idx) > 0)
+        assert positive >= 40, f"разорилось слишком много поселений: {positive}/50"
+        for p in h.provinces:
+            assert 0 <= p.loyalty <= 100, p.name
+            assert p.garrison >= 0, p.name
+
+    def test_thirty_turns_balance(self):
+        h = self.balance_scenario(30, seed=12345, rnd_garrison=False)
+        self.assert_healthy(h, 30)
+        assert h.realms["kingdom_riven"].gold < 10 ** 4
+
+    def test_hundred_turns_balance(self):
+        h = self.balance_scenario(100, seed=12345, rnd_garrison=False)
+        self.assert_healthy(h, 100)
+
+    def test_thirty_turns_balance_with_random_garrisons(self):
+        h = self.balance_scenario(30, seed=12345, rnd_garrison=True)
+        self.assert_healthy(h, 30)
+
+    def test_hundred_turns_balance_with_random_garrisons(self):
+        h = self.balance_scenario(100, seed=12345, rnd_garrison=True)
+        self.assert_healthy(h, 100)
+
+    def test_balance_is_reproducible_with_a_fixed_seed(self):
+        a = self.balance_scenario(30, seed=999, rnd_garrison=True)
+        b = self.balance_scenario(30, seed=999, rnd_garrison=True)
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+    def test_garrison_upkeep_actually_presses_the_treasury(self):
+        """Контрольный эксперимент: счёт за гарнизоны уменьшает казну.
+
+        Один и тот же ход на двух копиях мира, отличающихся только
+        гарнизонами: разница в золоте обязана равняться сумме счетов.
+        """
+        with_pay = make_hierarchy()
+        without_pay = make_hierarchy()
+        bill = {r.id: without_pay.garrison_upkeep(r.id) for r in without_pay.realms.values()}
+        assert all(v > 0 for v in bill.values()), bill
+        for p in without_pay.provinces:
+            p.garrison = 0
+        for h in (with_pay, without_pay):
+            h.tick_realms()
+        for realm_id in bill:
+            # платящий за гарнизоны король обязан быть беднее ровно на счёт
+            assert without_pay.realms[realm_id].gold - \
+                with_pay.realms[realm_id].gold == bill[realm_id], realm_id
+
+    def test_streams_do_not_affect_the_fingerprint(self):
+        a = build_default_hierarchy(copy_provinces())
+        b = build_default_hierarchy(copy_provinces(), streams=new_streams(424242))
+        assert a.streams.seed == HIERARCHY_DEFAULT_SEED
+        assert b.streams.seed == 424242
+        assert a.state_fingerprint() == b.state_fingerprint()
+        for _ in range(10):
+            a.end_turn()
+            b.end_turn()
+        assert a.state_fingerprint() == b.state_fingerprint()
+        assert len(b.streams) == 0, "ход не должен был потратить ни одного броска"
+
+    def test_two_builds_with_the_same_explicit_seed_hash_equal(self):
+        a = build_default_hierarchy(copy_provinces(), streams=new_streams(7))
+        b = build_default_hierarchy(copy_provinces(), streams=new_streams(7))
+        assert a.state_fingerprint() == b.state_fingerprint()
+        for _ in range(5):
+            a.end_turn()
+            b.end_turn()
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+    def test_default_streams_are_created_when_omitted(self):
+        a = Hierarchy(copy_provinces())
+        b = Hierarchy(copy_provinces())
+        assert a.streams.seed == HIERARCHY_DEFAULT_SEED
+        assert b.streams.seed == HIERARCHY_DEFAULT_SEED
+        assert a.state_fingerprint() == b.state_fingerprint()
+        # потоки — внешний источник энтропии, в снапшот они не попадают
+        assert "streams" not in a.to_state()
