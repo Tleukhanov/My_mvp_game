@@ -165,13 +165,25 @@ def tactical_units_for(troops_committed: object) -> int:
 def defender_units_for(session: "WarSession") -> int:
     """Сколько юнитов получает защитник.
 
-    У обороняющейся стороны нет своего левейса в мире (войска провинции — это
-    гарнизон, а не армия), поэтому берём половину вложенного игроком с нижней
-    границей в один юнит: иначе бой с двумя сотнями солдат был бы бесплатным
-    и бессмысленным.
+    Считается из **реальных войск защитника** (``session.defender_troops``).
+    Раньше здесь было ``own // 2`` — защитник всегда вдвое слабее, сколько бы
+    солдат у него ни было: игрок со 1200 войск выходил против «3000», а
+    получал противника вдвое меньше собственного. Число метрик уходило.
+
+    Фолбэк на ``own // 2`` оставлен только для сессий без данных о
+    защитнике (старая сессия, приказ из UI), чтобы число не падало до нуля.
     """
-    own = tactical_units_for(session.troops_committed)
-    return max(1, min(TACTICS_UNIT_CAP, own // 2))
+    troops = getattr(session, "defender_troops", None)
+    if troops is None:
+        own = tactical_units_for(session.troops_committed)
+        return max(1, min(TACTICS_UNIT_CAP, own // 2))
+    try:
+        raw = max(0, int(troops))
+    except (TypeError, ValueError):
+        raw = 0
+    if raw <= 0:
+        return 1
+    return max(1, min(TACTICS_UNIT_CAP, raw // TROOPS_PER_TACTICAL_UNIT))
 
 
 @dataclass(frozen=True)
@@ -205,6 +217,9 @@ class WarSession:
     province_idx: int
     general_name: str
     troops_committed: int
+    #: Реальные войска защитника. ``None`` — данных нет (старая сессия),
+    #: тогда :func:`defender_units_for` падает на подстановку.
+    defender_troops: Optional[int] = None
     quality: int = QUALITY_MIN
     seed: int = 0
     player_attacker: bool = True
@@ -233,6 +248,8 @@ class WarSession:
             "province_idx": int(self.province_idx),
             "general_name": str(self.general_name),
             "troops_committed": int(self.troops_committed),
+            "defender_troops": (None if self.defender_troops is None
+                                else int(self.defender_troops)),
             "quality": int(self.quality),
             "seed": int(self.seed),
             "player_attacker": bool(self.player_attacker),
@@ -256,6 +273,8 @@ class WarSession:
                 province_idx=int(data["province_idx"]),
                 general_name=str(data["general_name"]),
                 troops_committed=int(data["troops_committed"]),
+                defender_troops=(None if data.get("defender_troops") is None
+                                else int(data["defender_troops"])),
                 quality=clamp_quality(data.get("quality", QUALITY_MIN)),
                 seed=int(data.get("seed", 0)),
                 player_attacker=bool(data.get("player_attacker", True)),

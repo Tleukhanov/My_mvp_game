@@ -355,7 +355,12 @@ class GameEngine:
             if not self._game_over:
                 self._update(dt)
             self._render()
-        pygame.quit()
+        # НЕ вызываем pygame.quit() здесь: тактический экран открывается
+        # СВЕРХ мировой карты, и после боя игрок возвращается в тот же
+        # WorldMapScreen. Уничтожение видеорежима оставляло его `self.screen`
+        # мёртвой поверхностью — возврат в глобалку падал или давал чёрный
+        # экран. Ресурсы освобождает pygame при выходе из процесса, а
+        # `main()` вызывает pygame.quit() последним действием.
         return self._victory_next_mission
 
     def _handle_events(self):
