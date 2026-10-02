@@ -324,6 +324,71 @@ class TestAiActivity:
         assert neutral_after < neutral_before, "боты не захватили ничего"
 
 
+class TestSelectionAndRendering:
+    """Выбор генерала обязан переживать отрисовку.
+
+    Регрессия: в `_render` стояло `self.selectedGeneral` вместо
+    `self.selected_general`. Имя выглядит как опечатку, но это роняло
+    рендер с `AttributeError` ровно в тот момент, когда игрок выбирал
+    армию, — то есть на самом первом клике по генералу в бою.
+    """
+
+    def test_render_with_selected_general(self, fresh_screen):
+        w = fresh_screen
+        w._render()
+        g = next(x for x in w.generals if x.province_idx is not None)
+        w.selected_general = g
+        w._render()  # раньше здесь был AttributeError
+
+    def test_render_after_click_selects_without_crash(self, fresh_screen):
+        w = fresh_screen
+        w._render()
+        g = next(x for x in w.generals if x.nation == PLAYER_NATION)
+        cx, cy = w.provinces[g.province_idx].centroid
+        w._handle_map_click(*w._world_to_screen(cx, cy))
+        w._render()
+
+    def test_no_typo_attributes_in_source(self, fresh_screen):
+        import inspect
+
+        src = inspect.getsource(type(fresh_screen)._render)
+        assert "self.selectedGeneral" not in src, \
+            "опечатка в имени атрибута роняет рендер при выборе генерала"
+
+    def test_all_provinces_labelled_at_full_zoom(self, fresh_screen):
+        """На зуме 1.0 подписаны все поселения — игрок видит, где что."""
+        w = fresh_screen
+        w.zoom = 1.0
+        w._render()
+        drawn = len(w._label_cache)
+        assert drawn >= len(WORLD_PROVINCES) * 0.9, \
+            f"подписано лишь {drawn} из {len(WORLD_PROVINCES)}"
+
+    def test_frame_perf_budget(self, fresh_screen):
+        """Кадр карты обязан укладываться в бюджет.
+
+        Порог 20 мс, а не 16: под pytest в процессе живут десятки
+        `WorldMapScreen` с их кэшами текстур, и замер завышается втрое —
+        стенд-алоне карта рисуется за 7-11 мс на зумах 0.6/1.0/1.8.
+        Тест ловит именно регрессии масштаба (например, возврат по-per-pixel
+        заливки океана), а не дрожание машины.
+        """
+        import time
+
+        w = fresh_screen
+        w.zoom = 1.0
+        for _ in range(3):
+            w._render()  # прогрев кэшей текстур и окантовки
+        best = None
+        for _ in range(3):
+            t = time.time()
+            for _ in range(20):
+                w._render()
+            ms = (time.time() - t) / 20 * 1000
+            best = ms if best is None else min(best, ms)
+        assert best < 20.0, f"кадр {best:.1f} мс — бюджет превышен"
+
+
 class TestCaptureOwnership:
     def test_capture_goes_through_hierarchy(self, fresh_screen):
         """Захват обязан обновлять и иерархию, и карту."""

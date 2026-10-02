@@ -21,7 +21,7 @@ from world_data import (
     RIVER_WEST_X, RIVER_EAST_X,
 )
 from diplomacy import DiplomacyManager, Relation
-from textures import TextureManager, GeneralIcon, RiverRenderer
+from textures import TextureManager, GeneralIcon, RiverRenderer, LandMask, build_map_frame
 from states import (
     build_default_hierarchy, TitleRank, CONTRACT_LEVELS,
     # приказы (этап 1.2 в states.py) — правила и статусы
@@ -47,6 +47,80 @@ OWNER_BORDER = {
     "blue": (95, 135, 205),
     "green": (95, 175, 105),
 }
+
+# Границы владений по толщине и контрасту. Раньше все провинции обводились
+# одной и той же линией в цвет владельца, и по карте было нельзя понять,
+# где своя территория, а где чужая, — приходилось читать цвет заливки.
+# Теперь толщина и вид несут смысл, а цвет только подсказывает, чья это
+# граница.
+#: Шов внутри одной нации: тонкая чернильная линия. Бледная линия на
+#: оливковом фоне читалась как царапина, а не как граница провинции —
+#: особенно на длинных горизонтальных швах между рядами, которые тянулись
+#: через полкарты.
+BORDER_INTERNAL = (96, 88, 62)
+#: Нейтральная земля: бледнее и пунктиром. Видна, но не выглядит
+#: захваченной — раньше нейтральные провинции не отличались от своих.
+BORDER_NEUTRAL = (150, 141, 104)
+#: Между державами: жирная тёмная краска плюс цветовая сердцевина.
+BORDER_FOREIGN_INK = (40, 36, 22)
+
+#: Ступени поселений. Индекс — уровень подписи: столица, город, деревня.
+#: Заодно это порядок приоритета при наложении подписей.
+_PLACE_TIERS = {RegionType.CAPITAL: 0, RegionType.CITY: 1, RegionType.VILLAGE: 2}
+#: Радиус кружка поселения, px. Тот же порядок, что и у шрифта.
+_PLACE_RADIUS = (8, 5, 3)
+#: Подпись — тёмная с 1px светлой обводкой, иначе она пропадала то на
+#: тёмном лесу, то на светлом поле, и её приходилось бы угадывать.
+_PLACE_INK = (34, 30, 18)
+_PLACE_HALO = (238, 230, 200)
+#: Ниже этого зума деревни не подписываются: на 0.6 все 50 названий
+#: сливаются в мелкую рябь и мешают читать города.
+_PLACE_VILLAGE_MIN_ZOOM = 1.0
+#: Границы подписи: сколько места она может занимать и сколько ей нужно,
+#: чтобы вообще что-то сказать. Порог считается от кегля: обрезанное до
+#: двух-трёх букв название («Sta…») читается хуже, чем отсутствие названия,
+#: поэтому такую подпись не рисуем вовсе — кружок на месте.
+_PLACE_LABEL_MAX_W = 190
+_PLACE_LABEL_MIN_W = 40
+_PLACE_LABEL_MIN_CHARS_PER_LINE = 3.5
+#: Запас вокруг силуэта суши под тень и обводку берега, в мировых px.
+_FRAME_PAD = 6
+
+#: Сторона клетки сетки занятых прямоугольников подписей.
+_LABEL_GRID_CELL = 64
+
+
+class _RectGrid:
+    """Кто уже занял место на карте — сеткой клеток, а не перебором всех.
+
+    Проверка «подпись ни на что не налезает» сама по себе копеечная, но при
+    50 подписях против 66 занятых прямоугольников это 3300 вызовов
+    ``colliderect`` на кадр, и третья по стоимости статья рендера после
+    блитов и рек. Сетка отсекает почти всё: у подписи проверяются только
+    клетки, которые она правда перекрывает.
+    """
+
+    __slots__ = ("cell", "buckets")
+
+    def __init__(self, cell: int = _LABEL_GRID_CELL):
+        self.cell = cell
+        self.buckets: Dict[Tuple[int, int], List[pygame.Rect]] = {}
+
+    def add(self, rect: pygame.Rect) -> None:
+        c = self.cell
+        for gy in range(rect.top // c, (rect.bottom - 1) // c + 1):
+            for gx in range(rect.left // c, (rect.right - 1) // c + 1):
+                self.buckets.setdefault((gx, gy), []).append(rect)
+
+    def hits(self, rect: pygame.Rect) -> bool:
+        c = self.cell
+        for gy in range(rect.top // c, (rect.bottom - 1) // c + 1):
+            for gx in range(rect.left // c, (rect.right - 1) // c + 1):
+                for other in self.buckets.get((gx, gy), ()):
+                    if rect.colliderect(other):
+                        return True
+        return False
+
 
 # Палитра границ провинций по рангу держателя. Базовые цвета — по владельцу,
 # оттенки ранга добавляются поверх: король насыщеннее, герцог светлее.
@@ -267,13 +341,22 @@ class WorldMapScreen:
         self._mouse_pos = (0, 0)
         self._hover_province = None
         self._zoom_cache = {}
-        # serif для подписей городов как на референсе
+        # Подписи поселений: три ступени, как на референсе. Раньше шрифтов
+        # было два, и города со столицами печатались одним и тем же кеглем,
+        # а деревни не подписывались вовсе — из 50 провинций игрок видел
+        # несколько названий и не знал, что находится в остальных.
         try:
-            self.font_city = pygame.font.SysFont("serif", 22)
-            self.font_city_small = pygame.font.SysFont("serif", 15)
+            self._place_fonts = (
+                pygame.font.SysFont("serif", 21),
+                pygame.font.SysFont("serif", 15),
+                pygame.font.SysFont("serif", 12),
+            )
         except Exception:
-            self.font_city = pygame.font.SysFont(None, 22)
-            self.font_city_small = pygame.font.SysFont(None, 15)
+            self._place_fonts = (
+                pygame.font.SysFont(None, 21),
+                pygame.font.SysFont(None, 15),
+                pygame.font.SysFont(None, 12),
+            )
 
         self.diplomacy = DiplomacyManager()
         self.provinces: List[Province] = [Province(p.name, p.owner, p.region_type,
@@ -348,6 +431,13 @@ class WorldMapScreen:
         self.tex_manager = TextureManager()
         self._build_province_offsets()
         self._build_static_surfaces()
+        self._build_world_bounds()
+        # Порядок отрисовки подписей: важное раньше неважного. Список
+        # статичен, меняется только вынос провинции под курсором вперёд,
+        # поэтому сортировка не повторяется каждый кадр.
+        self._place_order = sorted(
+            range(len(self.provinces)),
+            key=lambda i: (_PLACE_TIERS.get(self.provinces[i].region_type, 2), i))
 
     @property
     def is_finished(self) -> bool:
@@ -426,6 +516,33 @@ class WorldMapScreen:
         # ленивый кэш вычислений, привязанный к номеру хода
         self._turn_cache: Dict[Tuple[str, object], object] = {}
         self._turn_cache_turn: Optional[int] = None
+        # Окантовка карты (тень, берег, границы владений) целиком в одной
+        # поверхности мировых размеров. Собирается один раз на зум и на
+        # раскладку владений и в кадре уходит ровно на один блит.
+        self._frame: Optional[pygame.Surface] = None
+        self._frame_key: Optional[Tuple] = None
+        # Подписи поселений с обводкой и уже обрезанные по ширине: обе
+        # карты живут отдельно от _text_cache, потому что у подписи своя
+        # форма (с обводкой) и свой ключ (исходная строка + лимит ширины).
+        self._label_cache: Dict[Tuple, pygame.Surface] = {}
+        self._fit_cache: Dict[Tuple[str, int, int], str] = {}
+
+    def _build_world_bounds(self):
+        """Габариты суши в мировых координатах + запас под окантовку.
+
+        Поверхность окантовки должна быть чуть больше самой суши: тень уходит
+        вниз-вправо на несколько пикселей, а обводка берега — наружу от
+        контура, и без запаса они бы срезались краем поверхности.
+        """
+        xs = [x for prov in self.provinces for x, _ in prov.polygon]
+        ys = [y for prov in self.provinces for _, y in prov.polygon]
+        min_x, min_y = min(xs), min(ys)
+        self._frame_origin = (min_x - _FRAME_PAD, min_y - _FRAME_PAD)
+        self._frame_size = ((max(xs) - min_x) + _FRAME_PAD * 2,
+                            (max(ys) - min_y) + _FRAME_PAD * 2)
+        # Маска суши для рек: без неё они уходили в открытое море
+        self._land_mask = LandMask([p.polygon for p in self.provinces],
+                                   (min_x, min_y))
 
     def _build_connection_index(self):
         self._conn_by_province = {}
@@ -1500,6 +1617,73 @@ class WorldMapScreen:
             min(255, base[2] + tint[2]),
         )
 
+    def _border_style(self, idx: int, peer: int):
+        """Как рисовать границу между двумя провинциями: (цвет, цвет, px, пунктир).
+
+        Три случая, и различать их — смысл всей правки: игрок должен за
+        секунду видеть «это моё / это чужое».
+
+        * одна нация (включая пару нейтральных) — 1 px бледный шов: он не
+          должен спорить с границей державы, иначе внутренние перегородки
+          снова съедают всю карту;
+        * разные державы — жирная тёмная краска плюс цветовая сердцевина.
+          Сердцевина смесью цветов ОБЕих наций, а не цветом одной: смесь
+          симметрична, поэтому шов смотрится одинаково с обеих сторон и не
+          «прыгает», когда доли соседей меняются местами при перерисовке;
+        * нейтральная земля — 2 px заметно бледнее и пунктиром: её видно, но
+          она не выглядит захваченной.
+
+        Толщина в мировых координатах масштабируется зумом, поэтому на 0.6x
+        границы не сходятся в нить, а на 1.8x не превращаются в забор.
+        """
+        a, b = self.provinces[idx], self.provinces[peer]
+        z = self.zoom
+        if a.owner == b.owner:
+            if a.owner == "neutral":
+                return (BORDER_NEUTRAL, None, max(1, min(2, int(round(1.4 * z)))), True)
+            return (BORDER_INTERNAL, None, max(1, min(2, int(round(z)))), False)
+        if "neutral" in (a.owner, b.owner):
+            return (BORDER_NEUTRAL, None, max(1, min(3, int(round(2 * z)))), True)
+        ca, cb = self._border_color(idx, a), self._border_color(peer, b)
+        core = tuple((ca[i] + cb[i]) // 2 for i in range(3))
+        return (BORDER_FOREIGN_INK, core, max(2, min(4, int(round(3 * z)))), False)
+
+    def _ownership_signature(self) -> Tuple:
+        """Отпечаток раскладки владений для кэша окантовки.
+
+        Границы зависят и от владельца, и от ранга держателя (см.
+        ``_border_color``), а ранг меняется не только при захвате, но и при
+        смерти короля. Без ранга в ключе карта показывала бы прежние
+        границы до перезахода в экран.
+        """
+        sig = []
+        for prov in self.provinces:
+            rank = None
+            duchy_id = getattr(prov, "duchy_id", None)
+            if duchy_id and prov.owner != "neutral":
+                holder = self._holder_of_duchy(duchy_id)
+                rank = getattr(getattr(holder, "rank", None), "value", None)
+            sig.append((prov.owner, rank))
+        return tuple(sig)
+
+    def _map_frame(self) -> pygame.Surface:
+        """Кэшированная окантовка карты: тень, берег, границы владений.
+
+        Пересобирается только когда сменился зум или раскладка владений.
+        Камера, панель и время на неё не влияют, поэтому при обычном панорамировании
+        это просто блит готовой поверхности.
+        """
+        key = (round(self.zoom, 2), self._ownership_signature())
+        if self._frame is not None and self._frame_key == key:
+            return self._frame
+        self._frame = build_map_frame(
+            [p.polygon for p in self.provinces],
+            [p.owner for p in self.provinces],
+            self._frame_origin, self._frame_size,
+            self.zoom, self._border_style)
+        self._frame_key = key
+        return self._frame
+
     def _get_scaled_tex(self, i, tex):
         zr = round(self.zoom, 1)
         key = (i, zr, tex.get_width(), tex.get_height())
@@ -1545,6 +1729,66 @@ class WorldMapScreen:
             surf = font.render(text, True, color)
             self._text_cache[key] = surf
         return surf
+
+    def _cached_label(self, font, text: str) -> pygame.Surface:
+        """Подпись поселения с 1px светлой обводкой, готовая к блиту.
+
+        Обводка рисуется восемью смещёнными копиями глифа ПОВЕРХ кэшируемой
+        поверхности, а не в кадре: иначе пятьдесят подписей стоили бы
+        четырёхсот блитов вместо пятидесяти. Цвет обводки подобран под
+        пергамент, поэтому подпись читается и на тёмном лесу, и на светлом
+        поле.
+        """
+        key = (text, font.get_point_size(), _PLACE_INK, _PLACE_HALO)
+        surf = self._label_cache.get(key)
+        if surf is not None:
+            return surf
+        raw = font.render(text, True, _PLACE_INK)
+        pad = 1
+        surf = pygame.Surface((raw.get_width() + pad * 2, raw.get_height() + pad * 2),
+                              pygame.SRCALPHA)
+        halo = font.render(text, True, _PLACE_HALO)
+        for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1),
+                       (1, -1), (-1, 1), (-1, 0), (0, -1)):
+            surf.blit(halo, (pad + dx, pad + dy))
+        surf.blit(raw, (pad, pad))
+        if len(self._label_cache) >= _TEXT_CACHE_LIMIT:
+            self._label_cache.clear()
+        self._label_cache[key] = surf
+        return surf
+
+    def _fit_place_name(self, font, text: str, max_w: int) -> str:
+        """Обрезать название поселения по ширине, вручную добавив многоточие.
+
+        ``pygame.font`` не умеет многоточие, а встроить его в имя нельзя:
+        подпись должна говорить, что название не поместилось, а не молчать.
+        Режем по символам (названия графств — одно слово, резать по словам
+        тут нечего) и обязательно оставляем многоточие. Результат кэшируется:
+        подпись не меняется, а пересчёт ширины в кадре — работа напрасная.
+        """
+        if max_w <= 0:
+            return ""
+        key = (text, font.get_point_size(), int(max_w))
+        fit = self._fit_cache.get(key)
+        if fit is not None:
+            return fit
+        low, high, best = 1, len(text), ""
+        if font.size(text)[0] <= max_w:
+            # Название помещается целиком — многоточие тут было бы враньём,
+            # оно читается как «дальше есть название, которое не влезло».
+            best = text
+        else:
+            while low <= high:
+                mid = (low + high) // 2
+                cut = text[:mid] + "…"
+                if font.size(cut)[0] <= max_w:
+                    best, low = cut, mid + 1
+                else:
+                    high = mid - 1
+        if len(self._fit_cache) >= _TEXT_CACHE_LIMIT:
+            self._fit_cache.clear()
+        self._fit_cache[key] = best
+        return best
 
     def _invalidate_panel(self):
         """Сбросить кэш вычислений и пометить панель владений на перерисовку.
@@ -1635,13 +1879,10 @@ class WorldMapScreen:
 
     def _render(self):
         view_h = SCREEN_HEIGHT - 80
-        ocean = self.tex_manager.get_ocean_texture(SCREEN_WIDTH, view_h)
-        if abs(self.zoom - 1.0) > 0.02:
-            try:
-                ocean = pygame.transform.scale(ocean, (SCREEN_WIDTH, view_h))
-            except Exception:
-                pass
-        self.screen.blit(ocean, (0, 0))
+        # Море готовится один раз и блитится как есть. Раньше здесь стоял
+        # pygame.transform.scale в тот же размер — то есть 4 мс на кадр
+        # на ровно ничего, кроме лишней копии 1.6 млн пикселей.
+        self.screen.blit(self.tex_manager.get_ocean_texture(SCREEN_WIDTH, view_h), (0, 0))
 
         for i, prov in enumerate(self.provinces):
             xs = [p[0] for p in prov.polygon]
@@ -1656,20 +1897,22 @@ class WorldMapScreen:
             sy = int((min_y - self.cam_y) * self.zoom - 4 * self.zoom)
             self.screen.blit(stex, (sx, sy))
 
+        # Тень, берег и границы владений — одним блитом кэшированной
+        # поверхности. Тень лежит вне силуэта суши, поэтому её не нужно
+        # засовывать под текстуры, а границы по определению поверх.
+        self.screen.blit(self._map_frame(), self._frame_origin_screen())
+
+        if self._hover_province is not None:
+            prov = self.provinces[self._hover_province]
             screen_poly = [self._world_to_screen(x, y) for x, y in prov.polygon]
-            border_col = self._border_color(i, prov)
             try:
-                pygame.draw.polygon(self.screen, border_col, screen_poly, max(1, int(2 * self.zoom)))
+                pygame.draw.polygon(self.screen, (255, 250, 220), screen_poly,
+                                    max(1, int(1 * self.zoom)))
             except Exception:
                 pass
-            if i == self._hover_province:
-                try:
-                    pygame.draw.polygon(self.screen, (255, 250, 220), screen_poly, max(1, int(1 * self.zoom)))
-                except Exception:
-                    pass
 
         self._render_rivers()
-        self._render_city_labels()
+        self._render_settlements()
         self._render_move_route()
 
         for general in self.generals:
@@ -1708,36 +1951,156 @@ class WorldMapScreen:
 
         pygame.display.flip()
 
-    def _render_city_labels(self):
-        # подписи как на референсе: точка + serif-название
-        from world_data import RegionType
+    def _frame_origin_screen(self) -> Tuple[int, int]:
+        """Левый верхний угол поверхности окантовки на экране."""
+        return (int((self._frame_origin[0] - self.cam_x) * self.zoom),
+                int((self._frame_origin[1] - self.cam_y) * self.zoom))
+
+    def _render_settlements(self):
+        """Кружки поселений, значки гарнизонов и подписи названий.
+
+        Самое заметное, чего не хватало карте: подписано ВСЁ поселение, а не
+        только города. Из пятидесяти провинций игрок видел единицы названий и
+        не знал, что находится в остальных сорока девяти.
+
+        Кружки рисуются всем и всегда — они мелкие и не спорят друг с другом.
+        Подписи не помещаются все сразу, поэтому у каждой есть прямоугольник,
+        и подпись, столкнувшаяся с уже нарисованной, просто не рисуется.
+        Приоритет: провинция под курсором, потом столица, город, деревня.
+        """
+        view_h = SCREEN_HEIGHT - 80
+        dots: Dict[int, Tuple[int, int, int]] = {}
         for i, prov in enumerate(self.provinces):
+            tier = _PLACE_TIERS.get(prov.region_type, 2)
             cx, cy = prov.centroid
             sx, sy = self._world_to_screen(cx, cy)
-            if sx < -100 or sx > SCREEN_WIDTH + 100 or sy < -50 or sy > SCREEN_HEIGHT:
+            if sx < -80 or sx > SCREEN_WIDTH + 80 or sy < -40 or sy > view_h + 40:
                 continue
-            is_city = prov.region_type in (RegionType.CITY, RegionType.CAPITAL)
-            if not is_city and self.zoom < 1.2 and i != self._hover_province:
+            r = _PLACE_RADIUS[tier]
+            self._draw_settlement_mark(sx, sy, r, tier)
+            self._draw_garrison_mark(sx, sy, r, prov)
+            dots[i] = (sx, sy, r)
+
+# Кружки и таблички знамён занимают место первыми: подпись, севшая на
+        # соседний город или под табличку армии, читается хуже, чем подпись,
+        # которую можно сдвинуть. Знамя рисуется ПОСЛЕ подписей, поэтому
+        # подпись под ним не просто налезает — её разрезает пополам.
+        dot_rects: Dict[int, List[pygame.Rect]] = {0: [], 1: [], 2: []}
+        for i, (sx, sy, r) in dots.items():
+            dot_rects[_PLACE_TIERS.get(self.provinces[i].region_type, 2)].append(
+                pygame.Rect(sx - r - 1, sy - r - 1, r * 2 + 2, r * 2 + 2))
+        plate_by_province: Dict[int, pygame.Rect] = {}
+        for g in self.generals:
+            if g.province_idx is None or g.province_idx >= len(self.provinces):
                 continue
-            font = self.font_city if is_city else self.font_city_small
-            # точка города
-            if is_city:
-                pygame.draw.circle(self.screen, (20, 18, 12), (sx, sy), 5)
-                pygame.draw.circle(self.screen, (240, 235, 215), (sx, sy), 4)
-                pygame.draw.circle(self.screen, (20, 18, 12), (sx, sy), 2)
-            name = prov.name
-            # тень + светлый текст (строки из кэша — подписи не меняются)
-            shadow = self._cached_text(font, name, (25, 22, 12))
-            text = self._cached_text(font, name, (242, 236, 214))
-            self.screen.blit(shadow, (sx + 8 + 1, sy - 12 + 1))
-            self.screen.blit(text, (sx + 8, sy - 12))
+            cx, cy = self.provinces[g.province_idx].centroid
+            gx, gy = self._world_to_screen(cx, cy - 18)
+            plate = GeneralIcon._label_plate(f"{g.name} {g.troops}",
+                                            max(10, int(12 * self.zoom)))
+            rect = plate.get_rect()
+            rect.midtop = (int(gx), int(gy) + int(12 * self.zoom))
+            plate_by_province.setdefault(g.province_idx, rect)
+
+        # Сеток столько же, сколько ступеней: grids[t] — это «занято для
+        # подписи ступени t». Таблички и кружки попадают во все сетки от
+        # своей ступени и выше, потому что подписи младших ступеней держат
+        # расстояние от важных знаков; уже нарисованная подпись — во все.
+        grids = [_RectGrid() for _ in range(len(dot_rects))]
+        for rect in plate_by_province.values():
+            for grid in grids:
+                grid.add(rect)
+        for tier, rects in dot_rects.items():
+            for grid in grids[tier:]:
+                for rect in rects:
+                    grid.add(rect)
+
+        order = self._place_order
+        hover = self._hover_province
+        if hover is not None:
+            order = [hover] + [i for i in order if i != hover]
+        for i in order:
+            tier = _PLACE_TIERS.get(self.provinces[i].region_type, 2)
+            if tier == 2 and self.zoom < _PLACE_VILLAGE_MIN_ZOOM and i != hover:
+                continue
+            dot = dots.get(i)
+            if dot is None:
+                continue
+            sx, sy, r = dot
+            font = self._place_fonts[tier]
+            # Подпись справа от кружка. Если в этой провинции стоит знамя —
+            # то за краями ТАБЛИЧКИ, а не кружка: знамя шире кружка, и
+            # подпись, вставленная между ними, всё равно оказывалась под
+            # табличкой. Вариантов два, и берётся первый свободный: у
+            # правого края экрана иначе выходило «…verhold».
+            need = max(_PLACE_LABEL_MIN_W,
+                       int(font.get_height() * _PLACE_LABEL_MIN_CHARS_PER_LINE))
+            own_plate = plate_by_province.get(i)
+            if own_plate is not None:
+                candidates = ((own_plate.left - 5, False),
+                              (own_plate.right + 5, True))
+            else:
+                candidates = ((sx + r + 5, True), (sx - r - 5, False))
+            grid = grids[tier]
+            for place_x, on_right in candidates:
+                room = (SCREEN_WIDTH - place_x - 6 if on_right else place_x - 6)
+                max_w = min(_PLACE_LABEL_MAX_W, room)
+                if max_w < need:
+                    continue
+                name = self._fit_place_name(font, self.provinces[i].name, max_w)
+                if not name:
+                    continue
+                surf = self._cached_label(font, name)
+                rect = surf.get_rect()
+                if on_right:
+                    rect.left = place_x
+                else:
+                    rect.right = place_x
+                rect.top = sy - surf.get_height() // 2
+                if grid.hits(rect):
+                    continue
+                for each in grids:
+                    each.add(rect)
+                self.screen.blit(surf, rect.topleft)
+                break
+
+    def _draw_settlement_mark(self, sx: int, sy: int, r: int, tier: int):
+        """Кружок поселения: тёмный круг в светлой обводке, как на референсе.
+
+        Размер по типу: столица — с точкой посередине и двойным кольцом,
+        город — просто кольцо, деревня — мелкая точка. Размеры взяты из
+        одного места (``_PLACE_RADIUS``) вместе с кеглем подписи, иначе
+        столица могла бы оказаться мельче деревни.
+        """
+        pygame.draw.circle(self.screen, _PLACE_HALO, (sx, sy), r)
+        pygame.draw.circle(self.screen, _PLACE_INK, (sx, sy), max(1, r - 1))
+        if tier == 0:
+            pygame.draw.circle(self.screen, _PLACE_HALO, (sx, sy), 3)
+            pygame.draw.circle(self.screen, _PLACE_INK, (sx, sy), 2)
+        elif tier == 1:
+            pygame.draw.circle(self.screen, _PLACE_HALO, (sx, sy), 1)
+
+    def _draw_garrison_mark(self, sx: int, sy: int, r: int, prov):
+        """Значок башни у провинции с гарнизоном.
+
+        Без него игрок не видел, где держава уже закрепилась: владение на
+        карте выглядело писем на паузе — цвет есть, а защиты не видно.
+        """
+        if int(getattr(prov, "garrison", 0) or 0) <= 0:
+            return
+        tx = sx + r + 3
+        ty = sy - r - 2
+        pygame.draw.rect(self.screen, _PLACE_INK, (tx, ty, 4, 6))
+        pygame.draw.rect(self.screen, _PLACE_INK, (tx - 1, ty - 1, 6, 1))
+        pygame.draw.line(self.screen, _PLACE_HALO, (tx + 1, ty + 1), (tx + 1, ty + 4))
+
 
     def _render_rivers(self):
         t = pygame.time.get_ticks()
 
         for river_x in [RIVER_WEST_X, RIVER_EAST_X]:
             RiverRenderer.draw_river(self.screen, river_x, self.cam_x, self.cam_y,
-                                     SCREEN_HEIGHT, t, zoom=self.zoom)
+                                     SCREEN_HEIGHT, t, zoom=self.zoom,
+                                     land=self._land_mask)
 
             bridge_indices = []
             for a, b in BRIDGE_CONNECTIONS:
