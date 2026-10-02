@@ -33,6 +33,9 @@ import pytest
 
 from sim import dumps, from_jsonable, loads, new_streams, register_enum, state_hash, to_jsonable
 from states import (
+    CHARACTERS_AGE_PER_TURN,
+    CHARACTERS_DEATH_AGE_SPREAD,
+    CHARACTER_DEATH_AGE,
     COMMAND_MIN_RANK,
     CONTRACT_CHANGES_PER_TURN,
     CONTRACT_LEVELS,
@@ -43,6 +46,8 @@ from states import (
     CROWN_COST,
     CROWN_PRESTIGE_COST,
     CROWN_RAISES_PER_TURN,
+    DEATH_CAUSE_AGE,
+    DEATH_CAUSE_KILLED,
     DEVELOPMENTS_PER_TURN,
     DEVELOPMENT_MAX,
     DEV_COST_BASE,
@@ -78,6 +83,7 @@ from states import (
     MERC_QUALITY_STREAM,
     MERC_SALT_STRIDE,
     MERC_TIER_THRESHOLDS,
+    NEUTRAL_NATION,
     ORDER_DEADLINE_TURNS,
     ORDER_DEFAULT_WEIGHT,
     ORDER_REFUSAL_FLOOR,
@@ -92,6 +98,7 @@ from states import (
     ROYAL_COURT_BASE_COST,
     ROYAL_COURT_PRESTIGE_DIVISOR,
     STATE_VERSION,
+    SUCCESSION_CRISIS_TURNS,
     TAX_POLICY_CROWN_AUTHORITY,
     TAX_POLICY_MAX,
     TAX_POLICY_MIN,
@@ -101,11 +108,14 @@ from states import (
     Order,
     OrderKind,
     OrderStatus,
+    SuccessionCrisis,
     Tier,
     TitleRank,
     VassalContract,
     as_int,
+    auto_inherit,
     build_default_hierarchy,
+    character_death_age,
     clean_mercenary_tiers,
     clean_order_args,
     development_tax_multiplier,
@@ -145,13 +155,35 @@ FORBIDDEN_STATE_KEYS: Tuple[str, ...] = (
 #: Точный набор ВЕРХНЕУРОВНЕВЫХ ключей снапшота. Жёстко зафиксирован, потому
 #: что это весь контракт ``to_state``: лишний ключ — это либо мусор в хеше, либо
 #: обещание, которого ``from_state`` не сдержит. Вынесено в одну константу,
-#: потому что проверяется в двух местах, и раньше эти два места уже разошлись
-#: бы при добавлении поля. ``orders`` добавлен этапом 1.2: у приказа есть срок
-#: и последствия, поэтому это состояние, а не история.
+#: потому что проверяется в четырёх местах, и раньше эти места уже разошлись бы
+#: при добавлении поля. ``orders`` добавлен этапом 1.2: у приказа есть срок
+#: и последствия, поэтому это состояние, а не история. ``succession_crises``
+#: добавлен этапом 4: пустой трон — это тоже состояние, а не строчка в журнале.
 SNAPSHOT_KEYS = {
     "version", "turn", "log", "log_truncated",
-    "realms", "duchies", "characters", "contracts", "orders", "counties",
+    "realms", "duchies", "characters", "contracts", "orders",
+    "succession_crises", "counties",
 }
+
+#: Герцогства, у которых на текущей карте есть de-факто держатель (этап 2):
+#: нация владеет строгим большинством de jure провинций. Карта зафиксирована в
+#: ``world_data.py``, и таблица ниже — её проверка на владение: если параллельный
+#: агент перекрасит провинцию, тест упадёт с понятным сообщением, а не
+#: «доход герцогства неожиданно изменился».
+EXPECTED_DE_FACTO_HOLDERS: Dict[str, str] = {
+    "ravenhold": "duke_aldric",    # red 4:1
+    "blackridge": "duke_vasya",    # red 3:2
+    "emberfall": "duke_brenna",    # blue 4:1
+    "dawnmarch": "duke_theon",     # blue 3:2
+    "leafguard": "duke_lyra",      # green 5:0
+}
+
+#: Герцогства без de-факто держателя: большинства нет (ничья или полный
+#: нейтралитет). ``goldfield`` здесь — важный случай: 2 зелёные из 5, то есть
+#: ровно НЕ большинство, поэтому герцогства нет, хотя нация там что-то имеет.
+NEUTRAL_DUCHIES: Tuple[str, ...] = (
+    "northmark", "southmarch", "stonewaste", "greymoor", "goldfield",
+)
 
 
 # --------------------------------------------------------------------------
@@ -722,15 +754,95 @@ class TestEconomy:
 
     # --- агрегаты ---
 
-    def test_duchy_income_equals_sum_of_county_incomes(self):
-        for duchy in self.h.duchies.values():
-            expected = sum(self.h.county_income(i) for i in duchy.de_jure_provinces)
-            assert self.h.duchy_income(duchy.id) == expected, duchy.id
+    def test_duchy_income_counts_only_provinces_of_the_de_facto_nation(self):
+        """Этап 2. Прежний тест жёстко закреплял ДВОЙНОЙ ДОХОД и был багом.
 
-    def test_duchy_levy_equals_sum_of_county_levies(self):
+        Старое поведение было таким: ``duchy_income`` суммировал ``county_income``
+        по ВСЕМ de jure провинциям герцогства, не глядя на ``province.owner``.
+        То есть завоёванное иностранное графство платило и завоевателю
+        (``realm_income`` считается по ``owner``), и прежнему герцогу (здесь — по
+        титулу): одна и та же деревня засчитывалась в доход дважды, и
+        ``summary()`` показывал игроку сумму, которую никто не получал.
+
+        Правильная семантика: платит нация de-факто держателя и только те
+        графства, которые реально её. Поэтому проверка идёт не по de jure, а по
+        ``counties_factually_held``.
+        """
         for duchy in self.h.duchies.values():
-            expected = sum(self.h.county_levy(i) for i in duchy.de_jure_provinces)
+            holder = self.h.de_facto_holder_of_duchy(duchy.id)
+            if holder is None:
+                assert self.h.duchy_income(duchy.id) == 0, duchy.id
+                continue
+            owned = self.h.counties_factually_held(duchy.id, holder.nation)
+            expected = sum(self.h.county_income(i) for i in owned)
+            assert self.h.duchy_income(duchy.id) == expected, duchy.id
+            assert owned, f"{duchy.id}: у держателя нет ни одного графства"
+
+    def test_duchy_levy_counts_only_provinces_of_the_de_facto_nation(self):
+        """Тот же контракт для левейса (был суммой по всем de jure провинциям)."""
+        for duchy in self.h.duchies.values():
+            holder = self.h.de_facto_holder_of_duchy(duchy.id)
+            if holder is None:
+                assert self.h.duchy_levy(duchy.id) == 0, duchy.id
+                continue
+            owned = self.h.counties_factually_held(duchy.id, holder.nation)
+            expected = sum(self.h.county_levy(i) for i in owned)
             assert self.h.duchy_levy(duchy.id) == expected, duchy.id
+
+    def test_random_world_income_is_still_consistent(self):
+        # те же случайные поселения, но сверка идёт по правильной семантике:
+        # по de jure сумма уже не равна дукционному доходу, и это НЕ баг
+        rng = random.Random(12345)
+        for idx in range(50):
+            p = self.h.provinces[idx]
+            p.hearths = rng.randint(0, 2000)
+            p.security = rng.randint(0, 20)
+        for duchy in self.h.duchies.values():
+            holder = self.h.de_facto_holder_of_duchy(duchy.id)
+            if holder is None:
+                assert self.h.duchy_income(duchy.id) == 0
+                continue
+            assert self.h.duchy_income(duchy.id) == sum(
+                self.h.county_income(i)
+                for i in self.h.counties_factually_held(duchy.id, holder.nation))
+
+    def test_duchy_income_does_not_double_count_a_conquered_county(self):
+        """ГЛАВНЫЙ тест этапа 2: одна провинция платит ровно один раз.
+
+        Захватываем чужое графство и проверяем, что прежний герцог перестаёт его
+        видеть в своём доходе, а завоеватель платит за него один раз — в сумме
+        по realm'ам, а не дважды поrealm'ам.
+        """
+        # Завоёвываем emberfall (25-29) нации red. De jure герцог — duke_brenna из
+        # blue: его титул захват не отбирает.
+        for idx in (25, 26, 27, 28, 29):
+            self.h.transfer_county(idx, "red", None, cause="захват")
+        emberfall = self.h.duchies["emberfall"]
+        assert emberfall.holder_id == "duke_brenna", "de jure титул не отбирается"
+        assert self.h.majority_nation_of_duchy("emberfall") == "red"
+        # де-факто правителем становится КОРОЛЬ red: держателя дукции у red в
+        # этом герцогстве нет, и страна правит своей областью через трон
+        assert emberfall.de_facto_holder_id == "king_erik"
+        assert self.h.de_facto_holder_of_duchy("emberfall") is \
+            self.h.characters["king_erik"]
+        owned_by_red = self.h.counties_factually_held("emberfall", "red")
+        assert owned_by_red == [25, 26, 27, 28, 29]
+        assert self.h.duchy_income("emberfall") == sum(
+            self.h.county_income(i) for i in owned_by_red)
+        # прежний герцог blue больше не получает дохода за эти графства
+        assert self.h.counties_factually_held("emberfall", "blue") == []
+        # и ни одно графство не платит дважды: сумма по realm'ам равна сумме
+        # по фактическим владельцам провинций
+        total = sum(self.h.realm_income(r) for r in self.h.realms)
+        by_nation = sum(self.h.county_income(i) for i, p in enumerate(self.h.provinces)
+                        if p.owner != "neutral")
+        assert total == by_nation, "ни одно графство не должно платить дважды"
+
+    def test_neutral_duchy_pays_nobody(self):
+        for duchy_id in NEUTRAL_DUCHIES:
+            assert self.h.de_facto_holder_of_duchy(duchy_id) is None, duchy_id
+            assert self.h.majority_nation_of_duchy(duchy_id) is None, duchy_id
+            assert self.h.duchy_income(duchy_id) == 0, duchy_id
 
     def test_realm_income_counts_only_own_provinces(self):
         for realm in self.h.realms.values():
@@ -763,16 +875,6 @@ class TestEconomy:
             )
             assert self.h.county_income(idx) >= 0, idx
             assert self.h.county_levy(idx) >= 0, idx
-
-    def test_random_world_income_is_still_consistent(self):
-        rng = random.Random(12345)
-        for idx in range(50):
-            p = self.h.provinces[idx]
-            p.hearths = rng.randint(0, 2000)
-            p.security = rng.randint(0, 20)
-        for duchy in self.h.duchies.values():
-            assert self.h.duchy_income(duchy.id) == sum(
-                self.h.county_income(i) for i in duchy.de_jure_provinces)
 
 
 # --------------------------------------------------------------------------
@@ -3206,9 +3308,29 @@ class TestOrderRights:
                                                 by_actor=RIGHTS_DUKE), "мёртв")
 
     def test_junk_actor_is_refused_and_does_not_crash(self):
-        for junk in (None, 7, 3.5, ["duke_lyra"], object()):
-            events = self.h.revoke_fief(RIGHTS_BARON, by_actor=junk)
-            assert isinstance(events, list) and len(events) == 1
+        # None — это НЕ мусор, а документированный путь «без проверки прав»
+        # (его зовут старые тесты и UI), поэтому он проверяется отдельно ниже.
+        # Здесь только настоящий мусор: и он обязан дать ровно ОДИН отказ.
+        for junk in (7, 3.5, ["duke_lyra"], object()):
+            self.assert_refused(self.h.revoke_fief(RIGHTS_BARON, by_actor=junk))
+
+    def test_junk_actor_still_refused_while_revocation_returns_two_events(self):
+        """Этап 2: отзыв теперь возвращает событие ПЕРЕДАЧИ плюс своё.
+
+        Прежде ``_revoke_fief_now`` просто обнулял ``province_idx`` и возвращал
+        одну строку. Теперь он идёт через ``transfer_county``, и журнал честно
+        рассказывает, что графство освободилось, а затем — что барон лишён земли
+        и какое у него мнение. Два события вместо одного — это не поломка, а
+        информация; проверять «ровно одно» здесь было бы проверкой старой
+        бедности лога.
+        """
+        assert self.h.revoke_fief(RIGHTS_BARON, by_actor=7)
+        events = self.h.revoke_fief(RIGHTS_BARON)
+        assert len(events) == 2, events
+        assert "теряет Verdant" in events[0], events
+        assert "лишён земли" in events[1], events
+        again = self.h.revoke_fief(RIGHTS_BARON)
+        assert len(again) == 1, "повторный отзыв ничего не передаёт"
 
     def test_dead_target_is_refused(self):
         self.h.characters[RIGHTS_BARON].alive = False
@@ -4045,3 +4167,940 @@ class TestOrders:
         assert "action_ledger" not in all_keys(state)
         self.h.end_turn()
         assert self.h.action_ledger == {}
+
+# --------------------------------------------------------------------------
+# Этап 2: передача владений (de jure vs de facto)
+# --------------------------------------------------------------------------
+
+
+class TestTransferCounty:
+    """``transfer_county`` — единственная точка смены владельца графства.
+
+    Контракт, который здесь защищается:
+
+    * ``province.owner`` меняется на ``new_nation``;
+    * прежний держатель теряет ``province_idx`` и становится безземельным;
+    * новый держатель получает графство, а его ``duchy_id`` пересчитывается;
+    * ``contracts[id].liege_id`` пересчитывается — «вассал по контракту» и
+      «вассал по ``liege_of``» обязаны быть одним человеком;
+    * ``de_facto_holder_id`` пересчитывается у прежнего и нового герцогства;
+    * прежний держатель НЕ теряет ``duchy_id``;
+    * мусор на входе не меняет состояние.
+    """
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+        # 41 — Verdant, зелёная, в leafguard, её держит baron_thorn
+        self.county = 41
+        self.holder = self.h.characters["baron_thorn"]
+
+    def test_owner_follows_the_new_nation(self):
+        events = self.h.transfer_county(self.county, "red", "baron_scar",
+                                        cause="захват на карте")
+        assert self.h.provinces[self.county].owner == "red"
+        assert self.h.characters["baron_scar"].province_idx == self.county
+        assert any("захват на карте" in e for e in events), events
+
+    def test_previous_holder_becomes_landless(self):
+        assert self.holder.province_idx == self.county
+        self.h.transfer_county(self.county, "red", None)
+        assert self.holder.province_idx is None
+        assert self.holder.landless_turns == 0
+        assert not self.holder.is_ruler
+
+    def test_landless_holder_starts_losing_opinion(self):
+        before = self.holder.opinion_of_liege
+        self.h.transfer_county(self.county, "red", None)
+        self.h.tick_vassals()
+        assert self.holder.landless_turns == 1
+        assert self.holder.opinion_of_liege == before - LANDLESS_OPINION_DECAY
+
+    def test_previous_holder_keeps_his_duchy(self):
+        self.h.transfer_county(self.county, "red", None)
+        assert self.holder.duchy_id == "leafguard", \
+            "потеря графства не должна выкидывать из дукции"
+
+    def test_new_holder_duchy_is_recomputed(self):
+        assert self.h.characters["baron_wolf"].duchy_id == "greymoor"
+        self.h.transfer_county(self.county, "red", "baron_wolf")
+        assert self.h.characters["baron_wolf"].duchy_id == "leafguard"
+
+    def test_holder_of_a_duchy_keeps_his_duchy_when_given_a_county(self):
+        # подарок графства герцогу НЕ отнимает дукцию: иначе все его бароны
+        # осиротели бы через liege_of
+        duke = self.h.characters["duke_lyra"]
+        self.h.transfer_county(44, duke.nation, duke.id)
+        assert duke.duchy_id == "leafguard"
+        assert self.h.duchies["leafguard"].holder_id == "duke_lyra"
+        assert {c.id for c in self.h.vassals_of("duke_lyra")} == \
+            {"baron_thorn", "baron_moss"}
+
+    def test_contract_liege_is_recomputed_for_the_new_holder(self):
+        # baron_thorn был вассалом duke_lyra; переносим его в greymoor
+        self.h.transfer_county(37, "green", "baron_thorn")
+        assert self.h.characters["baron_thorn"].duchy_id == "greymoor"
+        liege = self.h.liege_of("baron_thorn")
+        assert liege is not None and liege.id == "duke_orso"
+        assert self.h.contracts["baron_thorn"].liege_id == liege.id
+
+    def test_contract_liege_is_recomputed_for_the_previous_holder(self):
+        # прежний держатель теряет графство, но остаётся вассалом своего герцога,
+        # поэтому контракт у него сохраняется — терять его было бы ошибкой
+        self.h.transfer_county(self.county, "red", None)
+        assert self.holder.province_idx is None
+        assert self.h.contracts["baron_thorn"].liege_id == "duke_lyra"
+        assert self.h.liege_of("baron_thorn").id == "duke_lyra"
+
+    def test_contract_is_dropped_when_there_is_no_liege(self):
+        # goldfield не имеет герцога — сюзерена нет, значит и контракта нет
+        self.h.transfer_county(47, "green", "baron_thorn")
+        assert self.h.characters["baron_thorn"].duchy_id == "goldfield"
+        assert self.h.liege_of("baron_thorn") is None
+        assert "baron_thorn" not in self.h.contracts
+
+    def test_de_facto_holder_is_recomputed_on_both_sides(self):
+        before = self.h.duchies["leafguard"].de_facto_holder_id
+        assert before == "duke_lyra"
+        # отдаём 3 из 5 провинций leafguard красным — это большинство
+        for idx in (40, 42, 43):
+            self.h.transfer_county(idx, "red", None)
+        assert self.h.duchies["leafguard"].de_facto_holder_id == "king_erik"
+        assert self.h.duchies["leafguard"].holder_id == "duke_lyra", \
+            "de jure титул не отбирается"
+        # прежнее герцогство нового держателя тоже пересчитано
+        assert self.h.majority_nation_of_duchy("greymoor") is None
+
+    def test_events_report_the_owner_change(self):
+        events = self.h.transfer_county(self.county, "red", None, cause="битва")
+        assert any("green → red" in e for e in events), events
+        assert any("битва" in e for e in events), events
+
+    def test_junk_input_changes_nothing(self):
+        before = self.h.state_fingerprint()
+        for args in ((None, "red", None), (-1, "red", None), (999, "red", None),
+                     (True, "red", None), (41, None, None), (41, 7, None),
+                     (41, "", None), (41, "red", "baron_ghost")):
+            assert self.h.transfer_county(*args) == [], args
+        assert self.h.state_fingerprint() == before
+
+    def test_transfer_to_the_same_holder_is_idempotent_in_state(self):
+        self.h.transfer_county(self.county, "green", "baron_thorn")
+        assert self.h.characters["baron_thorn"].province_idx == self.county
+        assert self.h.provinces[self.county].owner == "green"
+
+    def test_holder_of_county_finds_the_holder(self):
+        assert self.h.holder_of_county(self.county) is self.holder
+        assert self.h.holder_of_county(0) is None
+        assert self.h.holder_of_county(-5) is None
+
+
+class TestDeFactoOwnership:
+    """Правило «герцогство де-факто принадлежит большинству» и его следствия.
+
+    Проверяется на КОНКРЕТНОЙ карте: ``EXPECTED_DE_FACTO_HOLDERS`` и
+    ``NEUTRAL_DUCHIES`` — это утверждение о ``world_data.py``. Если параллельный
+    агент перекрасит провинцию, тест упадёт сразу и с понятным сообщением, а не
+    через три других теста.
+    """
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    def test_fresh_world_has_de_facto_holders_where_the_majority_is(self):
+        for duchy_id, holder_id in EXPECTED_DE_FACTO_HOLDERS.items():
+            duchy = self.h.duchies[duchy_id]
+            assert duchy.de_facto_holder_id == holder_id, duchy_id
+            assert self.h.de_facto_holder_of_duchy(duchy_id) is \
+                self.h.characters[holder_id]
+
+    def test_fresh_world_has_no_de_facto_holder_without_a_majority(self):
+        for duchy_id in NEUTRAL_DUCHIES:
+            assert self.h.duchies[duchy_id].de_facto_holder_id is None, duchy_id
+
+    def test_neutral_is_never_a_nation(self):
+        # полностью нейтральное герцогство не должно объявлять «большинство»
+        # из словаря, где единственный ключ — это «никто»
+        assert self.h.majority_nation_of_duchy("northmark") is None
+        assert self.h.majority_nation_of_duchy("greymoor") is None
+        for duchy_id in EXPECTED_DE_FACTO_HOLDERS:
+            assert self.h.majority_nation_of_duchy(duchy_id) != NEUTRAL_NATION
+
+    def test_majority_must_be_strict(self):
+        # goldfield: 2 зелёные из 5 — это ровно НЕ большинство
+        assert self.h.majority_nation_of_duchy("goldfield") is None
+        self.h.transfer_county(46, "red", None)
+        assert self.h.majority_nation_of_duchy("goldfield") is None, "2:2 — ничья"
+        self.h.transfer_county(47, "green", None)
+        self.h.transfer_county(48, "green", None)
+        assert self.h.majority_nation_of_duchy("goldfield") == "green", "3:2 — да"
+        assert self.h.de_facto_holder_of_duchy("goldfield") is \
+            self.h.characters["king_sigurd"], "de jure герцога тут нет вовсе"
+
+    def test_majority_of_three_out_of_five_is_enough(self):
+        for idx in (45, 46, 47):
+            self.h.transfer_county(idx, "green", None)
+        assert self.h.majority_nation_of_duchy("goldfield") == "green"
+
+    def test_without_a_strict_majority_the_duchy_pays_nobody(self):
+        # leafguard: 1 зелёная, 2 синие, 2 красные — ни у кого нет половины
+        self.h.transfer_county(41, "blue", None)
+        self.h.transfer_county(42, "blue", None)
+        self.h.transfer_county(43, "red", None)
+        self.h.transfer_county(44, "red", None)
+        assert self.h.majority_nation_of_duchy("leafguard") is None
+        assert self.h.de_facto_holder_of_duchy("leafguard") is None
+        assert self.h.duchy_income("leafguard") == 0
+        assert self.h.duchies["leafguard"].holder_id == "duke_lyra", \
+            "de jure титул остаётся, даже когда страна раздроблена"
+
+    def test_three_out_of_five_is_a_majority(self):
+        self.h.transfer_county(40, "blue", None)
+        self.h.transfer_county(41, "blue", None)
+        self.h.transfer_county(42, "blue", None)
+        assert self.h.majority_nation_of_duchy("leafguard") == "blue"
+        assert self.h.de_facto_holder_of_duchy("leafguard") is \
+            self.h.characters["king_rurik"]
+
+    def test_de_facto_holder_falls_back_to_the_king_of_the_nation(self):
+        # захватываем emberfall целиком: de jure герцог — синий duke_brenna,
+        # а править областью придётся красному трону
+        for idx in (25, 26, 27, 28, 29):
+            self.h.transfer_county(idx, "red", None, cause="захват")
+        assert self.h.duchies["emberfall"].holder_id == "duke_brenna"
+        assert self.h.duchies["emberfall"].de_facto_holder_id == "king_erik"
+
+    def test_de_facto_holder_is_none_when_the_nation_has_no_ruler(self):
+        self.h.kill_character("king_sigurd")
+        assert self.h.duchies["leafguard"].de_facto_holder_id == "duke_lyra", \
+            "de jure герцог — живой правитель своей нации"
+        self.h.kill_character("duke_lyra")
+        self.h.characters["baron_moss"].alive = False
+        self.h.characters["baron_thorn"].alive = False
+        self.h.characters["baron_wolf"].alive = False
+        self.h.characters["duke_orso"].alive = False
+        self.h.characters["baron_gray"].alive = False
+        self.h.recompute_de_facto_holders()
+        assert self.h.duchies["leafguard"].de_facto_holder_id is None
+
+    def test_de_facto_holder_of_duchy_never_returns_a_corpse(self):
+        self.h.characters["duke_lyra"].alive = False
+        assert self.h.de_facto_holder_of_duchy("leafguard") is None
+
+    def test_recompute_is_cheap_and_idempotent(self):
+        before = {d.id: d.de_facto_holder_id for d in self.h.duchies.values()}
+        assert self.h.recompute_de_facto_holders() == []
+        assert {d.id: d.de_facto_holder_id for d in self.h.duchies.values()} == before
+
+    def test_de_facto_holder_survives_the_snapshot(self):
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        for duchy_id, holder_id in EXPECTED_DE_FACTO_HOLDERS.items():
+            assert restored.duchies[duchy_id].de_facto_holder_id == holder_id
+        for duchy_id in NEUTRAL_DUCHIES:
+            assert restored.duchies[duchy_id].de_facto_holder_id is None
+
+    def test_de_facto_holder_is_not_added_to_summary(self):
+        # набор ключей summary зафиксирован тестами детерминизма, поэтому
+        # de-факто держатель туда НЕ добавляется — он живёт в to_state
+        assert set(self.h.summary()["duchies"]["leafguard"]) == {"holder", "income"}
+        duchy_state = self.h.to_state()["duchies"]["leafguard"]
+        assert set(duchy_state) == {f.name for f in
+                                    dataclasses.fields(self.h.duchies["leafguard"])}
+        assert "de_facto_holder_id" in duchy_state
+
+
+class TestGrantRevokeOwnership:
+    """``grant_fief``/``revoke_fief`` обязаны реально менять состояние земли."""
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    def test_grant_moves_the_county_into_the_recipients_hands(self):
+        self.h.revoke_fief("baron_wolf")
+        assert self.h.grant_fief(44, "baron_wolf")
+        assert self.h.characters["baron_wolf"].province_idx == 44
+        assert self.h.provinces[44].owner == "green"
+
+    def test_grant_of_neutral_land_records_the_annexation(self):
+        # Путь без by_actor — «выдать можно что угодно кому угодно». Раньше
+        # такая земля НЕ меняла владельца, то есть оставалась ничейной: после
+        # этапа 2 duchy_income считает только фактические владения, и выданное
+        # нейтральное графство не платило бы НИКОМУ.
+        self.h.revoke_fief("baron_wolf")
+        assert self.h.grant_fief(47, "baron_wolf")
+        assert self.h.provinces[47].owner == "green"
+        assert self.h.characters["baron_wolf"].nation == "green"
+
+    def test_grant_inside_the_realm_keeps_the_owner(self):
+        # 44 — зелёная провинция, baron_thorn зелёный: смена owner тут вхолостую,
+        # и это правильно — выдать землю внутри своего realm'а не значит
+        # аннексировать её у себя
+        self.h.revoke_fief("baron_thorn")
+        self.h.grant_fief(44, "baron_thorn", by_actor="duke_lyra")
+        assert self.h.provinces[44].owner == "green"
+
+    def test_grant_keeps_the_old_opinion_math(self):
+        self.h.revoke_fief("baron_thorn")
+        opinion, loyalty = (self.h.characters["baron_thorn"].opinion_of_liege,
+                            self.h.characters["baron_thorn"].loyalty)
+        assert self.h.grant_fief(44, "baron_thorn", by_actor="duke_lyra")
+        assert self.h.characters["baron_thorn"].opinion_of_liege == opinion + 20
+        assert self.h.characters["baron_thorn"].loyalty == min(100, loyalty + 10)
+
+    def test_revoke_returns_the_land_to_the_realm_pool(self):
+        holder = self.h.characters["baron_thorn"]
+        owner_before = self.h.provinces[41].owner
+        events = self.h.revoke_fief("baron_thorn")
+        assert holder.province_idx is None
+        assert self.h.provinces[41].owner == owner_before, \
+            "отзыв не отбирает землю у короля, он забирает её у барона"
+        assert self.h.holder_of_county(41) is None, "графство освободилось"
+        assert any("теряет" in e for e in events), events
+
+    def test_revoked_county_is_free_to_grant_again(self):
+        self.h.revoke_fief("baron_thorn")
+        assert self.h.holder_of_county(41) is None
+        assert self.h.grant_fief(41, "baron_moss")
+        assert self.h.characters["baron_moss"].province_idx == 41
+
+    def test_revoke_then_grant_moves_the_fief_to_another_duchy(self):
+        self.h.revoke_fief("baron_thorn")
+        self.h.grant_fief(36, "baron_thorn")
+        assert self.h.characters["baron_thorn"].duchy_id == "greymoor"
+        assert self.h.contracts["baron_thorn"].liege_id == "duke_orso"
+
+    def test_revoke_keeps_the_vassal_in_his_duchy(self):
+        self.h.revoke_fief("baron_thorn")
+        assert self.h.characters["baron_thorn"].duchy_id == "leafguard"
+        assert self.h.contracts["baron_thorn"].liege_id == "duke_lyra"
+
+    def test_grant_recomputing_de_facto_holder(self):
+        # отдать три из пяти зелёных графств leafguard синим — de-факто
+        # держателем станет их король
+        for idx in (40, 41, 43):
+            self.h.transfer_county(idx, "blue", None)
+        assert self.h.duchies["leafguard"].de_facto_holder_id == "king_rurik"
+
+
+# --------------------------------------------------------------------------
+# Этап 4: ранг как состояние
+# --------------------------------------------------------------------------
+
+
+class TestRankAsState:
+    """Ранг выводится из титулов, а не задаётся константой при постройке мира.
+
+    Главный баг, который это закрывает: раньше ``rank`` был константой, и
+    герцог, получивший герцогство из рук умершего дуке, оставался ``BARON``.
+    У барона без сюзерена ``liege_of`` возвращает ``None``, а ``tick_vassals``
+    делает ``continue`` — то есть мнение, лояльность и риск мятежа замирали
+    навсегда.
+    """
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    def test_title_rank_has_no_bakeless(self):
+        # «безземельный герцог» звучит естественно, но четвёртое значение сломало
+        # бы _RANK_TO_TIER (нет для него Tier) и COMMAND_MIN_RANK (отказ с
+        # неверным текстом). Отсутствие земли описывает province_idx is None.
+        assert {r.value for r in TitleRank} == {"baron", "duke", "king"}
+
+    def test_fresh_world_ranks_match_the_titles(self):
+        for ch in self.h.characters.values():
+            assert ch.rank is self.h.expected_rank(ch.id), ch.id
+
+    def test_duke_holder_is_still_a_duke(self):
+        # старый контракт тестов: holder_of_duchy(d).rank is TitleRank.DUKE
+        for duchy in self.h.duchies.values():
+            holder = self.h.holder_of_duchy(duchy.id)
+            if holder is not None:
+                assert holder.rank is TitleRank.DUKE, duchy.id
+
+    def test_baron_liege_is_still_a_duke(self):
+        # старый контракт тестов: liege_of(baron).rank is TitleRank.DUKE
+        for baron in characters_by_rank(self.h, TitleRank.BARON):
+            liege = self.h.liege_of(baron.id)
+            assert liege is not None and liege.rank is TitleRank.DUKE, baron.id
+
+    def test_realm_ruler_is_still_a_king(self):
+        for realm in self.h.realms.values():
+            assert self.h.characters[realm.ruler_id].rank is TitleRank.KING
+
+    def test_promote_reports_the_change_once(self):
+        events = self.h.promote("baron_thorn", TitleRank.DUKE)
+        assert len(events) == 1 and "ранг" in events[0]
+        assert self.h.characters["baron_thorn"].rank is TitleRank.DUKE
+        assert self.h.promote("baron_thorn", TitleRank.DUKE) == [], \
+            "повтор той же смены молчит"
+
+    def test_promote_refuses_junk(self):
+        before = self.h.state_fingerprint()
+        assert self.h.promote("baron_ghost", TitleRank.DUKE) == []
+        assert self.h.promote(7, TitleRank.DUKE) == []
+        assert self.h.promote("baron_thorn", "duke") == []
+        assert self.h.state_fingerprint() == before
+
+    def test_expected_rank_follows_the_realm_throne(self):
+        self.h.realms["kingdom_thorn"].ruler_id = "baron_thorn"
+        assert self.h.expected_rank("baron_thorn") is TitleRank.KING
+
+    def test_expected_rank_follows_the_duchy_title(self):
+        self.h.duchies["leafguard"].holder_id = "baron_wolf"
+        assert self.h.expected_rank("baron_wolf") is TitleRank.DUKE
+
+    def test_expected_rank_falls_back_to_baron(self):
+        self.h.characters["baron_wolf"].duchy_id = None
+        self.h.characters["baron_wolf"].province_idx = None
+        assert self.h.expected_rank("baron_wolf") is TitleRank.BARON
+
+    def test_expected_rank_never_re_ranks_a_corpse(self):
+        self.h.characters["duke_lyra"].alive = False
+        assert self.h.expected_rank("duke_lyra") is TitleRank.DUKE
+        assert self.h.refresh_rank("duke_lyra") == []
+
+    def test_refresh_rank_demotes_a_landless_duke(self):
+        duke = self.h.characters["duke_lyra"]
+        self.h.duchies["leafguard"].holder_id = "baron_wolf"
+        assert self.h.refresh_rank("duke_lyra")
+        assert duke.rank is TitleRank.BARON
+
+    def test_rank_does_not_leak_into_summary_keys(self):
+        # набор ключей summary зафиксирован; ранг — это ЗНАЧЕНИЕ, а не новый ключ
+        assert set(self.h.summary()["characters"]["baron_thorn"]) == \
+            {"rank", "loyalty", "opinion", "gold"}
+
+
+# --------------------------------------------------------------------------
+# Этап 4: старение и смерть
+# --------------------------------------------------------------------------
+
+
+class TestAgingAndDeath:
+    """Возраст растёт, смерть наступает строго по возрасту и без кубика."""
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    def test_ageing_constants_are_the_documented_ones(self):
+        assert CHARACTERS_AGE_PER_TURN == 1
+        assert CHARACTER_DEATH_AGE == 80
+        assert CHARACTERS_DEATH_AGE_SPREAD >= 1
+        assert SUCCESSION_CRISIS_TURNS >= 1
+
+    def test_death_ages_are_staggered_by_design(self):
+        # С одинаковым порогом все бароны умирали в ОДИН ход, и к смерти
+        # герцога его дукция была уже пуста: наследовать было некому, и мир
+        # вымирал целиком на 50-м ходу.
+        ages = {c.death_age for c in self.h.characters.values()}
+        assert len(ages) > 5, "разброс обязателен"
+        for ch in self.h.characters.values():
+            assert CHARACTER_DEATH_AGE <= ch.death_age <= \
+                CHARACTER_DEATH_AGE + CHARACTERS_DEATH_AGE_SPREAD
+
+    def test_death_age_is_deterministic_and_id_based(self):
+        assert character_death_age("baron_thorn") == \
+            character_death_age("baron_thorn")
+        for ch in self.h.characters.values():
+            assert ch.death_age == character_death_age(ch.id), ch.id
+
+    def test_death_age_never_uses_python_hash(self):
+        # hash(str) рандомизируется PYTHONHASHSEED: реплей разъехался бы
+        assert character_death_age("baron_thorn") == \
+            CHARACTER_DEATH_AGE + sum(ord(c) for c in "baron_thorn") % \
+            (CHARACTERS_DEATH_AGE_SPREAD + 1)
+
+    def test_age_does_not_move_until_a_turn_passes(self):
+        before = {c.id: c.age for c in self.h.characters.values()}
+        self.h.tick_counties()
+        self.h.tick_vassals()
+        self.h.tick_realms()
+        assert {c.id: c.age for c in self.h.characters.values()} == before, \
+            "старение живёт в тике персонажей, а не в тиках поселений и realm'ов"
+
+    def test_age_grows_by_exactly_one_per_turn(self):
+        before = {c.id: c.age for c in self.h.characters.values()}
+        self.h.tick_characters()
+        after = {c.id: c.age for c in self.h.characters.values()}
+        assert after == {k: v + CHARACTERS_AGE_PER_TURN for k, v in before.items()}
+
+    def test_age_grows_through_end_turn(self):
+        before = {c.id: c.age for c in self.h.characters.values()}
+        self.h.end_turn()
+        after = {c.id: c.age for c in self.h.characters.values()}
+        assert after == {k: v + CHARACTERS_AGE_PER_TURN for k, v in before.items()}
+
+    def test_no_one_dies_before_the_threshold(self):
+        for _ in range(30):
+            self.h.end_turn()
+        assert all(c.alive for c in self.h.characters.values())
+        assert self.h.characters["king_rurik"].age == 44 + 30
+
+    def test_death_is_strictly_by_age(self):
+        victim = self.h.characters["baron_thorn"]
+        # тик сначала старит, потом проверяет порог, поэтому «ещё рано» — это
+        # death_age на два года больше текущего возраста
+        victim.death_age = victim.age + 2
+        assert self.h.tick_characters() == [], "ещё не время"
+        assert victim.alive
+        victim.death_age = victim.age
+        events = self.h.tick_characters()
+        assert not victim.alive
+        assert any(DEATH_CAUSE_AGE in e for e in events), events
+
+    def test_death_is_reported_with_name_and_age(self):
+        victim = self.h.characters["baron_thorn"]
+        victim.age = victim.death_age
+        events = self.h.tick_characters()
+        assert any(victim.name in e and str(victim.age) in e for e in events), events
+
+    def test_aging_never_touches_the_dice(self):
+        for _ in range(40):
+            self.h.end_turn()
+        assert len(self.h.streams) == 0, "старение создало именованный поток"
+        assert self.h.streams.consumed("anything") == 0
+
+    def test_kill_character_is_deterministic_too(self):
+        events = self.h.kill_character("baron_thorn")
+        assert any(DEATH_CAUSE_KILLED in e for e in events), events
+        assert not self.h.characters["baron_thorn"].alive
+
+    def test_kill_character_refuses_the_dead_and_junk(self):
+        self.h.kill_character("baron_thorn")
+        assert self.h.kill_character("baron_thorn") == []
+        assert self.h.kill_character("baron_ghost") == []
+        assert self.h.kill_character(7) == []
+
+    def test_death_age_survives_the_snapshot(self):
+        self.h.characters["baron_thorn"].death_age = 111
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        assert restored.characters["baron_thorn"].death_age == 111
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_old_snapshot_without_death_age_falls_back(self):
+        state = self.h.to_state()
+        for data in state["characters"].values():
+            data.pop("death_age")
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert all(c.death_age == CHARACTER_DEATH_AGE
+                   for c in restored.characters.values())
+
+    def test_aging_is_reproducible_on_two_worlds(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        for _ in range(12):
+            a.tick_characters()
+            b.tick_characters()
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Этап 4: наследование и престол
+# --------------------------------------------------------------------------
+
+
+class TestSuccession:
+    """Смерть правителя разбирается по порядку realm -> герцогство -> графство."""
+
+    def setup_method(self):
+        self.h = make_hierarchy()
+
+    # ---------------- наследование герцогства ----------------
+
+    def test_duke_death_gives_the_title_to_an_heir(self):
+        events = self.h.kill_character("duke_lyra")
+        assert self.h.duchies["leafguard"].holder_id == "baron_moss"
+        assert any("герцогом стал" in e for e in events), events
+
+    def test_duke_heir_gets_the_duke_rank(self):
+        # ГЛАВНЫЙ тест этапа 4.1: раньше титул достался барону с rank = BARON
+        self.h.kill_character("duke_lyra")
+        heir = self.h.characters["baron_moss"]
+        assert heir.rank is TitleRank.DUKE
+        assert heir.duchy_id == "leafguard"
+        assert heir.realm_id == "kingdom_thorn"
+
+    def test_duke_heir_gets_a_liege_so_the_tick_does_not_skip_him(self):
+        self.h.kill_character("duke_lyra")
+        heir = self.h.characters["baron_moss"]
+        liege = self.h.liege_of(heir.id)
+        assert liege is not None and liege.id == "king_sigurd"
+        # наблюдаемо: тик реально его трогает (лояльность идёт к равновесию).
+        # При прежнем баге rank остался бы BARON, liege_of вернул бы None и
+        # tick_vassals сделал бы continue — лояльность осталась бы нулевой.
+        heir.loyalty = 0
+        self.h.tick_vassals()
+        assert heir.loyalty == 3
+
+    def test_old_vassals_of_the_duchy_follow_the_new_holder(self):
+        self.h.kill_character("duke_lyra")
+        assert {c.id for c in self.h.vassals_of("baron_moss")} == {"baron_thorn"}
+        assert self.h.liege_of("baron_thorn").id == "baron_moss"
+
+    def test_contracts_follow_the_new_duke(self):
+        self.h.kill_character("duke_lyra")
+        assert self.h.contracts["baron_thorn"].liege_id == "baron_moss"
+        assert self.h.contracts["baron_moss"].liege_id == "king_sigurd"
+
+    def test_dead_duke_keeps_his_own_duchy_field(self):
+        # труп остаётся в своей дукции в снапшоте — это история, а не титул
+        self.h.kill_character("duke_lyra")
+        assert self.h.characters["duke_lyra"].duchy_id == "leafguard"
+
+    def test_last_duke_leaves_the_duchy_without_a_holder(self):
+        self.h.kill_character("duke_lyra")
+        self.h.kill_character("baron_moss")
+        events = self.h.kill_character("baron_thorn")
+        # других зелёных в leafguard нет, а зелёные бароны других дукций живы —
+        # наследование герцогства ограничено своей династией
+        duchy = self.h.duchies["leafguard"]
+        assert duchy.holder_id is None
+        assert self.h.holder_of_duchy("leafguard") is None
+        assert any("без герцога" in e for e in events), events
+
+    def test_empty_duchy_still_reports_a_de_facto_holder_from_the_throne(self):
+        # титул герцога пуст, но нация владеет областью и правит ею королём —
+        # доход не должен исчезать только из-за смерти одного человека
+        self.h.kill_character("duke_lyra")
+        self.h.kill_character("baron_moss")
+        self.h.kill_character("baron_thorn")
+        duchy = self.h.duchies["leafguard"]
+        assert duchy.holder_id is None
+        assert duchy.de_facto_holder_id == "king_sigurd"
+        assert self.h.duchy_income("leafguard") > 0
+
+    def test_heirs_are_deterministic_by_loyalty_then_id(self):
+        self.h.characters["baron_thorn"].loyalty = 10
+        heirs = self.h.duchy_heirs("leafguard", exclude="duke_lyra")
+        assert [c.id for c in heirs] == ["baron_moss", "baron_thorn"]
+        self.h.characters["baron_thorn"].loyalty = 99
+        assert [c.id for c in self.h.duchy_heirs("leafguard",
+                                                exclude="duke_lyra")] == \
+            ["baron_thorn", "baron_moss"]
+
+    def test_duchy_heirs_stay_inside_the_dynasty(self):
+        self.h.characters["baron_ember"].duchy_id = "leafguard"
+        assert "baron_ember" not in [c.id for c in
+                                     self.h.duchy_heirs("leafguard",
+                                                        exclude="duke_lyra")]
+
+    # ---------------- наследование графства ----------------
+
+    def test_baron_death_without_heirs_frees_the_county(self):
+        events = self.h.kill_character("baron_thorn")
+        dead = self.h.characters["baron_thorn"]
+        assert dead.province_idx is None
+        assert self.h.holder_of_county(41) is None
+        assert any("#41" in e for e in events), events
+
+    def test_baron_death_with_a_heir_transfers_the_county(self):
+        # освобождаем землю baron_moss заранее, чтобы преемник был
+        self.h.revoke_fief("baron_moss")
+        events = self.h.kill_character("baron_thorn")
+        assert self.h.characters["baron_thorn"].province_idx is None
+        assert self.h.characters["baron_moss"].province_idx == 41
+        assert any("#41" in e for e in events), events
+
+    def test_county_heir_gets_the_duchy_and_the_contract(self):
+        self.h.revoke_fief("baron_moss")
+        self.h.kill_character("baron_thorn")
+        heir = self.h.characters["baron_moss"]
+        assert heir.province_idx == 41
+        assert heir.duchy_id == "leafguard"
+        assert self.h.contracts["baron_moss"].liege_id == "duke_lyra"
+
+    def test_county_is_never_inherited_by_a_king_or_a_duke(self):
+        # графство — владение барона: наследование от умершего сюзерена может
+        # подарить графство герцогу, а смерть барона — нет
+        self.h.revoke_fief("baron_moss")
+        self.h.revoke_fief("baron_gray")
+        self.h.revoke_fief("baron_wolf")
+        self.h.kill_character("baron_thorn")
+        heir = self.h.holder_of_county(41)
+        assert heir is not None and heir.rank is TitleRank.BARON, heir
+
+    def test_county_heir_is_of_the_same_nation(self):
+        # иначе налог по province.owner ушёл бы одной стране, а владение было бы
+        # у персонажа другой — realm_income и duchy_income считали бы разное.
+        # Нейтральные земли исключены намеренно: на стартовой карте барон может
+        # держать нейтральное графство (baron_ray -> #33), и это не следствие
+        # наследования, а исходная раскладка build_default_hierarchy.
+        self.h.revoke_fief("baron_moss")
+        self.h.kill_character("baron_thorn")
+        for ch in self.h.characters.values():
+            if ch.province_idx is None:
+                continue
+            owner = self.h.nation_of(ch.province_idx)
+            assert owner == "neutral" or ch.nation == owner, ch.id
+
+    def test_county_heirs_are_deterministic(self):
+        self.h.revoke_fief("baron_moss")
+        assert [c.id for c in self.h.county_heirs(41, exclude="baron_thorn")] \
+            == ["baron_moss"]
+        assert [c.id for c in self.h.county_heirs(41, exclude="baron_thorn")] \
+            == [c.id for c in self.h.county_heirs(41, exclude="baron_thorn")]
+
+    # ---------------- престол ----------------
+
+    def test_king_death_moves_the_throne(self):
+        events = self.h.kill_character("king_rurik")
+        realm = self.h.realms["kingdom_riven"]
+        assert realm.ruler_id == "baron_dawn"
+        assert self.h.characters[realm.ruler_id].rank is TitleRank.KING
+        assert any("престол перешёл" in e for e in events), events
+
+    def test_player_claim_survives_succession(self):
+        # is_player — это свойство КОРОНЫ, а не человека: претензия игрока не
+        # исчезает вместе с королём, поэтому флаг остаётся на королевстве
+        realm = self.h.realms["kingdom_riven"]
+        assert realm.is_player is True
+        self.h.kill_character("king_rurik")
+        assert self.h.realms["kingdom_riven"].is_player is True
+        assert self.h.characters[realm.ruler_id].nation == "blue"
+
+    def test_new_ruler_can_spend_the_treasury(self):
+        # иначе realm_upkeep продолжал бы брать 10 * len(vassals_of(труп)) + 30
+        realm = self.h.realms["kingdom_riven"]
+        gold, upkeep = realm.gold, self.h.realm_upkeep(realm.id)
+        self.h.kill_character("king_rurik")
+        assert self.h.realm_upkeep(realm.id) == upkeep
+        assert self.h.raise_levy(realm.id, 1), "новый король обязан платить"
+        assert realm.gold < gold
+
+    def test_dead_king_keeps_no_contract(self):
+        self.h.kill_character("king_rurik")
+        assert "king_rurik" not in self.h.contracts
+        # новый король — тоже без контракта: у короля нет сюзерена
+        assert self.h.realms["kingdom_riven"].ruler_id not in self.h.contracts
+
+    def test_heir_candidates_are_sorted_by_loyalty_martial_id(self):
+        candidates = self.h.heir_candidates("kingdom_riven")
+        assert candidates, "у королевства обязаны быть преемники"
+        keys = [(-c.loyalty, -c.martial, c.id) for c in candidates]
+        assert keys == sorted(keys)
+        assert all(c.nation == "blue" and c.alive for c in candidates)
+
+    def test_heir_candidates_are_living_and_of_the_realm_nation(self):
+        self.h.characters["baron_dawn"].loyalty = 5
+        assert [c.id for c in self.h.heir_candidates("kingdom_riven")][0] != \
+            "baron_dawn"
+        assert self.h.heir_candidates("kingdom_ember")[0].nation == "red"
+
+    def test_heir_candidates_of_an_unknown_realm_is_empty(self):
+        assert self.h.heir_candidates("kingdom_ghost") == []
+        assert self.h.heir_candidates(7) == []
+
+    def test_throne_without_heirs_is_an_explicit_state(self):
+        for character_id in sorted(c.id for c in self.h.characters.values()
+                                   if c.nation == "blue" and c.alive):
+            self.h.kill_character(character_id)
+        realm = self.h.realms["kingdom_riven"]
+        assert realm.ruler_id is None
+        crisis = self.h.succession_crisis_of(realm.id)
+        assert isinstance(crisis, SuccessionCrisis)
+        assert crisis.is_open
+        assert crisis.candidates == ()
+        assert crisis.ruler_id is None
+        assert crisis.resolved_turn is None
+        assert crisis.turn_limit == crisis.turn_opened + SUCCESSION_CRISIS_TURNS
+
+    def test_a_realm_without_a_ruler_spends_nothing(self):
+        for character_id in sorted(c.id for c in self.h.characters.values()
+                                   if c.nation == "blue" and c.alive):
+            self.h.kill_character(character_id)
+        realm = self.h.realms["kingdom_riven"]
+        assert self.h.realm_upkeep(realm.id) > 0, "содержание всё ещё платится"
+        assert self.h.raise_levy(realm.id, 1) == ["Kingdom of Riven: "
+                                                   "поднимать левейс некому"]
+        assert self.h.realms["kingdom_riven"].gold == realm.gold
+        self.h.end_turn()
+        assert self.h.realms["kingdom_riven"].gold >= 0
+
+    def test_crisis_records_who_took_the_throne(self):
+        self.h.kill_character("king_rurik")
+        crisis = self.h.succession_crisis_of("kingdom_riven")
+        assert crisis.realm_id == "kingdom_riven"
+        assert "baron_dawn" in crisis.candidates
+        assert crisis.ruler_id == "baron_dawn"
+        assert crisis.resolved_turn == self.h.turn
+        assert not crisis.is_open
+
+    def test_crisis_is_keyed_by_realm_so_the_registry_does_not_grow(self):
+        for turn in range(1, 40):
+            self.h.end_turn()
+            assert len(self.h.succession_crises) <= len(self.h.realms)
+
+    def test_resolve_succession_lets_the_player_pick_a_candidate(self):
+        self.h.characters["baron_dawn"].loyalty = 1
+        self.h.kill_character("king_rurik")
+        auto = self.h.realms["kingdom_riven"].ruler_id
+        other = next(c.id for c in self.h.heir_candidates("kingdom_riven")
+                     if c.id != auto)
+        events = self.h.resolve_succession("kingdom_riven", other)
+        assert events
+        assert self.h.realms["kingdom_riven"].ruler_id == other
+        assert self.h.characters[other].rank is TitleRank.KING
+
+    def test_resolve_succession_refuses_a_stranger(self):
+        self.h.kill_character("king_rurik")
+        before = self.h.state_fingerprint()
+        events = self.h.resolve_succession("kingdom_riven", "duke_aldric")
+        assert len(events) == 1 and "преемник" in events[0]
+        assert self.h.state_fingerprint() == before
+        assert self.h.resolve_succession("kingdom_thorn", "baron_thorn") == []
+
+    def test_crisis_survives_the_snapshot(self):
+        self.h.kill_character("king_rurik")
+        restored = Hierarchy.from_state(self.h.to_state(), copy_provinces())
+        crisis = restored.succession_crisis_of("kingdom_riven")
+        assert isinstance(crisis, SuccessionCrisis)
+        assert crisis.candidates == \
+            self.h.succession_crisis_of("kingdom_riven").candidates
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    def test_crisis_candidates_are_tuple_after_json(self):
+        self.h.kill_character("king_rurik")
+        restored = Hierarchy.from_state(loads(dumps(self.h.to_state())),
+                                        copy_provinces())
+        crisis = restored.succession_crisis_of("kingdom_riven")
+        assert isinstance(crisis.candidates, tuple)
+
+    def test_from_state_survives_a_broken_crisis_block(self):
+        state = self.h.to_state()
+        state["succession_crises"] = {"x": {"candidates": "baron_thorn",
+                                            "turn_opened": "wat"}}
+        restored = Hierarchy.from_state(state, copy_provinces())
+        crisis = restored.succession_crisis_of("x")
+        assert crisis.candidates == ("baron_thorn",), "строка стала одним id"
+        assert crisis.turn_opened == 0 and crisis.turn_limit == 0
+        assert crisis.ruler_id is None and crisis.resolved_turn is None
+        # сломанный блок не обязан ломать хеш: он остаётся таким, каким прочитан
+        assert restored.state_fingerprint() == Hierarchy.from_state(
+            restored.to_state(), copy_provinces()).state_fingerprint()
+
+    def test_from_state_without_crisis_block_loads_an_empty_registry(self):
+        state = self.h.to_state()
+        state.pop("succession_crises")
+        restored = Hierarchy.from_state(state, copy_provinces())
+        assert restored.succession_crises == {}
+        assert restored.state_fingerprint() == self.h.state_fingerprint()
+
+    # ---------------- auto_inherit ----------------
+
+    def test_auto_inherit_still_works_as_a_module_function(self):
+        # историческая точка входа для внешнего кода: разбор титулов умерших
+        self.h.characters["duke_lyra"].alive = False
+        events = auto_inherit(self.h)
+        assert events
+        assert self.h.duchies["leafguard"].holder_id == "baron_moss"
+
+    def test_auto_inherit_is_idempotent(self):
+        self.h.kill_character("duke_lyra")
+        assert auto_inherit(self.h) == [], "разбор уже сделан kill_character"
+
+    def test_auto_inherit_is_deterministic(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        for h in (a, b):
+            h.characters["duke_lyra"].alive = False
+            h.characters["king_rurik"].alive = False
+        assert auto_inherit(a) == auto_inherit(b)
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Этап 2 + 4: длинная дистанция и детерминизм
+# --------------------------------------------------------------------------
+
+
+class TestLongStage24Determinism:
+    """Старение, наследование и передача владений вместе: два мира — один хеш."""
+
+    def test_two_worlds_fifty_turns_hash_equal(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        for _ in range(50):
+            a.end_turn()
+            b.end_turn()
+        assert a.turn == b.turn == 51
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+    def test_fifty_turns_events_are_identical(self):
+        a, b = make_hierarchy(), make_hierarchy()
+        collected = []
+        for h in (a, b):
+            events = []
+            for _ in range(50):
+                events += h.end_turn()
+            collected.append(events)
+        assert collected[0] == collected[1]
+        assert any("умер" in e for e in collected[0]), \
+            "на 50 ходах уже должен быть кто-то, кто умер"
+
+    def test_fifty_turns_with_orders_and_transfers_hash_equal(self):
+        def churn(h: Hierarchy) -> None:
+            for _ in range(50):
+                h.grant_fief(44, "baron_thorn", by_actor="duke_lyra")
+                h.revoke_fief("baron_thorn", by_actor="duke_lyra")
+                h.transfer_county(46, "blue", None, cause="разведка")
+                h.transfer_county(46, "green", None, cause="отбита")
+                h.issue_order("duke_lyra", OrderKind.SUMMON_COUNCIL, "baron_moss")
+                h.end_turn()
+        a, b = make_hierarchy(), make_hierarchy()
+        churn(a)
+        churn(b)
+        assert a.state_fingerprint() == b.state_fingerprint()
+
+    def test_fifty_turns_never_touch_the_dice(self):
+        h = make_hierarchy()
+        for _ in range(50):
+            h.end_turn()
+        assert len(h.streams) == 0
+
+    def test_round_trip_with_deaths_preserves_the_fingerprint(self):
+        h = make_hierarchy()
+        for _ in range(45):
+            h.end_turn()
+        assert any(not c.alive for c in h.characters.values())
+        restored = Hierarchy.from_state(h.to_state(), copy_provinces())
+        assert restored.state_fingerprint() == h.state_fingerprint()
+
+    def test_json_round_trip_with_orders_and_deaths_preserves_it(self):
+        h = make_hierarchy()
+        h.realms["kingdom_riven"].gold = 10000
+        for _ in range(45):
+            h.issue_order("king_rurik", OrderKind.SUMMON_COUNCIL, "duke_brenna")
+            h.end_turn()
+        restored = Hierarchy.from_state(loads(dumps(h.to_state())), copy_provinces())
+        assert restored.state_fingerprint() == h.state_fingerprint()
+        assert restored.turn == h.turn
+
+    def test_snapshot_keys_gained_only_the_two_documented_blocks(self):
+        assert SNAPSHOT_KEYS == set(make_hierarchy().to_state())
+        duchy_fields = set(make_hierarchy().to_state()["duchies"]["leafguard"])
+        assert "de_facto_holder_id" in duchy_fields
+        character_fields = set(make_hierarchy().to_state()["characters"]["king_erik"])
+        assert "death_age" in character_fields
+
+    def test_two_hundred_turns_keep_the_world_consistent(self):
+        h, other = make_hierarchy(), make_hierarchy()
+        for world in (h, other):
+            for _ in range(200):
+                world.end_turn()
+        assert h.state_fingerprint() == other.state_fingerprint()
+        for realm in h.realms.values():
+            assert realm.gold >= 0, realm.id
+        for p in h.provinces:
+            assert 0 <= p.loyalty <= 100, p.name
+            assert p.garrison >= 0, p.name
+        # ни один живой персонаж не держит чужую нацию и не висит на мёртвом
+        for ch in h.characters.values():
+            if ch.province_idx is not None:
+                assert ch.nation == h.nation_of(ch.province_idx), ch.id
+
+    def test_two_hundred_turns_do_not_rotate_the_streams(self):
+        h = make_hierarchy()
+        for _ in range(200):
+            h.end_turn()
+        assert len(h.streams) == 0
+
+    def test_states_does_not_import_random_anymore(self):
+        source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "states.py"), encoding="utf-8").read()
+        assert "import random" not in source

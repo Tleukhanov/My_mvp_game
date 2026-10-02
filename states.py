@@ -39,6 +39,63 @@
   которую можно потерять между ходами. Приказы упираются в тот же
   ``action_ledger``, а их решения НЕ бросают кубик: всё выводится из мнения.
 
+De jure против de facto (этап 2)
+--------------------------------
+
+До этого этапа «герцогство» означало две разные вещи, и они не совпадали:
+
+* ``Duchy.holder_id`` — **de jure** титул. По нему считаются ``liege_of`` барона,
+  ``_baron_count``, ``auto_inherit`` и панель герцогства. Он не меняется при
+  завоевании: захватив Ravenhold целиком, соседний король всё равно остаётся
+  «герцогом Ravenhold» с точки зрения сюзерена его баронов.
+* ``province.owner`` — **de facto** владение нацией. По нему платит
+  ``realm_income``, по нему же покупается застройка и нанимается гарнизон.
+
+Дыра была ровно на стыке: ``duchy_income``/``duchy_levy`` суммировали
+``county_income`` по **всем** de jure провинциям герцогства, не глядя на
+``owner``. Поэтому завоёванное иностранное графство платило и завоевателю
+(``realm_income`` — по факту), и прежнему герцогу (``duchy_income`` — по
+титулу). Одна и та же деревня считалась дважды, и ``summary()`` показывал
+игроку доход, которого никто не получал.
+
+Что сделано:
+
+* ``Duchy.de_facto_holder_id`` — новое поле: кто правит герцогством ПО ФАКТУ.
+  ``holder_of_duchy`` остался **de jure** и ничего не знает про реальность.
+* ``Hierarchy.transfer_county`` — единственная точка смены владельца
+  провинции. Её зовут ``grant_fief``, ``revoke_fief`` и (после правки
+  ``world_map.py``/``war.py``) захват на карте. Всё, что меняет владельца
+  мимо неё, обязано само вызвать ``recompute_de_facto_holders``.
+* ``duchy_income``/``duchy_levy`` считают только те de jure провинции,
+  которые ФАКТИЧЕСКИ принадлежат нации де-факто держателя.
+
+Старение и наследование (этап 4)
+-------------------------------
+
+``Character.age``, ``Character.alive`` и ``auto_inherit`` были объявлены и
+не использовались ни одной строкой кода: в игре не умирал никто, титул
+никогда не переходил, а ``rank`` был константой, заданной в
+``build_default_hierarchy``. Отсюда был вывод, который выглядел как
+особенность модели, а был просто тупиком: после смерти герцога титул
+доставался барону с ``rank = BARON``, и такой персонаж выпадал из
+``tick_vassals`` целиком (у него не было сюзерена, потому что
+``liege_of`` смотрит на ранг) — мнение, лояльность и риск мятежа
+замирали навсегда.
+
+Теперь:
+
+* **ранг — состояние.** ``promote``/``refresh_rank`` выводят ранг из титулов:
+  правитель realm'а — ``KING``, держатель герцогства — ``DUKE``, остальное —
+  ``BARON``. Нового значения ``BAKELESS`` сознательно нет (см. докстринг
+  ``TitleRank``): оно потребовало бы правок в ``_RANK_TO_TIER``,
+  ``COMMAND_MIN_RANK`` и ``summary``, а земли без титула в этой модели уже
+  описывается ``province_idx is None``.
+* **смерть детерминирована.** Никакого ГПСЧ: ``CHARACTERS_AGE_PER_TURN`` лет
+  за ход, порог ``CHARACTER_DEATH_AGE``. Тик не трогает ``self.streams``.
+* **престол — состояние.** ``Realm.ruler_id`` переходит преемнику и получает
+  ранг ``KING``; если преемников нет, ``ruler_id`` становится ``None`` и
+  открывается ``SuccessionCrisis`` — явная запись в снапшоте, а не тихий баг.
+
 Хеширование состояния
 ---------------------
 
@@ -74,7 +131,27 @@ class Tier(IntEnum):
 
 
 class TitleRank(Enum):
-    """Ранг персонажа в иерархии."""
+    """Ранг персонажа в иерархии.
+
+    Ранг — это СОСТОЯНИЕ, а не константа из ``build_default_hierarchy``:
+    с этапа 4 он выводится из титулов (``Hierarchy.refresh_rank``) и меняется
+    при выдаче и отзыве земли и при смерти правителя. Три значения и дальше
+    ровно три — ``BAKELESS`` сознательно не заводится, хотя «безземельный
+    герцог» и звучит естественно:
+
+    * ``_RANK_TO_TIER`` — словарь без запасного значения: ``ch.tier`` обязан
+      работать для ЛЮБОГО персонажа, и четвёртое значение потребовало бы
+      фиктивного ``Tier`` только ради него;
+    * ``COMMAND_MIN_RANK`` не содержит ``BAKELESS``, поэтому
+      ``_command_refusal`` отвечал бы на приказ к безземельному «королю не
+      подчиняется никто» — сообщение оказывается не про то;
+    * ``summary()["characters"][*]["rank"]`` проверяется тестами против
+      множества ``{"baron", "duke", "king"}``, а менять его нельзя (набор
+      ключей ``summary`` зафиксирован).
+
+    Отсутствие земли в этой модели описывает ``province_idx is None``, а ранг
+    ``BARON`` означает ровно то, что означал: «не герцог и не король».
+    """
 
     BARON = "baron"
     DUKE = "duke"
@@ -429,6 +506,104 @@ PUNISHED_LOYALTY = 20
 COUNCIL_INFLUENCE = 5
 COUNCIL_LOYALTY = 10
 
+# --------------------------------------------------------------------------
+# Владение de jure / de facto (этап 2)
+# --------------------------------------------------------------------------
+#
+# ПРАВИЛО de facto владения герцогством, ровно одно и без исключений:
+#
+#   Герцогство де-факто принадлежит НАЦИИ, которая владеет строгим
+#   большинством (> половины) своих de jure провинций по ``province.owner``.
+#   Если такой нации нет — в том числе при ничьей 3:2 или 2:3, — герцогство
+#   считается НИЧЬИМ и ``Duchy.de_facto_holder_id`` равен ``None``.
+#
+# Почему большинство, а не «первый по id» и не «holder из большинства»:
+#
+# * Детерминизм. Подсчёт по отсортированным нациям даёт один и тот же ответ на
+#   любой машине; «первый по id» зависел бы от порядка обхода dict.
+# * Историческая правота. Feudal-модель называет герцогство по области, а не по
+#   одному графству: завоевание трёх графств из пяти — это ещё Ravenhold,
+#   завоевание двух — это уже не Ravenhold.
+# * Строгое «больше половины», а не «>= половины», потому что 3:2 и 2:3 — это
+#   ровно тот случай, когда спор о титуле решается не территорией. Считать
+#   такие провинции ничьими честнее, чем отдавать их той нации, у которой их
+#   просто оказалось больше на одну.
+#
+# Проверка на текущей карте (50 провинций, по 5 на герцогство):
+#
+#   ravenhold  (10-14)  red    4 : 1  -> red    (de facto duke_aldric)
+#   blackridge (15-19)  red    3 : 2  -> red    (de facto duke_vasya)
+#   emberfall  (25-29)  blue   4 : 1  -> blue   (de facto duke_brenna)
+#   dawnmarch  (30-34)  blue   3 : 2  -> blue   (de facto duke_theon)
+#   leafguard  (40-44)  green  5 : 0  -> green  (de facto duke_lyra)
+#   greymoor   (35-39)  все нейтральны         -> ничья
+#   goldfield  (45-49)  green  2 : 3  -> ничья
+#   northmark (0-4), southmarch (5-9), stonewaste (20-24) — нейтральны -> ничья
+#
+# ВАЖНО: ``Duchy.holder_id`` (de jure) от этого НЕ зависит. У greymoor есть
+# герцог de jure, но нет ни одной его провинции, поэтому de-факто держателя
+# нет и ``duchy_income("greymoor")`` честно ноль: платить нечего.
+
+# --------------------------------------------------------------------------
+# Старение, смерть и престол (этап 4)
+# --------------------------------------------------------------------------
+#
+# Смерть в этой модели строго детерминирована: ни ГПСЧ, ни «удачи», ни болезней.
+# Причина простая — иначе тесты детерминизма разошлись бы по хешу, а реплей
+# сервера перестал бы воспроизводиться. Возраст растёт на целое число лет за
+# ход, смерть наступает в ``CHARACTER_DEATH_AGE``.
+
+#: Сколько лет персонажу добавляет один ход. Единица означает «год за ход»,
+#: то есть ход — это год. Больше единицы быть не может: возраст обязан расти
+#: целыми числами, иначе снапшот перестал бы быть целочисленным.
+CHARACTERS_AGE_PER_TURN = 1
+
+#: Возраст естественной смерти для персонажа без личного отступа. Восемьдесят
+#: лет — историческая норма для правителя, дожившего до старости; сорок — это
+#: смерть на поле боя, а генералов по-прежнему убивает ``war.py``. На текущей
+#: карте первая смерть приходится на 38-й ход (самый «молодой долгожитель» —
+#: king_rurik, 44 года при пороге 82).
+CHARACTER_DEATH_AGE = 80
+
+#: Насколько личная смерть отличается от ``CHARACTER_DEATH_AGE``. Разброс
+#: ОБЯЗАТЕЛ, и это не украшение, а условие работоспособности наследования.
+#: Первая версия этапа 4 задавала всем одинаковый возраст смерти, и мир
+#: вымирал целиком на 50-м ходу: все бароны стартуют в 30 лет, значит все
+#: умирали в ОДИН ход, и к моменту смерти герцога его дукция уже была пуста —
+#: наследовать было некому, трон пустел, и после этого ни одного герцога не
+#: оставалось. С разбросом в 24 хода поколения перемежаются, и престол
+#: переходит к живому преемнику, а не «к тому, кто случайно дожил».
+CHARACTERS_DEATH_AGE_SPREAD = 24
+
+
+def character_death_age(character_id: str) -> int:
+    """Личный возраст смерти персонажа: ``CHARACTER_DEATH_AGE`` плюс отступ.
+
+    Отступ считается через ``sum(ord(...))`` по id, а НЕ через ``hash(id)``:
+    ``PYTHONHASHSEED`` рандомизирует строковый хеш между процессами, и реплей
+    сервера после рестарта разошёлся бы (ровно та же причина, по которой в
+    ``sim/rng.py`` запрещён ``hash``). Сумма кодов — целая, стабильная и
+    одинаковая на любой машине.
+    """
+    if not isinstance(character_id, str):
+        return CHARACTER_DEATH_AGE
+    offset = sum(ord(char) for char in character_id) % (CHARACTERS_DEATH_AGE_SPREAD + 1)
+    return CHARACTER_DEATH_AGE + offset
+
+#: Сколько ходов открытый кризис престола ждёт преемника. Пока преемников нет,
+#: трон пуст: казна копится сама (никто не тратит на двор), и запись о кризисе
+#: остаётся в снапшоте как явный факт «у королевства нет правителя».
+SUCCESSION_CRISIS_TURNS = 3
+
+#: Причины смерти в тексте события. Обе детерминированы: ни одна смерть в
+#: этой модели не бросает кубик.
+DEATH_CAUSE_AGE = "по возрасту"
+DEATH_CAUSE_KILLED = "убит"
+
+#: «Ничейная» нация на карте. Значение живёт константой, а не строкой в трёх
+#: местах: ``majority_nation_of_duchy`` обязан отличать «никто» от страны.
+NEUTRAL_NATION = "neutral"
+
 #: Минимальный ранг сюзерена, вправе отдавать приказы цели этого ранга
 #: (этап 1.1). Правило ровно одно и оно историческое: бароном командует его
 #: НЕПОСРЕДСТВЕННЫЙ сюзерен — держатель герцогства, то есть герцог; герцогом
@@ -677,6 +852,13 @@ class Character:
     stewardship: int = 5
     diplomacy: int = 5
     age: int = 30
+    #: Личный возраст естественной смерти (этап 4). Разброс между персонажами
+    #: обязателен: с одинаковым порогом все бароны умирали в один ход, и к
+    #: смерти герцога его дукция была уже пуста — наследовать становилось
+    #: некому (см. ``character_death_age``). Поле, а не порог в коде, потому что
+    #: это такой же факт о персонаже, как возраст, и он обязан ездить в
+    #: снапшоте: загруженный мир обязан умереть в те же ходы.
+    death_age: int = CHARACTER_DEATH_AGE
     alive: bool = True
     traits: Tuple[str, ...] = ()
     heir: Optional[str] = None
@@ -764,15 +946,68 @@ class Realm:
 
 @dataclass
 class Duchy:
-    """Герцогство: de jure группа провинций и его текущий держатель."""
+    """Герцогство: de jure группа провинций и его текущий держатель.
+
+    Два держателя, и это не опечатка:
+
+    * ``holder_id`` — **de jure** титул. Живёт своей жизнью: захват не отбирает
+      у соседа титул Ravenhold, потому что ``liege_of`` барона, ``_baron_count``
+      и панель герцогства читают именно его. Меняется только смертью держателя.
+    * ``de_facto_holder_id`` — **de facto** владелец: персонаж нации, которая
+      держит строгое большинство de jure провинций (см. правило в разделе
+      констант этапа 2). Меняется при каждой передаче графства.
+    """
 
     id: str
     name: str
     de_jure_provinces: Tuple[int, ...]
     holder_id: Optional[str] = None
+    #: Кто правит герцогством по факту (см. модульный докстринг и
+    #: ``Hierarchy.recompute_de_facto_holder``). ``None`` — либо большинства
+    #: нет (ничья), либо есть, но у этой нации нет живого правителя. В отличие
+    #: от ``holder_id`` это поле обязано жить в снапшоте: от него зависит
+    #: ``duchy_income``, а значит и то, что видит игрок в панели герцогства.
+    de_facto_holder_id: Optional[str] = None
     realm_id: Optional[str] = None
     development: int = 1
     siege_safety: int = 0
+
+
+@dataclass
+class SuccessionCrisis:
+    """Кризис престола: королевство осталось без правителя.
+
+    Отдельный объект состояния, а не строчка в журнале, потому что у кризиса
+    есть срок и последствия: престол пуст — королевство не тратит на двор,
+    не может поднимать левейс и не выдаёт приказов. Молчаливый ``ruler_id =
+    None`` без записи означал бы, что это баг; запись означает, что это факт
+    мира, который виден в панели и попадает в хеш.
+
+    Формат (все поля хешируются и ездят в ``to_state``):
+
+    * ``realm_id`` — королевство, у которого пуст трон;
+    * ``candidates`` — преемники по порядку ``heir_candidates`` (детерминирован),
+      либо пустой tuple, если преемников не нашлось вовсе;
+    * ``turn_opened`` / ``turn_limit`` — ход открытия и ход, после которого
+      кризис считается протухшим (``SUCCESSION_CRISIS_TURNS``);
+    * ``ruler_id`` — кто в итоге сел на трон, ``None`` — трон всё ещё пуст;
+    * ``resolved_turn`` — ход, когда трон определили (или ``None``).
+
+    Ключ реестра — ``realm_id``, поэтому кризисов не больше, чем королевств,
+    а реестр не растёт: новый кризис перезаписывает старый по тому же ключу.
+    """
+
+    realm_id: str
+    candidates: Tuple[str, ...]
+    turn_opened: int
+    turn_limit: int
+    ruler_id: Optional[str] = None
+    resolved_turn: Optional[int] = None
+
+    @property
+    def is_open(self) -> bool:
+        """Трон пуст и преемник ещё может быть назначен."""
+        return self.ruler_id is None
 
 
 @dataclass
@@ -928,6 +1163,7 @@ class Hierarchy:
         streams: Optional[NamedStreams] = None,
         *,
         orders: Optional[Dict[str, Order]] = None,
+        succession_crises: Optional[Dict[str, SuccessionCrisis]] = None,
     ):
         self.provinces = provinces
         self.duchies: Dict[str, Duchy] = duchies if duchies is not None else {}
@@ -958,6 +1194,12 @@ class Hierarchy:
         #: Записи не удаляются никогда — на этом держится счётчик id
         #: (``len(self.orders)``), см. ``_next_order_id``.
         self.orders: Dict[str, Order] = orders if orders is not None else {}
+        #: Открытые и закрытые кризисы престола по id королевства (этап 4).
+        #: СОСТОЯНИЕ, а не история: пустой трон виден игроку и обязан пережить
+        #: ``end_turn``, поэтому запись живёт в снапшоте и в ``state_hash``.
+        #: Реестр не растёт — на королевство ровно одна запись.
+        self.succession_crises: Dict[str, SuccessionCrisis] = (
+            succession_crises if succession_crises is not None else {})
         self._province_duchy: Dict[int, str] = {}
         self._rebuild_province_index()
 
@@ -1088,10 +1330,334 @@ class Hierarchy:
         return [i for i, p in enumerate(self.provinces) if getattr(p, "owner", "neutral") == nation]
 
     def holder_of_duchy(self, duchy_id: str) -> Optional[Character]:
+        """De jure держатель герцогства.
+
+        ВАЖНО: это НЕ «кто владеет герцогством на самом деле». Ответ на
+        последний вопрос — ``de_facto_holder_of_duchy``, и эти два персонажа
+        могут быть разными людьми разных наций: соседний король может
+        захватить все пять графств Ravenhold, и duke_aldric при этом останется
+        de jure герцогом (от него зависит ``liege_of`` его баронов).
+        """
         d = self.duchies.get(duchy_id)
         if d and d.holder_id:
             return self.characters.get(d.holder_id)
         return None
+
+    # ---------------- de jure / de facto ----------------
+
+    def nation_of(self, province_idx: int) -> str:
+        """Нация, ФАКТИЧЕСКИ владеющая провинцией (``province.owner``)."""
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool):
+            return "neutral"
+        if not 0 <= province_idx < len(self.provinces):
+            return "neutral"
+        return str(getattr(self.province(province_idx), "owner", "neutral"))
+
+    def counties_factually_held(self, duchy_id: str, nation: str) -> List[int]:
+        """De jure провинции герцогства, которые фактически принадлежат нации.
+
+        Порядок — ``de jure`` (как в ``Duchy.de_jure_provinces``), чтобы и
+        доход, и левейс, и любая проверка «сумма по этому списку» совпадали.
+        Пустая нация не совпадёт ни с одной провинцией, поэтому нейтральные
+        графства не достаются никому.
+        """
+        return [idx for idx in self.counties_of_duchy(duchy_id)
+                if self.nation_of(idx) == nation]
+
+    def majority_nation_of_duchy(self, duchy_id: str) -> Optional[str]:
+        """Нация, владеющая строгим большинством de jure провинций герцогства.
+
+        Правило и его обоснование — в разделе констант этапа 2. Кратко: строгое
+        ``больше половины``, иначе ``None`` (ничья 3:2 тоже ничья). Подсчёт идёт
+        по отсортированным нациям, поэтому ответ одинаков на любой машине.
+
+        ``neutral`` в подсчёте НЕ участвует: это не страна, а «никто». Иначе
+        полностью нейтральное герцогство объявило бы большинством ``neutral``,
+        а знаменатель («больше половины от de jure провинций») остался бы тем
+        же — то есть пустое герцогство получило бы несуществующего правителя.
+        При этом в знаменатель ``neutral`` ВХОДИТ: половина нейтральных земель не
+        делает оставшуюся половину большинством.
+        """
+        provinces = self.counties_of_duchy(duchy_id)
+        if not provinces:
+            return None
+        tally: Dict[str, int] = {}
+        for idx in provinces:
+            nation = self.nation_of(idx)
+            if nation == NEUTRAL_NATION:
+                continue
+            tally[nation] = tally.get(nation, 0) + 1
+        best_nation: Optional[str] = None
+        best_count = 0
+        for nation in sorted(tally):
+            count = tally[nation]
+            if count > best_count:
+                best_nation, best_count = nation, count
+        if best_nation is None or best_count * 2 <= len(provinces):
+            return None
+        return best_nation
+
+    def recompute_de_facto_holder(self, duchy_id: str) -> Optional[str]:
+        """Пересчитать ``de_facto_holder_id`` и вернуть его (или ``None``).
+
+        Кто именно становится de-факто держателем при известном большинстве:
+
+        1. de jure держатель, если он жив и его нация и есть большинство —
+           это обычный случай, и тогда de jure и de facto совпадают;
+        2. иначе король большинствующей нации — потому что страна, владеющая
+           областью без всякого титула, правит ею королём, и именно его
+           казна получает ``realm_income`` с этих графств;
+        3. иначе ``None``: большинство есть, а правителя у нации нет —
+           платить некому.
+
+        Персонаж возвращается живым: ``de_facto_holder_of_duchy`` не отдаёт
+        трупы в UI (см. там же).
+        """
+        duchy = self.duchies.get(duchy_id)
+        if duchy is None:
+            return None
+        nation = self.majority_nation_of_duchy(duchy_id)
+        if nation is None:
+            duchy.de_facto_holder_id = None
+            return None
+        holder = self.holder_of_duchy(duchy_id)
+        if holder is not None and holder.alive and holder.nation == nation:
+            duchy.de_facto_holder_id = holder.id
+            return holder.id
+        for realm_id in sorted(self.realms):
+            realm = self.realms[realm_id]
+            if realm.nation != nation or not realm.ruler_id:
+                continue
+            king = self.characters.get(realm.ruler_id)
+            if king is not None and king.alive:
+                duchy.de_facto_holder_id = king.id
+                return king.id
+        duchy.de_facto_holder_id = None
+        return None
+
+    def recompute_de_facto_holders(self) -> List[str]:
+        """Пересчитать de-факто держателя у ВСЕХ герцогств (по sorted id).
+
+        Единственный честный способ привести иерархию в согласие с картой,
+        когда ``province.owner`` меняли мимо ``transfer_county`` (например,
+        пока ``world_map.py`` и ``war.py`` не переведены на неё). Дёшево:
+        десять герцогств и пятьдесят провинций.
+        """
+        for duchy_id in sorted(self.duchies):
+            self.recompute_de_facto_holder(duchy_id)
+        return []
+
+    def de_facto_holder_of_duchy(self, duchy_id: str) -> Optional[Character]:
+        """Персонаж, который правит герцогством ПО ФАКТУ (``None`` — ничья).
+
+        Читает вычисленное поле, а не пересчитывает на лету: иначе результат
+        зависел бы от того, кто последним писал в ``province.owner``, и поле в
+        снапшоте перестало бы быть правдой. Пересчёт живёт в
+        ``recompute_de_facto_holder`` и вызывается из ``transfer_county``.
+
+        Мёртвый держатель не возвращается: панель герцогства не должна
+        показывать труп правителем (см. ``settle_deaths``).
+        """
+        duchy = self.duchies.get(duchy_id)
+        if duchy is None or not duchy.de_facto_holder_id:
+            return None
+        holder = self.characters.get(duchy.de_facto_holder_id)
+        if holder is None or not holder.alive:
+            return None
+        return holder
+
+    def holder_of_county(self, province_idx: int) -> Optional[Character]:
+        """Кто держит графство ПО ФАКТУ — по ``Character.province_idx``.
+
+        Поиск идёт по отсортированным id: в мире должен быть ровно один
+        такой персонаж на графство, но если поломалось что-то ещё, ответ
+        обязан быть одинаковым на всех машинах.
+        """
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool):
+            return None
+        for ch in sorted(self.characters.values(), key=lambda c: c.id):
+            if ch.province_idx == province_idx:
+                return ch
+        return None
+
+    # ---------------- единая точка передачи владения (этап 2) ----------------
+
+    def transfer_county(self, province_idx: int, new_nation: object,
+                        new_holder_id: Optional[object] = None, *,
+                        cause: str = "") -> List[str]:
+        """Передать графство: сменить нацию-владельца и (необязательно) держателя.
+
+        Единственное место в модуле, где меняется ``province.owner`` или
+        ``Character.province_idx``. Пока это правило соблюдается не везде
+        (``world_map.py`` и ``war.py`` пишут ``province.owner`` напрямую —
+        список мест приложен к этапу), иерархия остаётся согласованной.
+
+        Что обязано произойти (все инварианты проверяются тестами):
+
+        * ``province.owner`` становится ``new_nation``;
+        * прежний держатель теряет ``province_idx`` и становится безземельным
+          (``landless_turns = 0``, дальше ``tick_vassals`` начнёт снимать
+          мнение по ``LANDLESS_OPINION_DECAY``);
+        * новый держатель получает ``province_idx``, а его ``duchy_id``
+          пересчитывается по de jure — ЕСЛИ он не держит герцогства (иначе
+          подарок графства герцогу тихо отнял бы у него дукцию, а с ней всех
+          его баронов; см. ``_grant_fief_now``);
+        * ``contracts[id].liege_id`` пересчитывается у обоих затронутых
+          персонажей, потому что «вассал по контракту» и «вассал по
+          ``liege_of``» обязаны быть одним и тем же человеком;
+        * ``Duchy.de_facto_holder_id`` пересчитывается у прежнего и нового
+          герцогства — того, где лежала провинция, и того, где оказался новый
+          держатель, если он сменил дукцию;
+        * ``cause`` попадает в текст события, чтобы журнал сервера объяснял,
+        откуда взялась передача (выдача фьефа, отзыв, захват на карте).
+
+        Прежний держатель НЕ теряет ``duchy_id``: он остаётся в своём
+        герцогстве (он ведь мог быть герцогом, а теперь просто без графства).
+        Ранг тоже не трогается — этим занимается ``refresh_rank``.
+
+        Мусор на входе (не число, выход за границы, пустая нация, неизвестный
+        держатель) даёт пустой список: клиенту нечего показывать, а состояние
+        обязано остаться прежним.
+        """
+        if not isinstance(province_idx, int) or isinstance(province_idx, bool) \
+                or not 0 <= province_idx < len(self.provinces):
+            return []
+        if not isinstance(new_nation, str) or not new_nation:
+            return []
+        place = getattr(self.province(province_idx), "name", f"#{province_idx}")
+        reason = f" ({cause})" if cause else ""
+        old_duchy = self.duchy_of(province_idx)
+        old_holder = self.holder_of_county(province_idx)
+        new_holder: Optional[Character] = None
+        if new_holder_id is not None:
+            new_holder = self.characters.get(new_holder_id) \
+                if isinstance(new_holder_id, str) else None
+            if new_holder is None:
+                return []
+
+        events: List[str] = []
+        old_nation = self.nation_of(province_idx)
+        self.province(province_idx).owner = new_nation
+
+        touched = set()
+        if old_holder is not None and (new_holder is None
+                                       or old_holder.id != new_holder.id):
+            events.append(f"{old_holder.name} теряет {place}{reason}")
+            old_holder.province_idx = None
+            old_holder.landless_turns = 0
+            self.refresh_rank(old_holder.id)
+            touched.add(old_holder.id)
+
+        if new_holder is not None:
+            events.append(f"{place}: {new_holder.name}{reason}")
+            new_holder.province_idx = province_idx
+            new_holder.landless_turns = 0
+            holds_duchy = new_holder.rank is TitleRank.DUKE \
+                and new_holder.duchy_id is not None
+            if old_duchy is not None and not holds_duchy:
+                new_holder.duchy_id = old_duchy
+            touched.add(new_holder.id)
+            self.refresh_rank(new_holder.id)
+
+        # контракт должен совпадать с фактическим сюзереном: иначе «мой вассал
+        # по контракту» и «мой вассал по liege_of» — разные люди
+        for character_id in sorted(touched):
+            self._sync_contract(self.characters.get(character_id))
+
+        # de-факто владелец меняется у прежнего герцогства и у нового
+        for duchy_id in sorted({d for d in (old_duchy, new_holder.duchy_id
+                                            if new_holder is not None else None)
+                                if d}):
+            self.recompute_de_facto_holder(duchy_id)
+
+        if old_nation != new_nation:
+            events.append(f"{place}: владелец {old_nation} → {new_nation}")
+        return events
+
+    def _sync_contract(self, ch: Optional[Character], *, create: bool = True) -> None:
+        """Привести ``contracts[ch.id]`` в соответствие с ``liege_of(ch)``.
+
+        Контракт без сюзерена бессмыслен и опасен: по нему платят налоги и
+        копится тирания. Поэтому если сюзерена нет — контракт удаляется (ровно
+        так же у королей: ``test_nobody_may_command_a_king`` требует, чтобы у
+        короля контракта не было), а если есть — уровень сохраняется, а меняется
+        только ``liege_id``.
+
+        ``create=False`` — режим «не заводить новых контрактов»: обновить
+        существующие и убрать осиротевшие. Он нужен ``settle_deaths``, который
+        пересчитывает контракты ВСЕХ затронутых сменой титула: если бы он заводил
+        контракт там, где его не было, то набор контрактов зависел бы от того,
+        кто и когда умер, а это не состояние, а случайность. ``transfer_county``
+        создаёт контракт: там смена сюзерена — прямое следствие выдачи земли.
+        """
+        if ch is None or not isinstance(ch.id, str):
+            return
+        liege = self.liege_of(ch.id)
+        if liege is None or not liege.alive:
+            self.contracts.pop(ch.id, None)
+            return
+        old = self.contracts.get(ch.id)
+        if old is None and not create:
+            return
+        level = old.level if old is not None else int(ch.contract_level)
+        self.contracts[ch.id] = VassalContract(
+            liege_id=liege.id, vassal_id=ch.id, level=level)
+
+    # ---------------- ранг как состояние (этап 4.1) ----------------
+
+    def promote(self, character_id: str, rank: object) -> List[str]:
+        """Явно выдать персонажу ранг ``rank`` (событие только при смене).
+
+        Обёртка над прямым присваиванием ``Character.rank``: ранг — состояние,
+        поэтому любая его смена обязана быть видна в журнале, а не «молча
+        исправиться» где-то в тике. Неизвестное значение и не-персонаж дают
+        пустой список.
+        """
+        if not isinstance(character_id, str):
+            return []
+        ch = self.characters.get(character_id)
+        if ch is None or not isinstance(rank, TitleRank):
+            return []
+        if ch.rank is rank:
+            return []
+        old = ch.rank
+        ch.rank = rank
+        return [f"{ch.name}: ранг {old.value} → {rank.value}"]
+
+    def expected_rank(self, character_id: str) -> TitleRank:
+        """Какой ранг персонаж должен иметь, если судить по его титулам.
+
+        Правило ровно одно и оно историческое: правитель королевства — король,
+        держатель герцогства — герцог, все прочие, включая безземельных —
+        бароны. Мёртвым ранг НЕ назначается: у трупа нет титулов, но и
+        переписывать его ранг незачем — он всё равно выпадает из ``tick_vassals``
+        по ``alive``, а держать в снапшоте осмысленное «был герцог» полезнее,
+        чем «герцог, который правит».
+        """
+        ch = self.characters.get(character_id) if isinstance(character_id, str) else None
+        if ch is None or not ch.alive:
+            return ch.rank if ch is not None else TitleRank.BARON
+        for realm_id in sorted(self.realms):
+            if self.realms[realm_id].ruler_id == ch.id:
+                return TitleRank.KING
+        for duchy_id in sorted(self.duchies):
+            if self.duchies[duchy_id].holder_id == ch.id:
+                return TitleRank.DUKE
+        return TitleRank.BARON
+
+    def refresh_rank(self, character_id: str) -> List[str]:
+        """Свести ранг персонажа с его титулами (``expected_rank``).
+
+        Вызывается после любой смены титула: выдача и отзыв земли, смерть
+        правителя, наследование. Именно это чинит главный баг этапа 4: раньше
+        ранг был константой, и герцог, получивший герцогство из рук умершего
+        duke, оставался бароном — а барон без сюзерена целиком выпадал из
+        ``tick_vassals``, то есть мнение, лояльность и мятеж замирали.
+        """
+        ch = self.characters.get(character_id) if isinstance(character_id, str) else None
+        if ch is None:
+            return []
+        return self.promote(character_id, self.expected_rank(character_id))
 
     def liege_of(self, character_id: str) -> Optional[Character]:
         """Сюзерен персонажа: король для герцога, герцог для барона."""
@@ -1236,10 +1802,32 @@ class Hierarchy:
         return total
 
     def duchy_income(self, duchy_id: str) -> int:
-        return sum(self.county_income(i) for i in self.counties_of_duchy(duchy_id))
+        """Доход герцогства за ход — ТОЛЬКО по фактически принадлежащим графствам.
+
+        Именно здесь закрывался двойной доход: до этапа 2 сумма бралась по
+        ВСЕМ de jure провинциям герцогства, не глядя на ``owner``. Завоёванное
+        иностранное графство платило и завоевателю (``realm_income`` — по факту),
+        и прежнему герцогу (здесь — по титулу), то есть одна деревня
+        засчитывалась в казну дважды.
+
+        Теперь платит нация de-факто держателя (``de_facto_holder_of_duchy``),
+        и только те de jure провинции, которые реально её (``factually_held``).
+        Если большинства нет или у большинствующей нации нет живого правителя —
+        ноль: платить некому, и это честнее, чем платить пустым герцогством.
+        """
+        holder = self.de_facto_holder_of_duchy(duchy_id)
+        if holder is None:
+            return 0
+        return sum(self.county_income(i)
+                   for i in self.counties_factually_held(duchy_id, holder.nation))
 
     def duchy_levy(self, duchy_id: str) -> int:
-        return sum(self.county_levy(i) for i in self.counties_of_duchy(duchy_id))
+        """Левейс герцогства — по тому же правилу, что и ``duchy_income``."""
+        holder = self.de_facto_holder_of_duchy(duchy_id)
+        if holder is None:
+            return 0
+        return sum(self.county_levy(i)
+                   for i in self.counties_factually_held(duchy_id, holder.nation))
 
     def realm_income(self, realm_id: str) -> int:
         """Фактический доход королевства: то, что платят его владения."""
@@ -1451,10 +2039,19 @@ class Hierarchy:
           должно быть явным: ``revoke_fief`` с отзывом, потом ``grant_fief``
           с новой землёй.
 
-        ``province.owner`` при этом НЕ меняется: фьеф не меняет владельца
-        нации — он меняет только ``Character.province_idx``. Право раздавать
-        землю и доход realm'а считаются по ``owner``, а не по тому, кому
-        досталось графство.
+        ``province.owner`` меняется на нацию получателя. Раньше он НЕ менялся
+        вовсе, и это было ошибкой, а не «особенностью модели»: после этапа 2
+        ``duchy_income`` считает только графства, фактически принадлежащие
+        нации de-факто держателя, поэтому выданное чужое или нейтральное графство
+        не платило бы НИКОМУ — ни прежнему хозяину земли (он её уже не держит),
+        ни новому сюзерену (``realm_income`` идёт по ``owner``). То есть
+        «выданная земля» была бы владением без дохода и без видимости.
+
+        Для ВНУТРЕННЕЙ выдачи (``by_actor``) смена ``owner`` — операция вхолостую:
+        провинция обязана принадлежать realm'у актора, а получатель — его
+        вассал той же нации, поэтому владелец не меняется. Меняется он только
+        на неконтролируемом пути ``by_actor=None``, где «выдать можно что угодно
+        кому угодно» — и там смена ``owner`` как раз и означает честную аннексию.
         """
         ch = self.characters.get(baron_id)
         if ch is None:
@@ -1468,24 +2065,24 @@ class Hierarchy:
     def _grant_fief_now(self, province_idx: int, ch: Character) -> List[str]:
         """Ядро выдачи земли без проверки прав (см. ``_set_contract_now``).
 
-        Бонус «получил землю» даётся по факту отсутствия графства
-        (``province_idx is None``), а не по ``is_ruler``: герцог и без графства
-        правитель, но король вправе пожаловать ему графство первым, и такой дар
-        должен быть замечен вассалом так же, как земля для безземельного барона.
+        Всю работу делает ``transfer_county`` — единая точка передачи владения.
+        Здесь остаётся только то, что относится к выдаче, а не к передаче:
+        бонус «получил землю» и текст события.
 
-        ``duchy_id`` пересчитывается, но ТОЛЬКО если персонаж не держит
-        герцогства. Иначе пожалование графства герцогу из чужого герцогства
-        тихо отняло бы у него его дукцию, а вместе с ней — всех его баронов
-        (``liege_of`` барона идёт через держателя дукции). Держать герцогство и
-        графство «поверх» можно, а разорвать иерархию одним подарком — нет.
+        Бонус даётся по факту отсутствия графства (``province_idx is None``), а
+        не по ``is_ruler``: герцог и без графства правитель, но король вправе
+        пожаловать ему графство первым, и такой дар должен быть замечен вассалом
+        так же, как земля для безземельного барона.
+
+        Повторная выдача того же самого графства — операция вхолостую и молчащая
+        (``[]``): состояние не меняется, а «событие» без изменения только
+        засоряет журнал.
         """
-        events: List[str] = []
+        if ch.province_idx == province_idx:
+            return []
         was_landless = ch.province_idx is None
-        held_duchy = ch.rank is TitleRank.DUKE and ch.duchy_id is not None
-        ch.province_idx = province_idx
-        new_duchy = self.duchy_of(province_idx)
-        if new_duchy is not None and not held_duchy:
-            ch.duchy_id = new_duchy
+        events = self.transfer_county(province_idx, ch.nation, ch.id,
+                                      cause="выдан фьеф")
         ch.landless_turns = 0
         if was_landless:
             ch.opinion_of_liege = min(100, ch.opinion_of_liege + 20)
@@ -1520,12 +2117,23 @@ class Hierarchy:
 
     def revoke_fief(self, baron_id: str, *,
                     by_actor: Optional[str] = None) -> List[str]:
-        """Отозвать графство: снять владение, лояльность и доход поселения.
+        """Отозвать графство: земля возвращается королевству, мнение падает.
+
+        Земля возвращается В ПУЛ realm'а, а не просто исчезает: прежний код
+        обнулял ``province_idx`` и больше ничего не делал, из-за чего отозванное
+        графство выглядело как ничейная земля — оно продолжало платить налоги
+        державшей нации (это правильно), но не было видно нигде. Теперь отзыв
+        идёт через ``transfer_county`` с ``new_holder_id=None``, то есть
+        прежний держатель теряет ``province_idx``, становится безземельным, а
+        контракт с новым сюзереном пересчитывается.
+
+        Владелец нации при этом НЕ меняется: отзыв не отбирает землю у короля,
+        он лишь забирает её у барона. Аннексия — это отдельное действие.
 
         ``by_actor`` (этап 1.1) — те же права, что у ``grant_fief``: живой
         сюзерен цели по рангу. Проверять тут особенно важно, потому что отзыв —
         самое разрушительное, что может сделать сюзерен, и раньше он был
-        доступен кому угодно, кто знает id вассала.
+        доступен кому угодно, кто знал id вассала.
         """
         ch = self.characters.get(baron_id)
         if ch is None:
@@ -1538,11 +2146,17 @@ class Hierarchy:
 
     def _revoke_fief_now(self, ch: Character) -> List[str]:
         """Ядро отзыва земли без проверки прав."""
+        events: List[str] = []
+        if ch.province_idx is not None:
+            province_idx = ch.province_idx
+            events += self.transfer_county(province_idx, self.nation_of(province_idx),
+                                           None, cause="фьеф отозван")
         ch.province_idx = None
         ch.landless_turns = 0
         ch.opinion_of_liege = max(-100, ch.opinion_of_liege - 20)
         ch.loyalty = max(0, ch.loyalty - 20)
-        return [f"{ch.name} лишён земли, мнение {ch.opinion_of_liege}"]
+        events.append(f"{ch.name} лишён земли, мнение {ch.opinion_of_liege}")
+        return events
 
     # ---------------- траты золота ----------------
     #
@@ -2227,6 +2841,327 @@ class Hierarchy:
                 p.development = getattr(p, "development", 1) - 1
         return events
 
+    # ---------------- старение, смерть, наследование (этап 4) ----------------
+    #
+    # Контракт раздела:
+    #
+    # * ``tick_characters`` — единственный вызов старения и смертей. Живёт в
+    #   ``end_turn`` последней фазой, чтобы экономика хода считалась по миру,
+    #   в котором все ещё живы.
+    # * ``kill_character`` — явная смерть (бой, яд, казнь). Детерминирована так
+    #   же, как старение: причина передаётся строкой, кубик не бросается.
+    # * ``settle_deaths`` — разбирает титулы умерших: realm -> герцогство ->
+    #   графство, в этом порядке, потому что преемник герцогства сам может
+    #   оказаться безземельным бароном.
+    # * ``auto_inherit`` (модульная функция) — обёртка над ``settle_deaths`` для
+    #   внешних вызовов; раньше она была написана и не вызывалась НИ ОДНОЙ
+    #   строкой кода, то есть наследования в игре не было вообще.
+
+    def heir_candidates(self, realm_id: str) -> List[Character]:
+        """Преемники трона ``realm_id`` — по убыванию ``(-loyalty, -martial, id)``.
+
+        Лояльность — главный критерий, военная сила — второй, id — третий
+        (гарантия детерминизма: при равной лояльности и одинаковом ``martial``
+        мир обязан выбрать одного и того же человека на всех машинах).
+
+        Кандидаты — живые персонажи нации королевства. Ранг не фильтруется:
+        ``tick_vassals`` держит лояльность примерно одинаковой у всех, так что
+        ранг в сортировке ничего не решал бы, а фильтровать его — значило бы
+        запретить престолу перейти к барону, который всю жизнь верно служил.
+        Полноценная родословная по крови отложена (см. ``Character.heir``).
+        """
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if realm is None:
+            return []
+        out = [c for c in self.characters.values()
+               if c.alive and c.nation == realm.nation]
+        out.sort(key=lambda c: (-c.loyalty, -c.martial, c.id))
+        return out
+
+    def duchy_heirs(self, duchy_id: str, *,
+                    exclude: Optional[str] = None) -> List[Character]:
+        """Преемники герцогства: живые персонажи той же дукции, ``(-loyalty, id)``.
+
+        Порядок без ``-martial`` (как в прежней ``auto_inherit``): для
+        герцогства важна преданность, а не боевая сила, и добавление третьего
+        ключа здесь ничего бы не изменило — на карте у всех ``martial == 5``.
+
+        Кандидаты ограничены НАЦИЕЙ нынешнего держателя. Это не украшение, а
+        условие согласованности: дукция de jure принадлежит династии, и если бы
+        преемником мог стать кто угодно, то ``nation`` нового герцога разошёлся
+        бы с ``Duchy.realm_id``, который по-прежнему указывает на realm прежней
+        нации. Титул и его страна обязаны ехать вместе.
+        """
+        out = [c for c in self.characters.values()
+               if c.alive and c.duchy_id == duchy_id and c.id != exclude]
+        nation = self.dynasty_nation_of_duchy(duchy_id)
+        if nation is not None:
+            out = [c for c in out if c.nation == nation]
+        out.sort(key=lambda c: (-c.loyalty, c.id))
+        return out
+
+    def dynasty_nation_of_duchy(self, duchy_id: str) -> Optional[str]:
+        """Нация династии герцогства — по de jure держателю (``Duchy.realm_id``).
+
+        Титул и его страна обязаны ехать вместе, поэтому наследование
+        герцогства ограничено этой нацией (см. ``duchy_heirs``). Если держателя
+        нет, берётся нация realm'а самого герцогства, а если нет и его — ``None``,
+        и тогда кандидатов не фильтруем: мир и так уже вне закона.
+        """
+        duchy = self.duchies.get(duchy_id)
+        if duchy is None:
+            return None
+        holder = self.characters.get(duchy.holder_id or "")
+        if holder is not None:
+            return holder.nation
+        realm = self.realms.get(duchy.realm_id or "")
+        return realm.nation if realm is not None else None
+
+    def county_heirs(self, province_idx: int, *,
+                     exclude: Optional[str] = None) -> List[Character]:
+        """Преемники графства: живые БЕЗЗЕМЕЛЬНЫЕ БАРОНЫ его нации, ``(-loyalty, id)``.
+
+        Два ограничения, и оба обязательные:
+
+        * **нация.** Держатель графства и ``province.owner`` обязаны совпадать:
+          если разойдутся, налог пойдёт одной стране, а землёй будет владеть
+          персонаж другой, и ``realm_income`` с ``duchy_income`` начнут считать
+          разные вещи.
+        * **ранг барона.** Графство — это владение барона; наследование от
+          умершего сюзерена (``grant_fief``) может подарить графство и герцогу,
+          а смерть барона не может выдать землю ни королю, ни чужому герцогу —
+          тот иначе получил бы «собственное графство», которого у него и так
+          нет в ``is_ruler``.
+
+        Порядок детерминирован, повторный вызов даёт тот же список.
+        """
+        nation = self.nation_of(province_idx)
+        out = [c for c in self.characters.values()
+               if c.alive and c.nation == nation and c.rank is TitleRank.BARON
+               and c.province_idx is None and c.id != exclude]
+        out.sort(key=lambda c: (-c.loyalty, c.id))
+        return out
+
+    def succession_crisis_of(self, realm_id: str) -> Optional[SuccessionCrisis]:
+        return self.succession_crises.get(realm_id) \
+            if isinstance(realm_id, str) else None
+
+    def open_succession_crisis(self, realm_id: str) -> SuccessionCrisis:
+        """Открыть (или переоткрыть) кризис престола королевства.
+
+        Запись всегда создаётся, даже если преемников нет: «у королевства нет
+        правителя» — это факт, который обязан быть виден в панели и в хеше, а не
+        молчаливый ``ruler_id = None``. Если кандидат есть, трон занимает
+        ``candidates[0]`` — выбор детерминирован, чтобы реплей сервера
+        совпадал. Игрок может переопределить его через
+        ``resolve_succession`` (см. там же про формат выбора).
+        """
+        realm = self.realms.get(realm_id)
+        if realm is None:
+            raise ValueError(f"нет королевства {realm_id!r}")
+        candidates = [c.id for c in self.heir_candidates(realm_id)]
+        crisis = SuccessionCrisis(
+            realm_id=realm_id,
+            candidates=tuple(candidates),
+            turn_opened=self.turn,
+            turn_limit=self.turn + SUCCESSION_CRISIS_TURNS,
+        )
+        if candidates:
+            heir = self.characters[candidates[0]]
+            realm.ruler_id = heir.id
+            heir.realm_id = realm_id
+            heir.rank = TitleRank.KING
+            crisis.ruler_id = heir.id
+            crisis.resolved_turn = self.turn
+        else:
+            realm.ruler_id = None
+        self.succession_crises[realm_id] = crisis
+        return crisis
+
+    def resolve_succession(self, realm_id: str, character_id: str) -> List[str]:
+        """Явный выбор преемника из кандидатов кризиса (точка для игрока).
+
+        Формат выбора: ``character_id`` обязан быть в ``crisis.candidates`` и
+        быть жив. Никаких прав не проверяется — престол нельзя «выиграть»
+        командой, его можно только раздать одному из названных кандидатов; кто
+        именно нажимает — забота вызывающего слоя (UI или сетевой команды).
+
+        Трон немедленно занимает кандидат, ``crisis`` закрывается записью
+        ``ruler_id``/``resolved_turn``, поэтому в снапшоте видно, КТО сел и
+        КОГДА. На ранг преемника это не влияет: он и так получает ``KING`` при
+        назначении (см. ``open_succession_crisis``).
+        """
+        crisis = self.succession_crisis_of(realm_id)
+        realm = self.realms.get(realm_id) if isinstance(realm_id, str) else None
+        if crisis is None or realm is None:
+            return []
+        if character_id not in crisis.candidates:
+            return [f"{realm.name}: {character_id} не числится преемником"]
+        heir = self.characters.get(character_id)
+        if heir is None or not heir.alive:
+            return [f"{realm.name}: преемник {character_id} нежив"]
+        if crisis.ruler_id == character_id:
+            return [f"{realm.name}: {heir.name} уже на троне"]
+        realm.ruler_id = heir.id
+        heir.realm_id = realm_id
+        heir.rank = TitleRank.KING
+        crisis.ruler_id = heir.id
+        crisis.resolved_turn = self.turn
+        return [f"{realm.name}: престол занимает {heir.name} "
+                f"(прежний: {crisis.candidates[0] if crisis.candidates else '—'})"]
+
+    def kill_character(self, character_id: str, *, cause: str = DEATH_CAUSE_KILLED) -> List[str]:
+        """Убить персонажа и разобрать его титулы (детерминированно, без кубика).
+
+        Точка входа для ``war.py``: генерала или правителя можно снять сразу, не
+        дожидаясь старости. Разбор титулов делает ``settle_deaths``, поэтому
+        смерть на поле боя и смерть от старости дают одинаковые последствия —
+        иначе «убили герцога» и «герцог умер» были бы разными механиками.
+        """
+        ch = self.characters.get(character_id) if isinstance(character_id, str) else None
+        if ch is None or not ch.alive:
+            return []
+        ch.alive = False
+        return [f"{ch.name} ({cause}, {ch.age} лет)"] + self.settle_deaths([ch])
+
+    def settle_deaths(self, dead: Sequence[Character] = ()) -> List[str]:
+        """Разобрать титулы умерших: realm -> герцогство -> графство.
+
+        Порядок важен и единственный: сначала престол, потом герцогство, потом
+        графство. Наоборот нельзя — новый герцог, только что получивший дукцию,
+        тут же должен быть в состоянии «с дукцией», когда решается судьба
+        графства.
+
+        Что происходит с каждым титулом:
+
+        * **Трон.** ``Realm.ruler_id`` переходит преемнику из
+          ``heir_candidates`` (``-loyalty``, ``-martial``, ``id``), преемник
+          получает ранг ``KING`` и ``realm_id``. Если преемников нет —
+          ``ruler_id = None`` и открывается ``SuccessionCrisis``: явное
+          состояние, а не тихий баг.
+        * **Герцогство.** ``Duchy.holder_id`` переходит живому персонажу той
+          же дукции, наследник получает ранг ``DUKE`` и ``realm_id`` герцогства.
+          Если наследников нет — ``holder_id = None`` и явное событие: в UI не
+          должен появиться труп правителем (именно это и делал
+          ``holder_of_duchy``, не проверяя ``alive``).
+        * **Графство.** Если у умершего было ``province_idx``, поле
+          обнуляется ВСЕГДА (иначе на графстве окажутся двое), а само графство
+          переходит живому барону той же нации (тот же порядок отбора). Если
+          наследников нет — пишется событие «графство осталось без хозяина»:
+          земля возвращается в пул, а её налог остаётся у нации, потому что
+          ``owner`` не менялся.
+        * **Контракты.** У мёртвого контракт удаляется (вассал мёртв — платить
+          некому), у наследника — пересчитывается под нового сюзерена.
+
+        УМЕРШИЙ НЕ ТЕРЯЕТ НИЧЕГО, ЧТО НЕ СВЯЗАНО С ЕГО ТИТУЛАМИ: ``duchy_id``
+        остаётся, если герцогство ушло к наследнику иначе (``transfer_county``
+        и ``_sync_contract`` идут по своим путям). Сохранять это важно для
+        истории снапшота: по ``duchy_id`` мёртвого видно, кем он был.
+        """
+        if not dead:
+            return []
+        events: List[str] = []
+        gone = {ch.id for ch in dead}
+        # 1. престол
+        for realm_id in sorted(self.realms):
+            realm = self.realms[realm_id]
+            if realm.ruler_id is None or realm.ruler_id not in gone:
+                continue
+            old_ruler = self.characters.get(realm.ruler_id or "")
+            old_name = old_ruler.name if old_ruler else "?"
+            crisis = self.open_succession_crisis(realm_id)
+            if crisis.ruler_id:
+                heir = self.characters[crisis.ruler_id]
+                self._sync_contract(heir)
+                events.append(f"{realm.name}: престол перешёл к {heir.name} "
+                              f"(прежний {old_name})")
+            else:
+                events.append(f"{realm.name}: престол пуст, преемников нет")
+        # 2. герцогства
+        for duchy_id in sorted(self.duchies):
+            duchy = self.duchies[duchy_id]
+            if duchy.holder_id is None or duchy.holder_id not in gone:
+                continue
+            dead_holder = self.characters.get(duchy.holder_id or "")
+            heirs = self.duchy_heirs(duchy_id, exclude=duchy.holder_id)
+            if heirs:
+                heir = heirs[0]
+                duchy.holder_id = heir.id
+                heir.rank = TitleRank.DUKE
+                if duchy.realm_id:
+                    heir.realm_id = duchy.realm_id
+                self.refresh_rank(heir.id)
+                self._sync_contract(heir)
+                events.append(f"{duchy.name}: герцогом стал {heir.name}")
+            else:
+                duchy.holder_id = None
+                events.append(f"{duchy.name}: герцогство осталось без герцога")
+            if dead_holder is not None:
+                events.append(f"{dead_holder.name} больше не герцог {duchy.name}")
+        # 3. графства
+        for ch in sorted(dead, key=lambda c: c.id):
+            if ch.province_idx is None:
+                continue
+            province_idx = ch.province_idx
+            # поле обнуляется ВСЕГДА, даже если нашёлся наследник: иначе на
+            # одном графстве окажутся двое (``holder_of_county`` вернул бы
+            # первого по id, то есть не того, кто на самом деле им владеет),
+            # а мёртвый персонаж продолжал бы числиться правителем.
+            ch.province_idx = None
+            heirs = self.county_heirs(province_idx, exclude=ch.id)
+            if heirs:
+                heir = heirs[0]
+                heir.province_idx = province_idx
+                heir.landless_turns = 0
+                if heir.duchy_id is None:
+                    heir.duchy_id = self.duchy_of(province_idx)
+                self.refresh_rank(heir.id)
+                self._sync_contract(heir)
+                events.append(f"графство #{province_idx} унаследовал {heir.name}")
+            else:
+                events.append(f"графство #{province_idx} осталось без хозяина")
+        # 4. контракты. Смена ДЕРЖАТЕЛЯ герцогства меняет сюзерена сразу у всех
+        # баронов дукции, поэтому контракты пересчитываются у ВСЕХ персонажей,
+        # а не только у затронутых напрямую: иначе «мой вассал по контракту»
+        # и «мой вассал по liege_of» снова разошлись бы. create=False — набор
+        # контрактов не должен зависеть от того, кто умер.
+        for ch in sorted(self.characters.values(), key=lambda c: c.id):
+            if ch.id in gone:
+                self.contracts.pop(ch.id, None)
+                continue
+            self._sync_contract(ch, create=False)
+        # 5. de-факто владельцы обязаны перестать называть трупы. Пока герцог
+        # жив, его дукция указывала на него; после смерти поле пересчитывается
+        # целиком (десять герцогств, копейки) — иначе в снапшоте остался бы
+        # «правитель», который мёртв, и hash разошёлся бы с тем, что видит UI.
+        self.recompute_de_facto_holders()
+        return events
+
+    def tick_characters(self) -> List[str]:
+        """Старение, естественная смерть и разбор титулов (детерминированно).
+
+        Вызывается из ``end_turn`` последней фазой — после экономики. Порядок
+        объясним: ход считается по миру, в котором все персонажи ещё живы, а
+        умершие влияют уже на следующий. Это заметно для ``realm_upkeep``:
+        мёртвый король не должен успеть «списать» содержание двора.
+
+        Старение целочисленное и БЕЗ ГПСЧ — см. ``CHARACTERS_AGE_PER_TURN`` и
+        ``CHARACTER_DEATH_AGE``. Ни одного обращения к ``self.streams``.
+        """
+        events: List[str] = []
+        dead: List[Character] = []
+        for ch in sorted(self.characters.values(), key=lambda c: c.id):
+            if not ch.alive:
+                continue
+            ch.age += CHARACTERS_AGE_PER_TURN
+            if ch.age >= ch.death_age:
+                ch.alive = False
+                dead.append(ch)
+                events.append(f"{ch.name} умер {DEATH_CAUSE_AGE} ({ch.age} лет)")
+        if dead:
+            events += self.settle_deaths(dead)
+        return events
+
     def tick_vassals(self) -> List[str]:
         """Мнение, лояльность, тирания, накопление недовольства."""
         events: List[str] = []
@@ -2326,12 +3261,22 @@ class Hierarchy:
         Здесь же обнуляется ``action_ledger``: лимиты «раз за ход» действуют
         внутри хода, а номер хода в ключе журнала нужен только для логов.
         Обнуление делает каноническую точку сохранения (границу хода)
-        единственной точкой, где журнал гарантированно пуст. Оно выполняется
+        единственной точкой, где журнал гарантированно пуст. Обнуление выполняется
         ДВАЖДЫ: перед разбором приказов и после него. Первое — потому что
         разбор не должен отнимать у сюзерена его «раз за ход» живой кнопки
         (иначе ранее выданный приказ мог бы не исполниться только потому, что
         король в этом ходу уже кликнул ту же кнопку), второе — чтобы каноническая
         точка сохранения осталась с ПУСТЫМ журналом.
+
+        Старение и смерть (``tick_characters``) стоят ПОСЛЕДНЕЙ фазой, перед
+        увеличением ``turn``. Это требование совместимости, а не украшение:
+        экономика хода обязана считаться по миру, в котором все персонажи ещё
+        живы — иначе мёртвый король «спишет» содержание двора за этот ход и
+        наследование начнёт влиять на экономику того же хода, а не следующего.
+        Побочный эффект, который кстати: первая смерть на текущей карте случается
+        на 38-м ходу (короли стартуют в 44 года, минимальный порог — 80), поэтому
+        проверки «30 ходов подряд» и «100 ходов подряд» проходят без изменения их
+        смысла, а к 200 ходам уже видны и смерть короля, и передача престола.
         """
         events: List[str] = []
         events += self.tick_counties()
@@ -2341,6 +3286,7 @@ class Hierarchy:
         self.action_ledger.clear()
         if self.orders:
             events += self.resolve_orders(closing_turn)
+        events += self.tick_characters()
         self.turn += 1
         self.action_ledger.clear()
         self._append_log(events)
@@ -2457,6 +3403,10 @@ class Hierarchy:
                 # и round-trip тихо сменил бы тип поля.
                 "de_jure_provinces": tuple(d.de_jure_provinces),
                 "holder_id": d.holder_id,
+                # de-факто держатель (этап 2): от него зависит duchy_income,
+                # то есть то, что игрок видит в панели герцогства. Без него
+                # мир после загрузки считал бы доход по старым de jure правилам.
+                "de_facto_holder_id": d.de_facto_holder_id,
                 "realm_id": d.realm_id,
                 "development": d.development,
                 "siege_safety": d.siege_safety,
@@ -2480,6 +3430,7 @@ class Hierarchy:
                 "stewardship": c.stewardship,
                 "diplomacy": c.diplomacy,
                 "age": c.age,
+                "death_age": c.death_age,
                 "alive": c.alive,
                 "traits": tuple(c.traits),
                 "heir": c.heir,
@@ -2509,6 +3460,19 @@ class Hierarchy:
                 "resolved_turn": o.resolved_turn,
                 "message": o.message,
             } for order_id, o in sorted(self.orders.items())},
+            # Кризисы престола (этап 4) — состояние, а не история: пустой трон
+            # обязан быть виден и обязан пережить ``end_turn``. Ключ реестра —
+            # id королевства, на королевство ровно одна запись, поэтому реестр
+            # не растёт и порядок обхода по отсортированным id детерминирован.
+            "succession_crises": {realm_id: {
+                "realm_id": c.realm_id,
+                # tuple: JSON отдаёт list, и round-trip тихо сменил бы тип
+                "candidates": tuple(c.candidates),
+                "turn_opened": c.turn_opened,
+                "turn_limit": c.turn_limit,
+                "ruler_id": c.ruler_id,
+                "resolved_turn": c.resolved_turn,
+            } for realm_id, c in sorted(self.succession_crises.items())},
             "counties": {
                 idx: {name: getattr(p, name, default)
                       for name, default in COUNTY_FIELD_DEFAULTS.items()}
@@ -2577,6 +3541,10 @@ class Hierarchy:
                 # обратно в tuple: JSON отдаёт list
                 de_jure_provinces=tuple(data.get("de_jure_provinces") or ()),
                 holder_id=data.get("holder_id"),
+                # старый снапшот без de-факто держателя читается как «ничья»:
+                # так честнее, чем молчаливый пересчёт по текущей карте —
+                # загруженный мир должен совпасть с сохранённым по хешу.
+                de_facto_holder_id=data.get("de_facto_holder_id"),
                 realm_id=data.get("realm_id"),
                 development=data.get("development", 1),
                 siege_safety=data.get("siege_safety", 0),
@@ -2616,6 +3584,8 @@ class Hierarchy:
                 stewardship=data.get("stewardship", 5),
                 diplomacy=data.get("diplomacy", 5),
                 age=data.get("age", 30),
+                # старый снапшот без личного порога читается как «умрёт в 80»
+                death_age=as_int(data.get("death_age")) or CHARACTER_DEATH_AGE,
                 alive=bool(data.get("alive", True)),
                 # обратно в tuple: JSON отдаёт list
                 traits=tuple(traits),
@@ -2662,8 +3632,26 @@ class Hierarchy:
                 message=str(data.get("message") or ""),
             )
 
+        crises: Dict[str, SuccessionCrisis] = {}
+        for raw_id, data in dict(state.get("succession_crises") or {}).items():
+            data = dict(data)
+            realm_id = str(data.get("realm_id") or raw_id)
+            raw_candidates = data.get("candidates") or ()
+            if isinstance(raw_candidates, str):
+                raw_candidates = (raw_candidates,)
+            crises[realm_id] = SuccessionCrisis(
+                realm_id=realm_id,
+                # обратно в tuple: JSON отдаёт list
+                candidates=tuple(str(c) for c in raw_candidates),
+                turn_opened=as_int(data.get("turn_opened")) or 0,
+                turn_limit=as_int(data.get("turn_limit")) or 0,
+                ruler_id=data.get("ruler_id"),
+                resolved_turn=as_int(data.get("resolved_turn")),
+            )
+
         hierarchy = Hierarchy(provinces, duchies, realms, characters, contracts,
-                              streams=streams, orders=orders)
+                              streams=streams, orders=orders,
+                              succession_crises=crises)
 
         for raw_idx, data in dict(state.get("counties") or {}).items():
             try:
@@ -2793,37 +3781,33 @@ def build_default_hierarchy(provinces: Sequence,
             p.fort_level = 1
             p.garrison = 100
 
-    return Hierarchy(provinces, duchies, realms, characters, contracts, streams=streams)
+    hierarchy = Hierarchy(provinces, duchies, realms, characters, contracts, streams=streams)
+    # личный возраст смерти раздаётся по id (детерминированно): поколения должны
+    # перемежаться, иначе все бароны одной нации умрут в один ход и наследовать
+    # будет некому — см. CHARACTERS_DEATH_AGE_SPREAD
+    for character_id in sorted(characters):
+        characters[character_id].death_age = character_death_age(character_id)
+    # de-факто держатели вычисляются один раз здесь, а не лениво по чтению:
+    # от них зависит duchy_income, а значит и панель герцогства уже на первом
+    # кадре. Нулевые значения в provinces по этому моменту уже расставлены.
+    hierarchy.recompute_de_facto_holders()
+    return hierarchy
 
 
 def auto_inherit(hierarchy: Hierarchy) -> List[str]:
-    """Простейшее наследование: умерший правитель передаёт титул наследнику.
+    """Разобрать титулы всех, кто уже мёртв (обратная совместимость).
 
-    Правило намеренно простое — самый лояльный живой персонаж того же
-    владения. Полноценная родословная отложена: она тянет за собой UI и
-    скрытую информацию, которые в 2D без сервера нечитаемы.
+    Историческая функция была написана и НЕ ВЫЗЫВАЛАСЬ ни одной строкой кода:
+    до этапа 4 в игре не умирал никто, а значит не наследовалось ничего. Теперь
+    ею пользуется ``Hierarchy.tick_characters`` — то есть это тот же самый
+    разбор, а не второй, расходящийся с ним.
+
+    Оставлена внешней функцией, а не методом, потому что на неё могли ссылаться
+    ``world_map.py``/``campaigns.py``; реализация переехала в
+    ``Hierarchy.settle_deaths``, где живут престол, герцогство, графство и
+    контракты вместе. Новая логика наследования (ранг преемника, де-факто
+    держатель герцогства, пересчёт контракта) — там же.
     """
-    events: List[str] = []
-    for ch in sorted(hierarchy.characters.values(), key=lambda c: c.id):
-        if ch.alive or ch.rank is TitleRank.KING:
-            continue
-        if ch.duchy_id is None:
-            continue
-        # наследник — любой живой персонаж этого герцогства, ранг ниже не важен,
-        # иначе титул герцога переходил бы только к другому герцогу (их нет)
-        heirs = [c for c in hierarchy.characters.values()
-                 if c.alive and c.duchy_id == ch.duchy_id and c.id != ch.id]
-        heirs.sort(key=lambda c: (-c.loyalty, c.id))
-        if not heirs:
-            continue
-        heir = heirs[0]
-        if ch.rank is TitleRank.DUKE:
-            heir.duchy_id = ch.duchy_id
-            heir.realm_id = ch.realm_id
-            hierarchy.duchies[ch.duchy_id].holder_id = heir.id
-            events.append(f"{ch.name} погиб: герцогство {ch.duchy_id} → {heir.name}")
-        if ch.province_idx is not None:
-            heir.province_idx = ch.province_idx
-            events.append(f"{heir.name} унаследовал #{ch.province_idx}")
-        ch.duchy_id = None
-    return events
+    dead = [ch for ch in sorted(hierarchy.characters.values(), key=lambda c: c.id)
+            if not ch.alive]
+    return hierarchy.settle_deaths(dead)

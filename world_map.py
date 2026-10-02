@@ -22,7 +22,22 @@ from world_data import (
 )
 from diplomacy import DiplomacyManager, Relation
 from textures import TextureManager, GeneralIcon, RiverRenderer
-from states import build_default_hierarchy, TitleRank, CONTRACT_LEVELS
+from states import (
+    build_default_hierarchy, TitleRank, CONTRACT_LEVELS,
+    # приказы (этап 1.2 в states.py) — правила и статусы
+    OrderKind, OrderStatus, COMMAND_MIN_RANK,
+    ORDERS_ISSUED_PER_TURN, ORDER_DEADLINE_TURNS, REFUSED_WEIGHT, order_weight,
+    # цены и потолки трат: в интерфейсе НИ ОДНОГО числа не хардкодится,
+    # всё берётся отсюда, иначе UI разъедется с правилами после правки
+    GIFT_COST, GIFT_OPINION_BY_COUNT, GIFT_LOYALTY_BY_COUNT, gift_gain,
+    COUNCIL_INFLUENCE, COUNCIL_LOYALTY,
+    LEVY_COST_PER_BLOCK, LEVY_BLOCK_TROOPS,
+    DEV_COST_BASE, DEV_COST_STEP, DEVELOPMENT_MAX, development_upgrade_cost,
+    CROWN_COST, CROWN_PRESTIGE_COST, MAX_CROWN_AUTHORITY,
+    MERC_COST_PER_BLOCK, MERC_BLOCK_TROOPS, MERC_MAX_BLOCKS_PER_TURN,
+    GARRISON_RECRUIT_COST_PER_100, GARRISON_CAP_PER_FORT,
+    TAX_POLICY_MIN, TAX_POLICY_MAX, TAX_POLICY_CROWN_AUTHORITY,
+)
 
 # Базовые цвета границ по владельцу. Вынесены на уровень модуля, чтобы
 # палитру ранга можно было применять поверх, не трогая саму карту.
@@ -92,6 +107,96 @@ _PANEL_ROW_H = 13                   # шаг строки списка перс�
 _PANEL_MAX_Y = _PANEL_H - 40        # ниже этого дерево не рисуется
 _PANEL_HINT_Y = _PANEL_H - 25       # строка подсказки
 
+# Высота строки-кнопки (приказ, трата, кнопки графства). Равна шагу строки
+# персонажей: шрифт строки — 12 px, и на 11 px текст прижимался к рамке.
+_PANEL_ACT_H = 13
+# Отступ между блоками правого столбца (приказы под списком двора)
+_PANEL_BLOCK_GAP = 8
+
+# Цвета блока приказов и трат. Доступное действие — обычный тон панели,
+# заблокированное (нет золота, потолок, лимит) — приглушённый серый: игрок
+# видит недоступность ДО клика, а не по факту отказа.
+_ACT_OK = (205, 195, 160)
+_ACT_OFF = (118, 112, 100)
+_ACT_HEAD = (220, 200, 160)
+_ORDER_STATUS_COLOR = {
+    OrderStatus.PENDING: (235, 215, 165),
+    OrderStatus.ACCEPTED: (150, 205, 150),
+    OrderStatus.REFUSED: (215, 110, 100),
+    OrderStatus.FULFILLED: (150, 200, 210),
+    OrderStatus.PUNISHED: (205, 130, 200),
+}
+
+# Подпись статуса приказа по-русски. states отдаёт английские .value, но весь
+# остальной интерфейс панели русский, поэтому переводим здесь, а не в двух
+# строках кода поперёк.
+_ORDER_STATUS_TEXT = {
+    OrderStatus.PENDING: "ждёт решения вассала",
+    OrderStatus.ACCEPTED: "принят, ждёт исполнения",
+    OrderStatus.REFUSED: "отказ",
+    OrderStatus.FULFILLED: "исполнен",
+    OrderStatus.PUNISHED: "наказан за неисполнение",
+}
+
+# Виды приказов в порядке блока «ПРИКАЗЫ». Порядок НЕ влияет на правила, он
+# только разметка: тяжёлые (отзыв земли, левейс) вниз, чтобы верх панели
+# показывал то, что нужно чаще всего.
+_ORDER_ROWS: Tuple[Tuple[OrderKind, str], ...] = (
+    (OrderKind.SUMMON_COUNCIL, "совет"),
+    (OrderKind.GIFT, "подарок"),
+    (OrderKind.SET_CONTRACT, "контракт+1"),
+    (OrderKind.RAISE_LEVY, "левейс+1"),
+    (OrderKind.GRANT_FIEF, "выдать землю"),
+    (OrderKind.REVOKE_FIEF, "отозвать"),
+    (OrderKind.DEVELOP_COUNTY, "застройка"),
+)
+
+# Привязка клавиш 1..4 в открытой панели. Выбор — четыре самых частых
+# действия, и выбор этот не магический: это ровно те строки блока, у которых
+# НЕТ обязательных аргументов от игрока (никакой «выбери графство» перед
+# нажатием), поэтому действие выполняется сразу.
+#
+#   1 — ПОДАРОК: самый дешёвый рычаг на мнение и лояльность, вес приказа 1
+#       (см. states.ORDER_WEIGHTS), поэтому его чаще всего исполняют, а не
+#       отклоняют;
+#   2 — СОВЕТ: тоже вес 1 и БЕСПЛАТЕН (states.COUNCIL_* — это прибавки, не
+#       цена), то есть единственное действие без цены вообще;
+#   3 — КОНТРАКТ+1: единственный приказ, который сам по себе даёт доход
+#       (налог/левейс из states.CONTRACT_LEVELS), то есть платит самому себе;
+#   4 — ЛЕВЕЙС+1: главная кнопка войны states.raise_levy, самая частая трата
+#       казны после наема наёмников.
+#
+# Формат: (клавиша pygame, действие). Действие — "order:<OrderKind.value>"
+# или "spend:<метод states>". Разбор строки — в _panel_run_action.
+_PANEL_HOTKEYS: Tuple[Tuple[int, str], ...] = (
+    (pygame.K_1, f"order:{OrderKind.GIFT.value}"),
+    (pygame.K_2, f"order:{OrderKind.SUMMON_COUNCIL.value}"),
+    (pygame.K_3, f"order:{OrderKind.SET_CONTRACT.value}"),
+    (pygame.K_4, f"spend:{OrderKind.RAISE_LEVY.value}"),
+)
+
+# Траты королевства: шапка панели. Порядок как в _ORDER_ROWS — от дешёвого к
+# дорогому. Числа цен берутся из states, здесь только имена действий, и они
+# совпадают с именами методов states.Hierarchy — вызов идёт по этому же ключу.
+_SPEND_ROWS: Tuple[Tuple[str, str], ...] = (
+    ("raise_levy", "левейс"),
+    ("raise_crown_authority", "корона"),
+    ("hire_mercenaries", "наёмники"),
+    ("set_tax_policy", "налог"),
+)
+
+# Траты графства: под строкой графства. Ключи — ветки обработчика, а не имена
+# методов states: застройка и гарнизон бьют по ПРОВИНЦИИ, а не по королевству.
+_COUNTY_SPEND_ROWS: Tuple[Tuple[str, str], ...] = (
+    ("develop", "застройка"),
+    ("garrison", "гарнизон"),
+)
+
+# Текст подсказки. Сам формат задан константой, чтобы длина строки не «поехала»
+# вместе с содержимым: горячие клавиши и ESC-переходы дописываются к нему.
+_PANEL_HINT_OWN = "Q/E нация · ↑↓ двор · 1-4 приказ · ESC снять выбор · V закрыть"
+_PANEL_HINT_FOREIGN = "Q/E нация · ↑↓ двор · чужая держава: только чтение · V закрыть"
+
 # Потолок кэша строк: заполненный кэш сбрасывается целиком, иначе он
 # рос бы бесконечно при смене чисел в хинтах и тултипах.
 _TEXT_CACHE_LIMIT = 2000
@@ -107,6 +212,8 @@ _TC_COUNTY_INCOME = "county_income"
 _TC_DUCHY_INCOME = "duchy_income"
 _TC_DUCHY_LEVY = "duchy_levy"
 _TC_VASSALS = "vassals"
+_TC_REALM_LEVY = "realm_levy"
+_TC_FREE_COUNTY = "free_county"
 
 
 class WorldMapScreen:
@@ -201,6 +308,10 @@ class WorldMapScreen:
         self._own_mode: str = "browse"
         # курсор по списку персонажей правого столбца (Up/Down)
         self._vassal_cursor: int = 0
+        # последняя причина отказа от действия панели (приказ/трата). Показывается
+        # под блоком, чтобы игрок видел не «клик ничего не сделал», а причину.
+        # Обнуляется каждым успешным действием.
+        self._panel_notice: Optional[str] = None
         self._game_over = False
         self._winner: Optional[str] = None
         self._message: Optional[str] = None
@@ -378,7 +489,16 @@ class WorldMapScreen:
                 self._keys_held.add(event.key)
                 if event.key == pygame.K_ESCAPE:
                     if self._show_ownership:
-                        self._close_ownership_panel()
+                        # ESC двухуровневый: сначала снимает выбор персонажа
+                        # или графства, и только потом закрывает панель. Раньше
+                        # один ESC закрывал всё разом, и ошибочно снять выбор
+                        # было нельзя — приходилось закрывать и открывать панель.
+                        if self._sel_character_id is not None \
+                                or self._sel_county_idx is not None:
+                            self._reset_ownership_selection()
+                            self._invalidate_panel()
+                        else:
+                            self._close_ownership_panel()
                     elif self._show_diplomacy:
                         self._show_diplomacy = False
                         self._diplomacy_target = None
@@ -407,13 +527,20 @@ class WorldMapScreen:
                     self._show_diplomacy = not self._show_diplomacy
                 elif self._show_ownership:
                     # Q/E и стрелки вбок листают нации, стрелки вверх/вниз
-                    # двигают курсор по списку персонажей (задел на приказы)
+                    # двигают курсор по списку персонажей
                     if event.key in (pygame.K_q, pygame.K_LEFT):
                         self._cycle_ownership_nation(-1)
                     elif event.key in (pygame.K_e, pygame.K_RIGHT):
                         self._cycle_ownership_nation(1)
                     elif event.key in (pygame.K_UP, pygame.K_DOWN):
                         self._move_vassal_cursor(-1 if event.key == pygame.K_UP else 1)
+                    else:
+                        # ветка проглатывает ВСЁ, что не Q/E и не стрелки, поэтому
+                        # 1..4 приходится ловить здесь: без этого хоткеты панели
+                        # не достанутся никогда
+                        action = self._panel_hotkey_action(event.key)
+                        if action is not None:
+                            self._panel_run_action(action)
                 elif event.key == pygame.K_n and self._show_diplomacy:
                     self._cycle_diplomacy_target(1)
                 elif event.key == pygame.K_p and self._show_diplomacy:
@@ -537,6 +664,43 @@ class WorldMapScreen:
                             self.selected_general = gen
                             return
 
+    def _general_character(self, general):
+        """Персонаж иерархии, соответствующий генералу, или ``None``.
+
+        Генералы мира (``world_data.General``) и персонажи иерархии
+        (``states.Character``) — разные сущности: у первых есть число
+        солдат, у вторых ранг, мнение и земля.
+
+        Сверка идёт по паре (имя, нация), а не только по имени: имена
+        переиспользуются в разных державах (генерал синей армии Aldric и
+        красный герцог duke_aldric — разные люди), и сверка только по имени
+        отдала бы синюю провинцию красному персонажу вместе с его контрактом.
+        """
+        for ch in self.hierarchy.characters.values():
+            if ch.name == general.name and ch.nation == general.nation:
+                return ch
+        return None
+
+    def _take_county(self, target_idx: int, general, *, cause: str) -> None:
+        """Передача графства нации генерала через иерархию.
+
+        Единственная точка смены владельца на мировой карте: прямая запись
+        ``province.owner = ...`` оставляла ``Character.province_idx``,
+        ``contracts[...].liege_id`` и де-факто держателя герцогства в
+        неведении, из-за чего доход провинции засчитывался дважды.
+        """
+        character = self._general_character(general)
+        new_holder = character.id if character is not None else None
+        events = self.hierarchy.transfer_county(
+            target_idx, general.nation, new_holder, cause=cause)
+        if new_holder and character is not None:
+            general.province_idx = target_idx
+        for message in events:
+            self._show_msg(message)
+        if not events:
+            # персонажа нет (генерал без барона) — владелец всё равно сменился
+            self.provinces[target_idx].owner = general.nation
+
     def _move_general_to_province(self, general: General, target_idx: int,
                                   player_initiated: Optional[bool] = None):
         """Перевести генерала в соседнюю провинцию.
@@ -580,8 +744,7 @@ class WorldMapScreen:
                         return
 
         if target.owner == "neutral":
-            target.owner = general.nation
-            general.province_idx = target_idx
+            self._take_county(target_idx, general, cause="захват")
             general.moved = True
             self._invalidate_panel()
             self._show_msg(f"{target.name} захвачена!")
@@ -594,9 +757,8 @@ class WorldMapScreen:
             rel = self.diplomacy.get_relation(general.nation, target.owner)
             if rel == Relation.WAR:
                 if target.troops <= 0:
-                    target.owner = general.nation
+                    self._take_county(target_idx, general, cause="захват")
                     target.troops = 0
-                    general.province_idx = target_idx
                     general.moved = True
                     self._invalidate_panel()
                     self._show_msg(f"{target.name} захвачена!")
@@ -698,9 +860,10 @@ class WorldMapScreen:
         if a_roll > d_roll:
             losses = int(general.troops * 0.2)
             general.troops = max(100, general.troops - losses)
-            region.owner = general.nation
+            idx = self.provinces.index(region)
+            self._take_county(idx, general, cause="битва")
             region.troops = 0
-            general.province_idx = self.provinces.index(region)
+            self._invalidate_panel()
             self._battle_result = f"{general.name} захватил {region.name}!"
         else:
             losses = int(general.troops * 0.4)
@@ -1326,6 +1489,668 @@ class WorldMapScreen:
         out.sort(key=lambda ch: (_RANK_ORDER.get(ch.rank, 9), ch.id))
         return tuple(out)
 
+    # ---------------- приказы и траты (этап 1.3b) ----------------
+    #
+    # Правила живут в states.py, здесь только их показ и вызов. Три правила,
+    # которые блокируют всё остальное:
+    #
+    # * приказы выдаёт только СВОЙ король и только СВОЕМУ персонажу
+    #   (_panel_allows_orders + _command_refusal в states);
+    # * тратит казну только правитель королевства (_command_ruler в states);
+    # * чужая держава — read-only.
+
+    def _kingdom_realm(self):
+        """Королевство игрока: единственное, чьими командами можно что-то делать."""
+        return self._realm_of_nation(PLAYER_NATION)
+
+    def _kingdom_ruler(self):
+        """Живой король игрока — издатель всех приказов и плательщик всех трат.
+
+        Король берётся из ``Realm.ruler_id``, а не «первым KING в
+        ``hierarchy.characters``»: это ровно тот персонаж, которому states
+        доверяет распоряжаться казной (``_command_ruler``).
+        """
+        realm = self._kingdom_realm()
+        if realm is None or not realm.ruler_id:
+            return None
+        ruler = self.hierarchy.characters.get(realm.ruler_id)
+        if ruler is None or not ruler.alive:
+            return None
+        return ruler
+
+    def _selected_character(self):
+        """Выбранный в панели персонаж или ``None``."""
+        if not self._sel_character_id:
+            return None
+        return self.hierarchy.characters.get(self._sel_character_id)
+
+    def _command_refusal_text(self, issuer, target) -> Optional[str]:
+        """Почему сюзерен НЕ вправе приказать цели (``None`` — вправе).
+
+        Повторяет публичные правила states (``COMMAND_MIN_RANK`` + сюзеренство),
+        а НЕ лезет в приватный ``_command_refusal``: нужно не то, как states
+        откажет, а то, что панель покажет ДО клика. Причина отказа states
+        недоступна извне, поэтому формулировка здесь, а не выдумывается.
+        """
+        if issuer is None or not issuer.alive:
+            return "король мёртв или не найден"
+        if target is None or not target.alive:
+            return "персонаж мёртв или не найден"
+        required = COMMAND_MIN_RANK.get(target.rank)
+        if required is None:
+            return "королю не подчиняется никто"
+        if issuer.tier < required:
+            return f"{issuer.name}: не сюзерен {target.name}"
+        liege = self.hierarchy.liege_of(target.id)
+        if liege is None or liege.id != issuer.id:
+            return f"{issuer.name}: не сюзерен {target.name}"
+        return None
+
+    def _order_issuer(self, target):
+        """Кто выдаёт приказ ``target``.
+
+        Обычно это король, но баронов states считает вассалами ГЕРЦОГА
+        (``build_default_hierarchy``: сюзерен барона — держатель дукции), и
+        ``_command_refusal`` откажет королю. Поэтому издатель — непосредственный
+        сюзерен цели, а если им оказался король — он и есть. Это не обход
+        правил, а их чтение: приказ должен выдать тот, кто вправе.
+        """
+        ruler = self._kingdom_ruler()
+        liege = self.hierarchy.liege_of(target.id) if target is not None else None
+        if liege is not None and liege.alive:
+            return liege
+        return ruler
+
+    def _order_of(self, target_id: Optional[str]):
+        """Последний приказ, ВИДЯЩИЙся в панели — включая закрытые.
+
+        ``states.Hierarchy.order_of`` отдаёт только живой приказ
+        (``PENDING``/``ACCEPTED``), а игроку нужно видеть и ``REFUSED``
+        с причиной: отказ — это событие, а не отсутствие события. Поэтому
+        берём его, а если живого нет — ищем последний закрытый по ``id``
+        (порядок тот же детерминированный, что и в states).
+        """
+        if not target_id:
+            return None
+        live = self.hierarchy.order_of(target_id)
+        if live is not None:
+            return live
+        closed = [o for o in self.hierarchy.orders.values()
+                  if o.target_id == target_id]
+        if not closed:
+            return None
+        return max(closed, key=lambda o: o.id)
+
+    def _free_county_of(self, realm) -> Optional[int]:
+        """Первое по номеру графство королевства, которым ещё не пожаловали.
+
+        Нужна цель для приказов «выдать землю» и «застроить»: сам игрок её не
+        выбирает, поэтому берётся первая свободная, а её номер показывается в
+        строке приказа — приказ не выдаётся «в никуда».
+        """
+        if realm is None:
+            return None
+        return self._turn_cached(
+            (_TC_FREE_COUNTY, realm.id),
+            lambda: self._scan_free_county(realm.nation))
+
+    def _scan_free_county(self, nation: str) -> Optional[int]:
+        """Собственный поиск свободного графства — один раз на ход."""
+        held = {ch.province_idx for ch in self.hierarchy.characters.values()
+                if ch.province_idx is not None}
+        for idx, prov in enumerate(self.provinces):
+            if idx not in held and prov.owner == nation:
+                return idx
+        return None
+
+    def _order_specs(self, target, realm) -> List[Dict]:
+        """Строки блока «ПРИКАЗЫ» для выбранного персонажа.
+
+        Каждая строка — словарь ``kind``/``text``/``color``/``enabled``/
+        ``args``/``order_kind``. ``enabled=False`` означает «серым ДО клика», а
+        не отказ по факту; ``args`` уходит в ``states.issue_order``.
+
+        Виды отбираются по правилам, а не по вкусу: цель обязана быть живым
+        вассалом издателя (``COMMAND_MIN_RANK``), а у каждого вида — своя
+        осмысленность аргументов (см. ``_order_args_refusal`` в states).
+        """
+        specs: List[Dict] = []
+        issuer = self._order_issuer(target)
+        refusal = self._command_refusal_text(issuer, target)
+        # левейс/застройку исполняет realm ИЗДАТЕЛЯ приказа (states._apply_order
+        # берёт realm правителя), поэтому деньги и цена считаются от realm'а
+        # издателя, а не от realm'а цели
+        purse = self._issuer_realm(issuer)
+        # корона нужна и тяжёлому налогу, поэтому её лимит — общий с приказом
+        crown = purse.crown_authority if purse is not None else 0
+
+        for kind, label in _ORDER_ROWS:
+            row = self._order_row(kind, target, realm, issuer, purse, crown)
+            if row is None:
+                continue
+            # применимый вид гасим не только по деньгам: строка недоступна
+            # также тогда, когда издатель вообще не вправе командовать целью
+            enabled = bool(row["enabled"]) and refusal is None
+            specs.append({
+                "kind": "order",
+                "order_kind": kind,
+                "label": label,
+                "char_id": target.id,
+                "text": self._order_row_text(label, row["note"], row["cost"]),
+                "color": _ACT_OK if enabled else _ACT_OFF,
+                "enabled": enabled,
+                "args": row["args"],
+                "refusal": refusal,
+                "why": row["why"] if row["why"] is not None else refusal,
+            })
+        return specs
+
+    def _issuer_realm(self, issuer):
+        """Королевство, из казны которого идёт приказ издателя.
+
+        У короля оно своё (``Realm.ruler_id``), у герцога — realm его нации.
+        Ровно то же, что считает states (см. ``_realm_of_actor``), но своими
+        словами: приватный метод иерархии из UI звать нельзя.
+        """
+        if issuer is None:
+            return None
+        if issuer.rank is TitleRank.KING:
+            realm = self.hierarchy.realms.get(issuer.realm_id or "")
+            if realm is not None:
+                return realm
+        for realm_id in sorted(self.hierarchy.realms):
+            realm = self.hierarchy.realms[realm_id]
+            if realm.nation == issuer.nation:
+                return realm
+        return None
+
+    def _order_row(self, kind: OrderKind, target, realm, issuer,
+                   purse, crown) -> Optional[Dict]:
+        """Одна строка приказа или ``None``, если вид к этой цели неприменим.
+
+        Разница двух исходов принципиальна и потому вынесена в тип возврата:
+
+        * ``None`` — вид неприменим ВООБЩЕ (королю нельзя приказать, у цели
+          нет ранга, для которого вид существует). Такую строку панель не
+          показывает: она была бы шумом;
+        * ``enabled=False`` — вид применим, но сейчас нельзя (нет золота,
+          потолок исчерпан, лимит хода). Такая строка ВИДНА и серым, потому
+          что игрок должен видеть недоступность до клика.
+        """
+        if target is None:
+            return None
+
+        # ---- SUMMON_COUNCIL: аргументов нет, единственное действие без цены ----
+        if kind is OrderKind.SUMMON_COUNCIL:
+            return {
+                "args": None, "cost": None, "enabled": True, "why": None,
+                "note": f"+{COUNCIL_INFLUENCE} влияния "
+                        f"+{COUNCIL_LOYALTY} лояльности, бесплатно",
+            }
+
+        # ---- GIFT: цена платится ИЗ КОШЕЛЯ СЮЗЕРЕНА (states.purse_of) ----
+        if kind is OrderKind.GIFT:
+            effect = self._gift_effect(target)
+            has = issuer is not None and self.hierarchy.purse_of(issuer) >= GIFT_COST
+            enabled = has and effect is not None
+            return {
+                "args": None, "cost": GIFT_COST, "enabled": enabled,
+                "why": None if enabled else ("не хватает золота" if not has
+                                             else "отдача от подарков иссякла"),
+                "note": effect or "подарки больше не дают ничего",
+            }
+
+        # ---- SET_CONTRACT: единственный приказ, который сам платит королю ----
+        if kind is OrderKind.SET_CONTRACT:
+            level = self._next_contract_level(target)
+            if level is None:
+                return {
+                    "args": None, "cost": None, "enabled": False,
+                    "why": f"высший контракт "
+                           f"({CONTRACT_LEVELS[target.contract_level]['name']})",
+                    "note": "выше уровня нет",
+                }
+            spec = CONTRACT_LEVELS[level]
+            return {
+                "args": {"level": level}, "cost": None, "enabled": True, "why": None,
+                "note": f"{spec['name']}: налог{spec['tax']}% "
+                        f"левейс{spec['levy']}% тир+{spec['tyranny']}",
+            }
+
+        # ---- REVOKE_FIEF: применять имеет смысл, только если земля есть ----
+        if kind is OrderKind.REVOKE_FIEF:
+            if target.province_idx is None:
+                return {"args": None, "cost": None, "enabled": False,
+                        "why": "у него нет земли", "note": "отзывать нечего"}
+            return {
+                "args": None, "cost": None, "enabled": True, "why": None,
+                "note": f"отзыв #{target.province_idx} "
+                        f"{self.provinces[target.province_idx].name}: "
+                        f"−{self._order_penalty(kind)} мнения, земля отнимается",
+            }
+
+        # ---- GRANT_FIEF: земля должна быть СВОБОДНОЙ (обмен только через отзыв,
+        #      см. states._grant_fief_refusal), поэтому у уже держащего барона
+        #      вида нет вовсе, а не «есть, но серый» ----
+        if kind is OrderKind.GRANT_FIEF:
+            if target.province_idx is not None:
+                return None
+            idx = self._free_county_of(purse)
+            if idx is None:
+                return {"args": None, "cost": None, "enabled": False,
+                        "why": "нет свободного графства", "note": "земли нет"}
+            return {
+                "args": {"province_idx": idx}, "cost": None, "enabled": True,
+                "why": None,
+                "note": f"выдать #{idx} {self.provinces[idx].name}",
+            }
+
+        # ---- RAISE_LEVY: левейс поднимает ТОЛЬКО король (states._realm_of_ruler
+        #      возвращает realm только у KING), поэтому герцогу вид недоступен ----
+        if kind is OrderKind.RAISE_LEVY:
+            if purse is None or issuer is None or issuer.rank is not TitleRank.KING:
+                return {"args": None, "cost": None, "enabled": False,
+                        "why": "левейс поднимает только король",
+                        "note": "только королю"}
+            cost = LEVY_COST_PER_BLOCK
+            cap = self._turn_cached((_TC_REALM_LEVY, purse.id),
+                                    lambda: self.hierarchy.realm_levy(purse.id))
+            raised = int(getattr(purse, "raised_levy", 0))
+            gold = self._gold_left(purse)
+            why = None
+            if gold < cost:
+                why = f"не хватает золота ({gold}/{cost})"
+            elif raised + LEVY_BLOCK_TROOPS > int(cap):
+                why = f"левейс исчерпан ({raised}/{int(cap)})"
+            return {
+                "args": {"blocks": 1, "realm_id": purse.id}, "cost": cost,
+                "enabled": why is None, "why": why,
+                "note": f"+{LEVY_BLOCK_TROOPS} солдат, всего {raised}/{int(cap)}",
+            }
+
+        # ---- DEVELOP_COUNTY: states требует realm.ruler_id == actor.id, то есть
+        #      заказывает и платит правитель realm'а, то есть король ----
+        if kind is OrderKind.DEVELOP_COUNTY:
+            if purse is None or issuer is None or issuer.rank is not TitleRank.KING:
+                return {"args": None, "cost": None, "enabled": False,
+                        "why": "застройку заказывает и оплачивает король",
+                        "note": "только королю"}
+            idx = self._free_county_of(purse)
+            if idx is None:
+                return {"args": None, "cost": None, "enabled": False,
+                        "why": "нет своего графства", "note": "земли нет"}
+            prov = self.provinces[idx]
+            dev = int(getattr(prov, "development", 1) or 1)
+            if dev >= DEVELOPMENT_MAX:
+                return {"args": None, "cost": None, "enabled": False,
+                        "why": f"застроен максимум ({DEVELOPMENT_MAX})",
+                        "note": "потолок"}
+            cost = development_upgrade_cost(dev)
+            gold = self._gold_left(purse)
+            why = None if gold >= cost else f"не хватает золота ({gold}/{cost})"
+            return {
+                "args": {"province_idx": idx}, "cost": cost,
+                "enabled": why is None, "why": why,
+                "note": f"#{idx} {prov.name}: застройка {dev}→{dev + 1}",
+            }
+        return None
+
+    def _next_contract_level(self, target) -> Optional[int]:
+        """Следующий уровень контракта или ``None``, если уже высший."""
+        level = int(getattr(target, "contract_level", 0)) + 1
+        if level > len(CONTRACT_LEVELS) - 1:
+            return None
+        return level
+
+    def _gift_effect(self, target) -> Optional[str]:
+        """Реальная отдача подарка ЭТОМУ персонажу или ``None``, если иссякла.
+
+        Отдача падает по числу подарков за ЖИЗНЬ (``gifts_received``), поэтому
+        считается по счётчику цели, а не «вообще +15/+10»: иначе панель
+        обещала бы игроку прибавку, которой не будет.
+        """
+        got = int(getattr(target, "gifts_received", 0))
+        opinion = gift_gain(got, GIFT_OPINION_BY_COUNT)
+        loyalty = gift_gain(got, GIFT_LOYALTY_BY_COUNT)
+        if opinion <= 0 and loyalty <= 0:
+            return None
+        return f"+{opinion} мнения +{loyalty} лояльности"
+
+    def _order_row_text(self, label: str, note: Optional[str],
+                        cost: Optional[int]) -> str:
+        """Текст строки приказа: вид · цена · последствия.
+
+        Короткие подписи не случайны: правый столбец панели — 268 px, и
+        длинная расшифровка последствий съедала бы соседние строки (проверка
+        по ширине в _blit_panel_text — страховка, а не основной механизм).
+        """
+        parts = [label]
+        if cost is not None:
+            parts.append(f"{cost}з")
+        if note:
+            parts.append(note)
+        return " · ".join(parts)
+
+    def _order_penalty(self, kind: OrderKind) -> int:
+        """На сколько мнения просядет вассал, ОТКАЗАВШИсь от приказа этого вида.
+
+        Ровно то, что states посчитает в ``resolve_orders`` (``Order.
+        refusal_penalty``), но без создания приказа: панель показывает цену
+        отказа ДО выдачи, иначе игрок узнаёт о ней задним числом.
+        """
+        return REFUSED_WEIGHT * order_weight(kind)
+
+    def _gold_left(self, purse) -> int:
+        """Сколько золота осталось у королевства."""
+        return int(getattr(purse, "gold", 0)) if purse is not None else 0
+
+    def _spend_specs(self, realm) -> List[Dict]:
+        """Строки блока «ТРАТЫ» в шапке королевства.
+
+        Цена и текущее значение показываются ДО клика и всегда из констант
+        states. Недоступное гасится серым: ``enabled`` — это «золота хватает и
+        потолок не исчерпан», а не «команда вообще существует».
+        """
+        specs: List[Dict] = []
+        if realm is None:
+            return specs
+        gold = int(getattr(realm, "gold", 0))
+        prestige = int(getattr(realm, "prestige", 0))
+
+        # левейс: цена блока и потолок всего левейса realm'а
+        levy_cap = self._turn_cached((_TC_REALM_LEVY, realm.id),
+                                     lambda: self.hierarchy.realm_levy(realm.id))
+        raised = int(getattr(realm, "raised_levy", 0))
+        levy_ok = gold >= LEVY_COST_PER_BLOCK \
+            and raised + LEVY_BLOCK_TROOPS <= int(levy_cap)
+        specs.append({
+            "kind": "spend", "action": "raise_levy", "label": "левейс",
+            "text": f"левейс {LEVY_COST_PER_BLOCK}з · поднято {raised}/{int(levy_cap)}",
+            "cost": LEVY_COST_PER_BLOCK,
+            "enabled": levy_ok,
+            "why": None if levy_ok else ("не хватает золота" if gold < LEVY_COST_PER_BLOCK
+                                         else "левейс исчерпан"),
+        })
+
+        # корона: платится золотом И престижем, поэтому гасится по обоим
+        crown_ok = gold >= CROWN_COST and prestige >= CROWN_PRESTIGE_COST
+        crown_full = int(getattr(realm, "crown_authority", 0)) >= MAX_CROWN_AUTHORITY
+        specs.append({
+            "kind": "spend", "action": "raise_crown_authority", "label": "корона",
+            "text": (f"корона {CROWN_COST}з+{CROWN_PRESTIGE_COST}прест · "
+                     f"власть {int(getattr(realm, 'crown_authority', 0))}/{MAX_CROWN_AUTHORITY}"),
+            "cost": CROWN_COST,
+            "enabled": crown_ok and not crown_full,
+            "why": ("власть короны предельна" if crown_full else
+                    (None if crown_ok else "не хватает золота или престижа")),
+        })
+
+        # наёмники: цена за блок, тиры видны только ПОСЛЕ найма (states так
+        # решил), поэтому здесь показывается их количество, а не качество
+        tiers = list(getattr(realm, "mercenary_tiers", []) or [])
+        merc_ok = gold >= MERC_COST_PER_BLOCK
+        specs.append({
+            "kind": "spend", "action": "hire_mercenaries", "label": "наёмники",
+            "text": (f"наёмники {MERC_COST_PER_BLOCK}з/блок по {MERC_BLOCK_TROOPS} · "
+                     f"наймлено {len(tiers)} блоков, лимит {MERC_MAX_BLOCKS_PER_TURN}/ход"),
+            "cost": MERC_COST_PER_BLOCK,
+            "enabled": merc_ok,
+            "why": None if merc_ok else "не хватает золота",
+        })
+
+        # налог: значение 0..TAX_POLICY_MAX, тяжёлый только при короне
+        policy = int(getattr(realm, "tax_policy", 0))
+        crown = int(getattr(realm, "crown_authority", 0))
+        # кнопка переключает политику туда-обратно, поэтому «доступно» означает
+        # «можно переключить»: значение отличается от текущего И (если оно
+        # тяжёлое) корона дотягивает
+        nxt = TAX_POLICY_MIN if policy != TAX_POLICY_MIN else TAX_POLICY_MAX
+        tax_ok = nxt != policy and (nxt <= 0 or crown >= TAX_POLICY_CROWN_AUTHORITY)
+        specs.append({
+            "kind": "spend", "action": "set_tax_policy", "label": "налог",
+            "text": f"налог {policy}→{nxt} из {TAX_POLICY_MIN}..{TAX_POLICY_MAX} · "
+                    f"корона {crown}/{TAX_POLICY_CROWN_AUTHORITY}",
+            "cost": 0,
+            "enabled": tax_ok,
+            "why": None if tax_ok else "тяжёлый налог требует короны",
+        })
+        for spec in specs:
+            spec["color"] = _ACT_OK if spec["enabled"] else _ACT_OFF
+            spec["char_id"] = None
+            spec["county_idx"] = None
+        return specs
+
+    def _county_spend_specs(self, idx: int, realm) -> List[Dict]:
+        """Две кнопки под строкой графства: застройка и гарнизон.
+
+        Платит казна того королевства, которое ФАКТИЧЕСКИ владеет провинцией
+        (так же, как в states), поэтому ``realm`` здесь может быть и чужим для
+        панели — но кнопки кликабельны только у своей нации.
+
+        Порядок кнопок задан ``_COUNTY_SPEND_ROWS``, а не порядком расчёта,
+        чтобы перестановка в коде не тасовала их на экране.
+        """
+        specs: List[Dict] = []
+        prov = self.provinces[idx]
+        gold = int(getattr(realm, "gold", 0)) if realm is not None else 0
+        owned = realm is not None and prov.owner == realm.nation
+
+        dev = int(getattr(prov, "development", 1) or 1)
+        dev_cost = development_upgrade_cost(dev)
+        dev_why = None
+        if not owned:
+            dev_why = "не наша земля"
+        elif gold < dev_cost:
+            dev_why = f"не хватает золота ({gold}/{dev_cost})"
+        elif dev >= DEVELOPMENT_MAX:
+            dev_why = f"застроен максимум ({DEVELOPMENT_MAX})"
+
+        cap = self.hierarchy.garrison_cap(idx)
+        garrison = int(getattr(prov, "garrison", 0) or 0)
+        take = min(GARRISON_CAP_PER_FORT, max(0, int(cap) - garrison))
+        gar_cost = take * GARRISON_RECRUIT_COST_PER_100 // 100
+        gar_why = None
+        if not owned:
+            gar_why = "не наша земля"
+        elif take <= 0:
+            gar_why = f"гарнизон полон ({garrison}/{int(cap)})"
+        elif gold < gar_cost:
+            gar_why = f"не хватает золота ({gold}/{gar_cost})"
+
+        built = {
+            "develop": {
+                "kind": "county_spend", "action": "develop", "label": "застройка",
+                "county_idx": idx, "char_id": None,
+                "text": f"застройка {dev}→{dev + 1} {dev_cost}з",
+                "cost": dev_cost, "enabled": dev_why is None, "why": dev_why,
+            },
+            "garrison": {
+                "kind": "county_spend", "action": "garrison", "label": "гарнизон",
+                "county_idx": idx, "char_id": None,
+                "text": f"гарнизон +{take} {gar_cost}з",
+                "cost": gar_cost, "enabled": gar_why is None, "why": gar_why,
+            },
+        }
+        for action, label in _COUNTY_SPEND_ROWS:
+            spec = built[action]
+            spec["color"] = _ACT_OK if spec["enabled"] else _ACT_OFF
+            specs.append(spec)
+        return specs
+
+    def _panel_hotkey_action(self, key: int) -> Optional[str]:
+        """Действие панели по клавише или ``None``, если эта клавиша не ours."""
+        for hot, action in _PANEL_HOTKEYS:
+            if hot == key:
+                return action
+        return None
+
+    def _panel_run_action(self, action: str, county_idx: Optional[int] = None):
+        """Выполнить действие панели по строке ``order:<вид>`` / ``spend:<метод>``.
+
+        Разбор строки вместо трёх словарей: подсказка в панели, хоткей и клик
+        по строке идут через ОДНО и то же значение, поэтому они не могут
+        разойтись (см. ``_PANEL_HOTKEYS``). Перед «:» — ЧТО делаем, после — чем:
+        ``order`` — вид приказа, ``spend`` — команда траты королевства,
+        ``county`` — команда траты провинции (ей нужен номер графства).
+        """
+        scope, _, name = action.partition(":")
+        if scope == "order":
+            self._issue_order_to_selection(name)
+        elif scope == "spend":
+            self._spend_kingdom(name)
+        elif scope == "county":
+            self._spend_county(county_idx, name)
+
+    def _issue_order_to_selection(self, kind_name: str):
+        """Выдать приказ ``kind_name`` выбранному персонажу от его сюзерена.
+
+        Клик по строке приказа и хоткей приводят сюда же. Аргументы берутся из
+        той же раскладки, что нарисована на экране: пересборка «на всякий случай»
+        дала бы шанс выдать другой номер графства, чем показано в строке.
+
+        Отказ states возвращает ``None`` БЕЗ причины (``issue_order`` молчит),
+        поэтому текст формируется здесь: сначала своя проверка прав (её текст
+        настоящий), а если права были и всё равно ``None`` — честное «правила
+        отклонили, причина недоступна», без выдуманной причины.
+        """
+        if not self._panel_allows_orders():
+            self._panel_notice = "чужая держава: приказы только своей нации"
+            self._invalidate_panel()
+            return
+        target = self._selected_character()
+        issuer = self._order_issuer(target)
+        refusal = self._command_refusal_text(issuer, target)
+        if refusal is not None:
+            self._panel_notice = f"приказ не выдан: {refusal}"
+            self._invalidate_panel()
+            return
+        specs = self._order_specs(target, self._kingdom_realm())
+        match = next((s for s in specs if s["order_kind"].value == kind_name), None)
+        if match is None:
+            self._panel_notice = f"вид приказа «{kind_name}» неприменим к этой цели"
+            self._invalidate_panel()
+            return
+        if not match["enabled"]:
+            self._panel_notice = f"приказ не выдан: {match['why'] or 'недоступно'}"
+            self._invalidate_panel()
+            return
+        order = self.hierarchy.issue_order(issuer.id, kind_name, target.id,
+                                           match["args"])
+        if order is None:
+            self._panel_notice = (f"правила иерархии отклонили приказ "
+                                 f"(вид «{kind_name}»), причина недоступна")
+        else:
+            self._panel_notice = (f"приказ «{match['label']}» выдан {target.name}: "
+                                 f"{_ORDER_STATUS_TEXT.get(order.status, 'выдан')}")
+        self._invalidate_panel()
+
+    def _punish_order_of_selection(self):
+        """Наказать вассала за неисполненный (ACCEPTED) приказ."""
+        if not self._panel_allows_orders():
+            self._panel_notice = "чужая держава: наказание только своей нации"
+            self._invalidate_panel()
+            return
+        target = self._selected_character()
+        order = self._order_of(target.id if target is not None else None)
+        if order is None:
+            self._panel_notice = "наказывать нечего: приказа нет"
+            self._invalidate_panel()
+            return
+        if order.status is not OrderStatus.ACCEPTED:
+            self._panel_notice = (f"наказать можно только ACCEPTED, "
+                                 f"у приказа «{order.status.value}»")
+            self._invalidate_panel()
+            return
+        ruler = self._kingdom_ruler()
+        issuer = self._order_issuer(target) or ruler
+        events = self.hierarchy.punish_order(order.id, by_actor=issuer.id)
+        self._panel_notice = events[0] if events else "наказать не вышло"
+        self._invalidate_panel()
+
+    def _spend_kingdom(self, action: str):
+        """Трата казны королевства по имени метода states.
+
+        Сигнатуры команд в states разные (``realm_id, blocks`` / ``realm_id`` /
+        ``realm_id, policy``), поэтому аргументы собираются здесь, по имени
+        действия из ``_SPEND_ROWS``. Актора передавать не нужно: ``raise_levy``,
+        ``raise_crown_authority``, ``hire_mercenaries`` и ``set_tax_policy``
+        берут правителя сами (``_command_ruler``), то есть короля. Для
+        команд ПРОВИНЦИИ (``develop_county``, ``hire_garrison``) актор —
+        обязательный второй позиционный, и там передаётся ``ruler.id``.
+        """
+        if not self._panel_allows_orders():
+            self._panel_notice = "чужая держава: траты только своей нации"
+            self._invalidate_panel()
+            return
+        realm = self._kingdom_realm()
+        if realm is None:
+            self._panel_notice = "королевство не найдено"
+            self._invalidate_panel()
+            return
+        method = getattr(self.hierarchy, action, None)
+        if method is None:
+            self._panel_notice = f"команда {action} недоступна"
+            self._invalidate_panel()
+            return
+        if action == "raise_levy":
+            events = method(realm.id, 1)
+        elif action == "raise_crown_authority":
+            events = method(realm.id)
+        elif action == "hire_mercenaries":
+            events = method(realm.id, 1)
+        elif action == "set_tax_policy":
+            # кнопка переключает политику туда-обратно между крайними
+            # значениями states (TAX_POLICY_MIN..TAX_POLICY_MAX)
+            current = int(getattr(realm, "tax_policy", 0))
+            nxt = TAX_POLICY_MIN if current != TAX_POLICY_MIN else TAX_POLICY_MAX
+            events = method(realm.id, nxt)
+        else:
+            self._panel_notice = f"команда {action} не подключена к панели"
+            self._invalidate_panel()
+            return
+        if not events:
+            self._panel_notice = f"{action}: отказ без сообщения (причина недоступна)"
+        else:
+            self._panel_notice = events[0]
+        self._invalidate_panel()
+
+    def _spend_county(self, idx: int, action: str):
+        """Трата по провинции: застройка или гарнизон, от лица короля.
+
+        Актор передаётся явно: ``develop_county``/``hire_garrison`` платят из
+        казны того realm'а, который ФАКТИЧЕСКИ владеет провинцией, и требуют
+        правителя именно его (``_command_ruler(realm_id, actor_id)``).
+        """
+        if not self._panel_allows_orders():
+            self._panel_notice = "чужая держава: траты только своей нации"
+            self._invalidate_panel()
+            return
+        if not isinstance(idx, int) or not 0 <= idx < len(self.provinces):
+            self._panel_notice = "графство не выбрано"
+            self._invalidate_panel()
+            return
+        ruler = self._kingdom_ruler()
+        if ruler is None:
+            self._panel_notice = "король мёртв: тратить нечем"
+            self._invalidate_panel()
+            return
+        if action == "develop":
+            events = self.hierarchy.develop_county(idx, ruler.id)
+        elif action == "garrison":
+            # нанимаем ровно на одну сотню (GARRISON_CAP_PER_FORT): states
+            # обрезает по потолку стен, поэтому «побольше» означало бы лишь
+            # переплату без солдат
+            cap = self.hierarchy.garrison_cap(idx)
+            garrison = int(getattr(self.provinces[idx], "garrison", 0) or 0)
+            take = min(GARRISON_CAP_PER_FORT, max(0, int(cap) - garrison))
+            events = self.hierarchy.hire_garrison(idx, take, ruler.id)
+        else:
+            self._panel_notice = f"трата графства {action} не подключена"
+            self._invalidate_panel()
+            return
+        self._panel_notice = events[0] if events else f"{action}: отказ без сообщения"
+        self._invalidate_panel()
+
     def _panel_layout_get(self) -> Dict:
         """Раскладка панели владений (с кэшем на ход).
 
@@ -1344,20 +2169,27 @@ class WorldMapScreen:
         """Раскладка панели в экранных координатах — единственный источник геометрии.
 
         Словарь на выходе:
-        ``panel``       — прямоугольник панели на экране;
-        ``title``       — заголовок, ``nation`` — строка нации;
-        ``realm``       — шапка королевства или None;
-        ``duchies``     — строки герцогств, ``contracts`` — строки контрактов;
-        ``counties``    — строки графств (province_idx);
-        ``vassals``     — правый столбец: живые персонажи нации (char_id);
-        ``vassal_box``  — прямоугольник всего правого столбца;
-        ``hint``        — строка подсказки, ``notes`` — служебные пояснения.
+        ``panel``        — прямоугольник панели на экране;
+        ``title``        — заголовок, ``nation`` — строка нации;
+        ``realm``        — шапка королевства или None;
+        ``duchies``      — строки герцогств, ``contracts`` — строки контрактов;
+        ``counties``     — строки графств (province_idx);
+        ``spends``       — блок «ТРАТЫ» шапки королевства (левейс/корона/…);
+        ``county_spends``— кнопки «застройка»/«гарнизон» под строкой графства;
+        ``vassals``      — правый столбец: живые персонажи нации (char_id);
+        ``orders``       — блок «ПРИКАЗЫ» выбранному персонажу;
+        ``order_status`` — строка статуса текущего приказа (или None);
+        ``order_punish`` — кнопка «наказать» (или None);
+        ``notice``       — последняя причина отказа/событие (или None);
+        ``vassal_box``   — прямоугольник всего правого столбца;
+        ``hint``         — строка подсказки, ``notes`` — служебные пояснения.
 
         Каждая строка — это dict с ключами ``kind`` (``realm``/``duchy``/
-        ``contract``/``county``/``vassal``), ``rect`` (экранный прямоугольник),
-        ``text``, ``color``, ``font`` и идентификатором: ``char_id`` персонажа,
-        ``duchy_id`` герцогства, ``county_idx`` провинции, ``index`` для
-        строки персонажей. Одну и ту же раскладку читают и отрисовка, и
+        ``contract``/``county``/``vassal``/``spend``/``county_spend``/``order``/
+        ``punish``), ``rect`` (экранный прямоугольник), ``text``, ``color``,
+        ``font`` и идентификатором: ``char_id`` персонажа, ``duchy_id``
+        герцогства, ``county_idx`` провинции, ``action``/``order_kind`` — что
+        действие делает. Одну и ту же раскладку читают и отрисовка, и
         _panel_hit, поэтому клик по строке попадает ровно туда же, куда нарисовано.
         """
         px = SCREEN_WIDTH // 2 - _PANEL_W // 2
@@ -1386,12 +2218,14 @@ class WorldMapScreen:
             "vassal_head": {
                 "kind": "vassal_head",
                 "rect": R(_PANEL_COL2_X, _PANEL_TREE_Y, _PANEL_COL2_W, _PANEL_LINE_H),
-                "text": "COURT", "color": (220, 200, 160), "font": self.font_small,
+                "text": "COURT", "color": _ACT_HEAD, "font": self.font_small,
             },
             "hint": {
                 "kind": "hint",
                 "rect": R(_PANEL_PAD, _PANEL_HINT_Y, _PANEL_TREE_W, _PANEL_ROW_H + 2),
-                "text": "Q/E/Left/Right: nation | Up/Down: court | V: close",
+                # подсказка с хоткеями: текст собирается из _PANEL_HOTKEYS, иначе
+                # привязку и надпись правили бы в двух местах
+                "text": self._panel_hint_text(),
                 "color": (170, 155, 130), "font": self.font_small,
             },
             "realm": None,
@@ -1399,6 +2233,13 @@ class WorldMapScreen:
             "contracts": [],
             "counties": [],
             "vassals": [],
+            "spends": [],
+            "county_spends": [],
+            "orders": [],
+            "order_head": None,
+            "order_status": None,
+            "order_punish": None,
+            "notice": None,
             "notes": [],
         }
 
@@ -1426,6 +2267,45 @@ class WorldMapScreen:
                 "color": nation_color, "font": self.font_hud,
             }
             y += line_h + 2
+
+            # ---- блок «ТРАТЫ» в шапке королевства ----
+            # Траты своей нации кликабельны, чужой — серые и с подписью: чужая
+            # держава read-only (см. _panel_allows_orders).
+            for action, label in _SPEND_ROWS:
+                if y > max_y:
+                    break
+                spec = next((s for s in self._spend_specs(realm)
+                             if s["action"] == action), None)
+                if spec is None:
+                    continue
+                row = dict(spec)
+                # action сразу с префиксом области: обработчик клика и хоткей
+                # разбирают одну и ту же строку и не должны знать, откуда она
+                row["action"] = f"spend:{spec['action']}"
+                # selectable = own И enabled: серая кнопка обязана быть и
+                # некликабельной, иначе клик уводил бы в states, где причина
+                # отказа появится только постфактум — ровно то, чего блок
+                # «доступно до клика» и добивается
+                row["selectable"] = own and bool(spec["enabled"])
+                if not own:
+                    # приглушаем строку; текст не выдумывается — у чужой нации
+                    # кнопок нет вовсе, и это правда
+                    row["color"] = _ACT_OFF
+                    row["text"] = f"{label}: только чтение"
+                row["rect"] = R(x + 14, y, _PANEL_TREE_W - 14, _PANEL_ACT_H)
+                row["font"] = self.font_small
+                lay["spends"].append(row)
+                y += _PANEL_ACT_H
+            # Правило цены застройки — единственное, что игрок не угадывает из
+            # самой суммы: показываем формулу из констант states, а не число.
+            if y + _PANEL_ACT_H <= max_y:
+                lay["notes"].append({
+                    "kind": "note",
+                    "rect": R(x + 14, y, _PANEL_TREE_W - 14, _PANEL_ACT_H),
+                    "text": f"застройка: {DEV_COST_BASE}+{DEV_COST_STEP}×уровень",
+                    "color": COLOR_HUD_TEXT_DIM, "font": self.font_small,
+                })
+                y += _PANEL_ACT_H
 
             duchies = self._duchies_of_nation(nation)
             if not duchies:
@@ -1492,6 +2372,24 @@ class WorldMapScreen:
                     })
                     y += line_h - 3
 
+                    # ---- две кнопки под графством: застройка и гарнизон ----
+                    # Ровно одна строка на оба действия: под каждым графством
+                    # их по две, а высота дерева ограничена, поэтому две строки
+                    # съели бы половину панели.
+                    if y + _PANEL_ACT_H <= max_y:
+                        half = (_PANEL_TREE_W - 28) // 2
+                        for slot, spec in enumerate(self._county_spend_specs(i, realm)):
+                            row = dict(spec)
+                            row["action"] = f"county:{spec['action']}"
+                            row["selectable"] = own and bool(spec["enabled"])
+                            if not own:
+                                row["color"] = _ACT_OFF
+                                row["text"] = f"{spec['label']}: только чтение"
+                            row["rect"] = R(x + 28 + slot * half, y, half, _PANEL_ACT_H)
+                            row["font"] = self.font_small
+                            lay["county_spends"].append(row)
+                        y += _PANEL_ACT_H
+
         # правый столбец: живые персонажи нации. Персонажи чужой державы
         # показываются тусклыми и выбирать их нельзя
         palette = _VASSAL_COLOR if own else _VASSAL_COLOR_FOREIGN
@@ -1515,7 +2413,126 @@ class WorldMapScreen:
             vy += _PANEL_ROW_H
         lay["vassal_box"] = R(_PANEL_COL2_X, _PANEL_TREE_Y, _PANEL_COL2_W,
                               max(0, vy - _PANEL_TREE_Y))
+
+        # ---- блоки «ПРИКАЗЫ» и статус приказа ----
+        # Живут под списком двора в том же столбце: он короче дерева владений,
+        # и блок приказов относится к выбранному персонажу, а не к земле.
+        self._layout_order_block(lay, R, vy, max_y)
+
+        # ---- строка последнего события панели ----
+        if self._panel_notice:
+            lay["notice"] = {
+                "kind": "notice",
+                "rect": R(_PANEL_PAD, _PANEL_HINT_Y - _PANEL_ROW_H - 2,
+                          _PANEL_W - 2 * _PANEL_PAD, _PANEL_ROW_H + 2),
+                "text": self._panel_notice,
+                "color": (235, 200, 140), "font": self.font_small,
+            }
         return lay
+
+    def _layout_order_block(self, lay: Dict, R, vy: int, max_y: int):
+        """Разложить блок «ПРИКАЗЫ», статус приказа и кнопку «наказать».
+
+        Отдельный метод, а не хвост ``_build_panel_layout``: блок sizeable
+        (до семи строк приказов плюс статус и наказание) и не должен
+        раздувать тело раскладки, где идёт дерево владений.
+        """
+        target = self._selected_character()
+        own = self._panel_allows_orders()
+        y = vy + _PANEL_BLOCK_GAP
+
+        if not own:
+            lay["notes"].append({
+                "kind": "note",
+                "rect": R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ROW_H),
+                "text": "Приказы и траты — только своей нации",
+                "color": COLOR_HUD_TEXT_DIM, "font": self.font_small,
+            })
+            return
+        if target is None:
+            lay["notes"].append({
+                "kind": "note",
+                "rect": R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ROW_H),
+                "text": "Выберите персонажа (клик или ↑↓)",
+                "color": COLOR_HUD_TEXT_DIM, "font": self.font_small,
+            })
+            return
+        if target.rank is TitleRank.KING:
+            lay["notes"].append({
+                "kind": "note",
+                "rect": R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ROW_H),
+                "text": f"{target.name}: королю приказы не выдают",
+                "color": COLOR_HUD_TEXT_DIM, "font": self.font_small,
+            })
+            return
+
+        # заголовок блока со сроком и лимитом из states — игрок видит, что
+        # приказ не вечен и что за ход их выдаётся не больше ORDERS_ISSUED_PER_TURN
+        lay["order_head"] = {
+            "kind": "order_head",
+            "rect": R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ROW_H),
+            "text": f"ПРИКАЗЫ: {target.name} ({ORDERS_ISSUED_PER_TURN}/ход, "
+                    f"срок {ORDER_DEADLINE_TURNS})",
+            "color": _ACT_HEAD, "font": self.font_small,
+        }
+        y += _PANEL_ROW_H
+
+        for spec in self._order_specs(target, self._kingdom_realm()):
+            if y > max_y:
+                break
+            row = dict(spec)
+            row["action"] = f"order:{spec['order_kind'].value}"
+            row["selectable"] = bool(spec["enabled"])
+            row["rect"] = R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ACT_H)
+            row["font"] = self.font_small
+            lay["orders"].append(row)
+            y += _PANEL_ACT_H
+
+        # строка статуса: показывает, что висит за целью прямо сейчас
+        order = self._order_of(target.id)
+        if order is not None and y <= max_y:
+            status_text = _ORDER_STATUS_TEXT.get(order.status, order.status.value)
+            lay["order_status"] = {
+                "kind": "order_status",
+                "rect": R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ACT_H),
+                "char_id": target.id, "county_idx": None, "duchy_id": None,
+                "index": None, "selectable": False,
+                "text": f"{order.id}: {status_text} (ход {order.turn_issued}) "
+                        f"— {order.message}",
+                "color": _ORDER_STATUS_COLOR.get(order.status, COLOR_HUD_TEXT),
+                "font": self.font_small,
+            }
+            y += _PANEL_ACT_H
+            # наказать можно ТОЛЬКО принятый и не исполненный приказ: отказ не
+            # обещал ничего, а исполненный уже нечего взыскивать
+            if order.status is OrderStatus.ACCEPTED and y <= max_y:
+                lay["order_punish"] = {
+                    "kind": "punish",
+                    "rect": R(_PANEL_COL2_X, y, _PANEL_COL2_W, _PANEL_ACT_H),
+                    "char_id": target.id, "county_idx": None, "duchy_id": None,
+                    "index": None, "order_id": order.id, "selectable": True,
+                    "text": "наказать за неисполнение (клик)",
+                    "color": _ACT_OK, "font": self.font_small,
+                }
+                y += _PANEL_ACT_H
+
+    def _panel_hint_text(self) -> str:
+        """Строка подсказки: хоткеи названы своими именами, а не «1-4».
+
+        Собирается из ``_PANEL_HOTKEYS``, поэтому надпись и привязка не могут
+        разойтись: переименовали действие — надпись поехала за ним сама.
+        """
+        labels = dict(_ORDER_ROWS)
+        spend_labels = dict(_SPEND_ROWS)
+        keys = []
+        for hot, action in _PANEL_HOTKEYS:
+            scope, _, name = action.partition(":")
+            if scope == "order":
+                keys.append(f"{pygame.key.name(hot)}:{labels.get(OrderKind(name), name)}")
+            else:
+                keys.append(f"{pygame.key.name(hot)}:{spend_labels.get(name, name)}")
+        base = _PANEL_HINT_OWN if self._panel_allows_orders() else _PANEL_HINT_FOREIGN
+        return f"{base} · {' '.join(keys)}"
 
     def _panel_hit(self, mx: int, my: int) -> Optional[Dict]:
         """Что под курсором в панели владений.
@@ -1532,11 +2549,21 @@ class WorldMapScreen:
         lay = self._panel_layout_get()
         if not lay["panel"].collidepoint(mx, my):
             return None
-        # строки не пересекаются, порядок групп неважен
-        for key in ("vassals", "counties", "contracts", "duchies"):
+        # ПОРЯДОК ГРУПП ВАЖЕН, а не «неважен», как было раньше: строки графства и
+        # кнопки трат под ними НЕ пересекаются, но блок приказов стоит под
+        # списком двора в том же столбце, и при обратном порядке клик по приказу
+        # уезжал бы в строку персонажа на 13 px выше.
+        for key in ("orders", "spends", "county_spends", "counties",
+                    "contracts", "duchies", "vassals"):
             for row in lay[key]:
                 if row["rect"].collidepoint(mx, my):
                     return row
+        # одиночные строки: статус приказа, кнопка «наказать», событие панели
+        for key in ("order_punish", "order_status", "notice", "order_head",
+                    "vassal_head"):
+            row = lay.get(key)
+            if row is not None and row["rect"].collidepoint(mx, my):
+                return row
         realm = lay["realm"]
         if realm is not None and realm["rect"].collidepoint(mx, my):
             return realm
@@ -1546,17 +2573,35 @@ class WorldMapScreen:
         return {"kind": "panel", "rect": lay["panel"].copy()}
 
     def _handle_panel_click(self, mx: int, my: int):
-        """Клик по панели владений: пока только выбор и подсветка строки.
+        """Клик по панели владений: выбор строки и КНОПКИ действий.
+
+        Клавиатура и мышь идут через один и тот же ``action``, поэтому
+        «1 — подарок» и клик по строке «подарок» физически не могут разойтись
+        (см. ``_PANEL_HOTKEYS``).
 
         Персонаж выбирается только у своей нации: дерево чужих держав
-        показывается, но строки в нём не активируются. Это защита от ошибки
-        следующего этапа, где у короля появятся приказы — приказ чужому
-        вассалу отдать уже не получится.
+        показывается, но строки в нём не активируются, и блок приказов для
+        чужой нации вообще не строится.
         """
         hit = self._panel_hit(mx, my)
         if hit is None:
             return
         kind = hit.get("kind")
+
+        # ---- кнопки действий ----
+        # selectable=False означает «серым и не кликабельно»: клик по такой
+        # строке должен сказать ПОЧЕМУ, а не молча ничего не сделать.
+        if kind in ("order", "spend", "county_spend", "punish"):
+            if kind == "punish":
+                self._punish_order_of_selection()
+                return
+            if not hit.get("selectable"):
+                self._panel_notice = self._blocked_reason(hit)
+                self._invalidate_panel()
+                return
+            self._panel_run_action(hit["action"], hit.get("county_idx"))
+            return
+
         if kind in ("vassal", "duchy", "contract"):
             char_id = hit.get("char_id")
             # selectable = False у чужой нации: строка видна, но не выбирается
@@ -1571,12 +2616,28 @@ class WorldMapScreen:
             self._sel_county_idx = hit.get("county_idx")
             self._sel_character_id = None
             self._own_mode = "browse"
+        elif kind in ("order_status", "order_head", "vassal_head", "notice"):
+            # заголовки и статусы — не кликабельны, но и выбор не сбрасывают
+            return
         else:
             # пустое место панели — снять выбор
             self._sel_character_id = None
             self._sel_county_idx = None
             self._own_mode = "browse"
         self._invalidate_panel()
+
+    def _blocked_reason(self, row: Dict) -> str:
+        """Почему кнопка панели серая — текст берётся из самой строки.
+
+        Причина уже посчитана в раскладке (``why``), потому что там же
+        сравнивалось золото с ценой: пересчитывать значило бы получить второй
+        источник правды о доступности.
+        """
+        label = row.get("label") or row.get("action") or "действие"
+        why = row.get("why")
+        if not why:
+            return f"{label}: недоступно"
+        return f"{label}: {why}"
 
     def _render_ownership_panel(self):
         """Панель владений: Kingdom -> Duchy -> County + список персонажей.
@@ -1590,6 +2651,8 @@ class WorldMapScreen:
         # Панель перерисовывается либо по флажку (сменились данные владений),
         # либо если разошлось состояние: ход, нация, выделение на карте или
         # выбор в панели. Проверка состояния страхует от забытого сброса.
+        # ``_panel_notice`` добавлен в сверку: строка события меняется сама по
+        # себе после клика, и без неё панель осталась бы со старым текстом.
         prev = self._panel_state
         if (self._panel_dirty or prev is None
                 or prev[0] != self._turn
@@ -1598,12 +2661,14 @@ class WorldMapScreen:
                 or prev[3] != self._sel_character_id
                 or prev[4] != self._sel_county_idx
                 or prev[5] != self._vassal_cursor
-                or prev[6] != self._own_mode):
+                or prev[6] != self._own_mode
+                or prev[7] != self._panel_notice):
             self._paint_ownership_panel()
             self._panel_dirty = False
             self._panel_state = (self._turn, self._ownership_nation, self.selected_general,
                                  self._sel_character_id, self._sel_county_idx,
-                                 self._vassal_cursor, self._own_mode)
+                                 self._vassal_cursor, self._own_mode,
+                                 self._panel_notice)
 
         px, py = self._panel_layout_get()["origin"]
         self.screen.blit(self._panel_surface, (px, py))
@@ -1633,7 +2698,8 @@ class WorldMapScreen:
                                       nation_obj.color)
             surface.blit(label, lay["nation"].move(-ox, -oy).topleft)
 
-        # служебные пояснения («нет владений» и т.п.) — не строки выбора
+        # служебные пояснения («нет владений», «выберите персонажа» и т.п.) —
+        # не строки выбора
         for note in lay["notes"]:
             self._blit_panel_text(surface, note, ox, oy)
 
@@ -1644,7 +2710,14 @@ class WorldMapScreen:
         surface.blit(self._cached_text(head["font"], head["text"], head["color"]),
                      head["rect"].move(-ox, -oy).topleft)
 
-        for group in (lay["duchies"], lay["contracts"], lay["counties"], lay["vassals"]):
+        # блоки ТРАТЫ и ПРИКАЗЫ рисуются рамкой: по ней видно, где кончается
+        # читаемая строка и начинается кнопка, даже если она серая
+        for group in (lay["spends"], lay["orders"]):
+            for row in group:
+                self._paint_action_row(surface, row, ox, oy)
+
+        for group in (lay["duchies"], lay["contracts"], lay["counties"],
+                      lay["vassals"]):
             for row in group:
                 local = row["rect"].move(-ox, -oy)
                 if row["kind"] == "vassal" and row.get("index") == self._vassal_cursor:
@@ -1658,9 +2731,38 @@ class WorldMapScreen:
                     pygame.draw.rect(surface, _PANEL_SEL_BORDER, local, 1)
                 self._blit_panel_text(surface, row, ox, oy)
 
+        for row in lay["county_spends"]:
+            self._paint_action_row(surface, row, ox, oy)
+
+        # одиночные строки блока приказов: заголовок, статус и наказание
+        for key in ("order_head", "order_status", "order_punish"):
+            row = lay.get(key)
+            if row is not None:
+                if row["kind"] == "punish":
+                    self._paint_action_row(surface, row, ox, oy)
+                else:
+                    self._blit_panel_text(surface, row, ox, oy)
+
+        notice = lay.get("notice")
+        if notice is not None:
+            self._blit_panel_text(surface, notice, ox, oy)
+
         hint = lay["hint"]
         surface.blit(self._cached_text(hint["font"], hint["text"], hint["color"]),
                      hint["rect"].move(-ox, -oy).topleft)
+
+    def _paint_action_row(self, surface, row, ox: int, oy: int):
+        """Одна кнопка панели: рамка + текст.
+
+        Рамка рисуется ВСЕГДА, даже у серой строки: серый цвет сам по себе
+        читается как «выключено», а рамка показывает, что это кнопка, которую
+        можно нажать и узнать причину. Заливки под рукой нет намеренно — панель
+        не должна мигать при каждом пересчёте доступности.
+        """
+        local = row["rect"].move(-ox, -oy)
+        border = (150, 140, 115) if row.get("selectable") else (92, 86, 74)
+        pygame.draw.rect(surface, border, local, 1, border_radius=3)
+        self._blit_panel_text(surface, row, ox, oy)
 
     def _panel_row_selected(self, row) -> bool:
         """Отмечена ли строка панели текущим выбором.
@@ -1668,20 +2770,67 @@ class WorldMapScreen:
         По персонажу отмечаются все строки, где он встречается (строка
         герцогства, контракт и строка двора): выбор одного и того же лица
         должен выглядеть одинаково в обеих колонках.
+
+        Кнопки приказов и трат НЕ отмечаются никогда, хотя несут ``char_id``
+        выбранного: иначе подсветкой залило бы весь блок «ПРИКАЗЫ» целиком, и
+        выбор стал бы неотличим от обычного фона строк.
         """
-        if row["kind"] == "county":
+        kind = row["kind"]
+        if kind in ("order", "order_status", "punish", "spend", "county_spend"):
+            return False
+        if kind == "county":
             return self._sel_county_idx is not None and \
                 self._sel_county_idx == row["county_idx"]
         char_id = row.get("char_id")
         return char_id is not None and self._sel_character_id == char_id
 
     def _blit_panel_text(self, surface, row, ox: int, oy: int):
-        """Текст строки панели из кэша шрифтов — с учётом выделения."""
+        """Текст строки панели из кэша шрифтов — с учётом выделения.
+
+        Ширина строки не гарантирована: подписи приказов и кнопок графств
+        собираются из данных (имена провинций, цены, статусы) и могут стать
+        длиннее столбца. Поэтому текст ужимается по ширине строки — иначе он
+        вылезал бы за панель и перекрывал соседние кнопки. Ужимание идёт
+        через тот же кэш строк, то есть лишних font.render не добавляет.
+        """
         color = row["color"]
         if self._panel_row_selected(row):
             color = _PANEL_SEL_TEXT
-        text = self._cached_text(row["font"], row["text"], color)
-        surface.blit(text, row["rect"].move(-ox, -oy).topleft)
+        font = row["font"]
+        text = row["text"]
+        surf = self._cached_text(font, text, color)
+        if surf.get_width() > row["rect"].width:
+            text = self._fit_panel_text(font, text, color, row["rect"].width)
+            surf = self._cached_text(font, text, color)
+        surface.blit(surf, row["rect"].move(-ox, -oy).topleft)
+
+    def _fit_panel_text(self, font, text: str, color, max_w: int) -> str:
+        """Обрезать строку по ширине, дорезая по словам.
+
+        Слова, а не символы: обрезанное посреди слова («наёмни…») читается как
+        ошибка, а усечённая строка — как не поместившаяся подпись. Метрики
+        берутся у уже закэшированных строк, поэтому цикл почти ничего не стоит
+        (шрифт не перерисовывается).
+        """
+        if max_w <= 0:
+            return ""
+        if len(text) <= 2:
+            return text
+        low, high = 0, len(text)
+        best = ""
+        while low <= high:
+            mid = (low + high) // 2
+            # режем по последнему пробелу: хвост после него — неполное слово
+            cut = text[:mid].rstrip()
+            if " " in cut:
+                cut = cut[:cut.rfind(" ")]
+            cut = (cut + "…") if cut else "…"
+            if self._cached_text(font, cut, color).get_width() <= max_w:
+                best = cut
+                low = mid + 1
+            else:
+                high = mid - 1
+        return best or "…"
 
 
     def _render_diplomacy_panel(self):

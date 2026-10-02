@@ -466,7 +466,25 @@ def apply_deltas_to_screen(screen, deltas: Dict[str, object]) -> None:
         if bool(deltas.get("player_won", False)):
             attacker = str(deltas.get("attacker_nation", "") or "")
             if attacker:
-                prov.owner = attacker
+                # через иерархию, иначе персонаж/контракты/де-факто
+                # держатель герцогства остались бы от прежнего хозяина
+                hierarchy = getattr(screen, "hierarchy", None)
+                transfer = getattr(hierarchy, "transfer_county", None)
+                name = str(deltas.get("general_name", "") or "")
+                holder = None
+                if hierarchy is not None:
+                    attacker_nation = str(deltas.get("attacker_nation", "") or "")
+                    for ch in hierarchy.characters.values():
+                        # сверка по паре (имя, нация): имена переиспользуются
+                        # в разных державах, сверка только по имени отдала бы
+                        # провинцию персонажу чужой нации
+                        if ch.name == name and ch.nation == attacker_nation:
+                            holder = ch.id
+                            break
+                if transfer is not None:
+                    transfer(idx, attacker, holder, cause="битва")
+                else:
+                    prov.owner = attacker
             prov.troops = 0
 
     # 4. Генерал: уцелевшие солдаты возвращаются в его левейс.
