@@ -110,6 +110,9 @@ _PANEL_HINT_Y = _PANEL_H - 25       # строка подсказки
 # Высота строки-кнопки (приказ, трата, кнопки графства). Равна шагу строки
 # персонажей: шрифт строки — 12 px, и на 11 px текст прижимался к рамке.
 MOVE_ORDER_STUCK_TURNS = 3
+#: Ниже одного полка (100 солдат) армия считается разбитой: осколки не
+#: держат провинцию и только бесконечно бьются в стену.
+MIN_ARMY_TROOPS = 100
 _PANEL_ACT_H = 13
 # Отступ между блоками правого столбца (приказы под списком двора)
 _PANEL_BLOCK_GAP = 8
@@ -450,20 +453,28 @@ class WorldMapScreen:
 
     def _is_passable_for(self, idx: int, mover: General,
                          blocked: set) -> bool:
-        """Может ли ``mover`` пройти через провинцию ``idx``.
+        """Может ли ``mover`` пройти через провинцию ``idx`` как промежуточную.
 
-        Свои армии не считаются преградой — несколько генералов одной
-        державы в одной провинции это штатная стойка. Препятствием считаются
-        только чужие дружественные армии и клетки из ``blocked`` (его собственные
-        пройденные вершины при поиске пути).
+        Свои армии **не** преграда: несколько генералов одной державы в одной
+        провинции — штатная стойка, и `_move_general_to_province` их штабелирует.
+        Чужие мирные армии — преграда для промежуточной клетки (заходить туда
+        нельзя вовсе, это показано в ``_ai_can_enter``), а вражеские в
+        промежуточной клетке допустимы: с ними просто случается бой.
+
+        Именно эта разница даёт «обход своей армии» вместо тупика.
         """
         if idx in blocked:
             return False
         other = self._province_occupant(idx)
         if other is not None and other is not mover:
-            if self.diplomacy.can_move_through(other.nation, mover.nation):
-                # союзная армия — можно встать рядом, но не в ту же клетку
-                return False
+            if other.nation == mover.nation:
+                return True  # своя армия — проходим, встаём рядом
+            return False     # любой чужой генерал — мимо; зайти к нему в
+            # клетку можно только как к цели (её find_province_path
+            # проверяет отдельно, минуя этот метод)
+        # Земля дружественной/нейтральной державы проходима: армия идёт
+        # сквозь неё, не задерживаясь. Иначе одна союзная провинция на пути
+        # блокировала весь поход — «соперник стоит и не идёт».
         return True
 
     def find_province_path(self, start: int, goal: int, mover: General) -> List[int]:
@@ -803,6 +814,52 @@ class WorldMapScreen:
                         if gen.province_idx == clicked_province:
                             self.selected_general = gen
                             return
+                # клик по чужой территории без выбора армии — самый
+                # естественный способ «пойти на врага». Раньше это просто
+                # ничего не делало: игрок жал на далёкого соперника, а
+                # реакции не было. Теперь выбирается ближайшая своя армия
+                # и ей сразу выдаётся маршрут.
+                self._auto_attack_order(clicked_province)
+
+    def _auto_attack_order(self, target_idx: int) -> bool:
+        """Отдать приказ напасть на чужую провинцию без ручного выбора армии.
+
+        Берётся ближайшая по числу шагов своя армия, способная дойти (а не
+        та, что просто ближе в пикселях), и ей выдаётся маршрут. Если враг
+        стоит в соседней провинции, шаг делается сразу — приказ не нужен.
+        """
+        prov = self.provinces[target_idx]
+        owner = getattr(prov, "owner", "neutral")
+        if owner == PLAYER_NATION:
+            return False
+        if owner != "neutral" and not self.diplomacy.is_enemy(PLAYER_NATION, owner):
+            self._show_msg("Туда нельзя: нет войны")
+            return False
+
+        best_gen: Optional[General] = None
+        best_len = None
+        for gen in self.generals:
+            if gen.nation != PLAYER_NATION or gen.moved or gen.province_idx is None:
+                continue
+            path = self.find_province_path(gen.province_idx, target_idx, gen)
+            length = len(path) - 1
+            if not path or length <= 0:
+                continue
+            if best_len is None or length < best_len:
+                best_len = length
+                best_gen = gen
+        if best_gen is None:
+            self._show_msg("Нет армии, способной дойти")
+            return False
+
+        if best_len == 1:
+            self._move_general_to_province(best_gen, target_idx)
+            self._cancel_move_order()
+            return True
+        issued = self._issue_move_order(best_gen, target_idx)
+        if issued:
+            self._show_msg(f"{best_gen.name} идёт на {prov.name}")
+        return issued
 
     def _general_character(self, general):
         """Персонаж иерархии, соответствующий генералу, или ``None``.
@@ -833,13 +890,16 @@ class WorldMapScreen:
         new_holder = character.id if character is not None else None
         events = self.hierarchy.transfer_county(
             target_idx, general.nation, new_holder, cause=cause)
-        if new_holder and character is not None:
-            general.province_idx = target_idx
+        # Физическое положение армии обновляется ВСЕГДА, даже если у генерала
+        # нет пары-персонажа в иерархии: раньше условие связывало это с
+        # ``new_holder``, и генерал без персонажа (Theron, Aldric) захватывал
+        # провинцию, но оставался на месте — выглядело как «соперник стоит
+        # и ничего не делает», хотя владение менялось.
+        general.province_idx = target_idx
+        if character is not None and new_holder:
+            character.province_idx = target_idx
         for message in events:
             self._show_msg(message)
-        if not events:
-            # персонажа нет (генерал без барона) — владелец всё равно сменился
-            self.provinces[target_idx].owner = general.nation
 
     def _move_general_to_province(self, general: General, target_idx: int,
                                   player_initiated: Optional[bool] = None):
@@ -883,8 +943,24 @@ class WorldMapScreen:
                         general.moved = True
                         self._show_msg("Армии объединены!")
                         return
+                    elif self.diplomacy.is_enemy(general.nation, other.nation):
+                        # враждебный генерал в той же провиннице — бой
+                        if player_initiated:
+                            self._start_tactical_session(
+                                general, defender_nation=other.nation,
+                                province_idx=target_idx)
+                        else:
+                            self._start_battle(
+                                general, other, retreat_to=origin_idx,
+                                capture_idx=target_idx)
+                        general.moved = True
+                        return
                     else:
-                        self._show_msg("Нельзя войти на чужую территорию!")
+                        # нейтральная держава: армия проходит, но не задерживается
+                        general.province_idx = target_idx
+                        general.moved = True
+                        self._show_msg(
+                            f"{general.name} проходит через {target.name}")
                         return
 
         if target.owner == "neutral":
@@ -914,8 +990,14 @@ class WorldMapScreen:
                         self._start_battle_with_region(general, target)
                     general.moved = True
             else:
-                self._show_msg("Нельзя войти на чужую территорию!")
-                return
+                # дружественная или нейтральная земля: проходим насквозь,
+                # владение не трогаем. Раньше тут был отказ, и любая
+                # союзная провинция на пути намертво блокировала армию —
+                # бот стоял и «ничего не делал» именно из-за этого.
+                general.province_idx = target_idx
+                general.moved = True
+                self._show_msg(f"{general.name} проходит через {target.name}")
+            return
 
     def _defender_strength(self, nation: str, province_idx: int) -> int:
         """Сколько солдат реально может выставить защитник.
@@ -1000,41 +1082,65 @@ class WorldMapScreen:
         d_power = defender.troops * (defender.health / 100)
         a_roll = a_power * rnd.uniform(0.7, 1.3)
         d_roll = d_power * rnd.uniform(0.7, 1.3)
+        defender_destroyed = False
 
         if a_roll > d_roll:
             ratio = d_roll / a_roll if a_roll > 0 else 0
             losses = int(attacker.troops * ratio * 0.3)
-            attacker.troops = max(100, attacker.troops - losses)
+            attacker.troops = max(MIN_ARMY_TROOPS, attacker.troops - losses)
             defender.troops = max(0, defender.troops - int(defender.troops * 0.7))
-            if defender.troops <= 0:
+            if defender.troops < MIN_ARMY_TROOPS:
+                # меньше одного вьюч-полка (TROOPS_PER_TACTICAL_UNIT = 100)
+                # это уже не армия, а осколки: держать такую стойку бессмысленно,
+                # она вечно стояла и вечно билась в стену
                 self.generals.remove(defender)
                 self._battle_result = f"{attacker.name} победил {defender.name}!"
+                defender_destroyed = True
             else:
                 self._battle_result = f"{attacker.name} отбит, потеряно {losses}"
             defender.health = max(0, defender.health - 20)
-            # победитель занимает провинцию боя. Раньше он оставался на
-            # прежнем месте, и выигранная драка ни к чему не приводила:
-            # армия стояла рядом, а враг формально оставался хозяином.
-            if capture_idx is not None and attacker.troops > 0:
+            # провинцию занимает победитель только если враг из неё ушёл:
+            # иначе победитель и выживший защитник оказывались в одной
+            # провинции, что не имеет смысла и ломало расчёт сил
+            if (capture_idx is not None and attacker.troops > 0
+                    and defender_destroyed):
                 attacker.province_idx = capture_idx
                 self.provinces[capture_idx].troops = 0
         else:
             losses = int(attacker.troops * 0.5)
             attacker.troops = max(0, attacker.troops - losses)
-            if attacker.troops <= 0:
+            if attacker.troops < MIN_ARMY_TROOPS:
                 self.generals.remove(attacker)
                 self._battle_result = f"{defender.name} уничтожил {attacker.name}!"
             else:
                 self._battle_result = f"{attacker.name} отступил, потеряно {losses}"
                 # отступление: возвращаемся туда, откуда пришли, иначе
                 # приказ движения заклинивает на провинции противника
-                if (retreat_to is not None
-                        and attacker.province_idx != retreat_to
-                        and retreat_to not in [o.province_idx for o in self.generals
-                                               if o is not attacker]
-                        and getattr(self.provinces[retreat_to], "owner", "neutral") != "neutral"):
-                    attacker.province_idx = retreat_to
+                self._retreat(attacker, retreat_to)
         self._battle_timer = 3.0
+
+    def _retreat(self, general: General, retreat_to: Optional[int]) -> None:
+        """Отвести разбитую армию назад.
+
+        Сначала пробуем провинцию, откуда пришли. Если там уже кто-то есть
+        (в том числе противник, погнавшийся за отступлением) — ищем любую
+        соседнюю провинцию своей державы. Если и такой нет — стоим там, где
+        стояли: выдумывать «телепорт» в никуда нельзя.
+        """
+        occupied = {g.province_idx for g in self.generals if g is not general}
+
+        def free(idx):
+            if idx is None or idx in occupied:
+                return False
+            return getattr(self.provinces[idx], "owner", "neutral") == general.nation
+
+        if free(retreat_to):
+            general.province_idx = retreat_to
+            return
+        for adj in self._adjacent_provinces(general.province_idx):
+            if free(adj):
+                general.province_idx = adj
+                return
 
     def _start_battle_with_region(self, general: General, region: Province):
         """Мгновенный штурм провинции. Остаётся для ходов ИИ.
@@ -1212,25 +1318,49 @@ class WorldMapScreen:
         finally:
             self._ai_turn_active = False
 
-    def _ai_target(self, general: General) -> Optional[int]:
-        """Куда идти: ближайшая по числу шагов цель.
+    def _ai_can_enter(self, idx: int, general: General) -> bool:
+        """Имеет ли смысл ставить ``idx`` целью похода.
 
-        Приоритеты: вражеский генерал, вражеская провинция без гарнизона,
-        нейтральная провинция. Враг с гарнизоном — тоже цель, но только
-        когда рядом нечего взять мирного: иначе бот с двумя сотнями солдат
-        лезет в чужую крепость вместо того, чтобы дождаться подкрепления.
+        Через дружественную и нейтральную землю армия проходит насквозь
+        (см. ``_move_general_to_province``), поэтому такие провинции годятся
+        и целью — иначе бот не пошёл бы к врагу за спиной у союзника.
+        Зато цель, где стоит чужой мирный генерал, бесполезна: туда не
+        войти, и бот стоял бы перед ней все ходы.
+        """
+        if idx == general.province_idx:
+            return True
+        occupant = self._province_occupant(idx)
+        if occupant is not None and occupant is not general:
+            if occupant.nation == general.nation:
+                return True
+            return self.diplomacy.is_enemy(general.nation, occupant.nation)
+        return True
+
+    def _ai_target(self, general: General,
+                   skip: Optional[set] = None) -> Optional[int]:
+        """Куда идти: ближайшая по числу шагов достижимая цель.
+
+        Приоритеты: вражеский генерал, нейтральная провинция, вражеская
+        провинция без гарнизона, вражевая с гарнизоном (дороже всего — с ней
+        бот сначала уходит крепость осаждать силой).
 
         Сравнение по длине пути, а не по расстоянию в пикселях: пиксельное
-        расстояние игнорирует рельеф (реки, чужие стойки) и одна армия
-        «вроде ближе» до враждебной в��ине, но с другой стороны карты.
+        расстояние игнорирует рельеф (реки, чужие стойки), и одна армия
+        «вроде ближе» до враждебной в линии, но с другой стороны карты.
+
+        ``skip`` — цели, уже отвергнутые в этом ходу (см. ``_ai_move_general``):
+        одна заблокированная цель не должна отравлять весь ход бота.
         """
         g_idx = general.province_idx
+        skip = skip or set()
         best: Optional[Tuple[int, int, int]] = None
         best_idx: Optional[int] = None
 
         def consider(idx: int, rank: int):
             nonlocal best, best_idx
-            if idx == g_idx:
+            if idx == g_idx or idx in skip:
+                return
+            if not self._ai_can_enter(idx, general):
                 return
             path = self.find_province_path(g_idx, idx, general)
             length = len(path) - 1
@@ -1248,8 +1378,6 @@ class WorldMapScreen:
                 continue
             if self.diplomacy.is_enemy(general.nation, other.nation):
                 consider(other.province_idx, 0)
-            elif self.diplomacy.can_move_through(general.nation, other.nation):
-                consider(other.province_idx, 4)
 
         for idx, prov in enumerate(self.provinces):
             owner = getattr(prov, "owner", "neutral")
@@ -1272,17 +1400,30 @@ class WorldMapScreen:
         200 пикселей, поэтому он стоял столбом, когда рядом не было ни врага,
         ни нейтральной земли, и упирался в союзную армию, вставшую на пути.
         Теперь цель ищется по всему графу, а путь — в ширину, с обходом.
+
+        Если шаг отклонён (например, в провинции стоит нейтральный генерал, в
+        который нельзя войти), цель отбрасывается и выбирается следующая — за
+        один ход генерал делает один шаг, но не обязан стоять из-за первой
+        неудачной цели.
         """
         if general.province_idx is None:
             return
-        goal = self._ai_target(general)
-        if goal is None:
-            return
-        path = self.find_province_path(general.province_idx, goal, general)
-        if len(path) < 2:
-            return
-        step = path[1]
-        self._move_general_to_province(general, step, player_initiated=False)
+        skip: set = set()
+        for _attempt in range(4):
+            goal = self._ai_target(general, skip=skip)
+            if goal is None:
+                return
+            path = self.find_province_path(general.province_idx, goal, general)
+            if len(path) < 2:
+                skip.add(goal)
+                continue
+            before = general.province_idx
+            step = path[1]
+            self._move_general_to_province(general, step, player_initiated=False)
+            if general.province_idx != before or general.moved:
+                return
+            # шаг не состоялся — цель недостижима на практике, ищем другую
+            skip.add(goal)
         general.moved = True
 
     def _update(self, dt: float):

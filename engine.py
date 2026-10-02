@@ -251,18 +251,48 @@ class GameEngine:
 
         hp_bonus, dmg_bonus = quality_bonuses(self.session.quality)
 
+        # Потолок TACTICS_UNIT_CAP = 9 не даёт выставить 30 отрядов, но
+        # ровнять по потолку нельзя: 1200 и 3000 солдат превращались в
+        # одинаковые «9 vs 9» и сила стороны полностью терялась. Поэтому
+        # каждый отряд получает прочность, пропорциональную числу солдат
+        # за ним: отряд перестаёт быть эталоном и становится куском армии.
+        blue_scale = self._troops_per_unit_scale(self.session.troops_committed,
+                                                 self.session.tactical_units)
+        def_troops = self.session.defender_troops
+        if def_troops is None:
+            def_troops = self.session.defender_units * TROOPS_PER_TACTICAL_UNIT
+        red_scale = self._troops_per_unit_scale(def_troops,
+                                                self.session.defender_units)
+
         blue_cells = self._spawn_cells(Team.BLUE, self.session.tactical_units)
         for i, cell in enumerate(blue_cells):
             unit = self._make_warrior(UnitType.INFANTRY, Team.BLUE, cell,
-                                      hp_bonus, dmg_bonus)
+                                      hp_bonus * blue_scale, dmg_bonus)
             self.blue_units.append(unit)
             self.all_units.append(unit)
 
         red_cells = self._spawn_cells(Team.RED, self.session.defender_units)
         for cell in red_cells:
-            unit = self._make_warrior(UnitType.INFANTRY, Team.RED, cell)
+            unit = self._make_warrior(UnitType.INFANTRY, Team.RED, cell,
+                                      hp_bonus * red_scale, dmg_bonus)
             self.red_units.append(unit)
             self.all_units.append(unit)
+
+    @staticmethod
+    def _troops_per_unit_scale(troops: object, units: int) -> float:
+        """Во сколько раз крепче должен быть отряд из-за числа солдат.
+
+        Один отряд = ``TROOPS_PER_TACTICAL_UNIT`` солдат. Если сторона
+        выставила 3000 солдат девятью отрядами, за каждым стоит 333
+        солдата, и отряд должен быть втрое живучее эталонного, а не
+        равным. При штатном левейсе множитель равен 1.0 и ничего не меняет.
+        """
+        try:
+            raw = max(0, int(troops))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 1.0
+        n = max(1, int(units))
+        return max(1.0, (raw / n) / float(TROOPS_PER_TACTICAL_UNIT))
 
     def _make_warrior(self, unit_type: UnitType, team: Team, cell: Tuple[int, int],
                       hp_bonus: float = 1.0, dmg_bonus: float = 1.0) -> Unit:
@@ -845,10 +875,17 @@ class GameEngine:
         ws = self.session
         if ws is None:
             return
+        # Показываем СЫРЫЕ войска обеих сторон, а не только число юнитов:
+        # потолок TACTICS_UNIT_CAP = 9 превращал 1200 и 3000 солдат в «9 vs 9»
+        # — игрок видел равные армии и решал, что метрика сломалась, хотя
+        # разница вчетверо. Реальные числа стоят рядом с числом отрядов.
+        def_troops = ws.defender_troops
+        def_txt = (f"{def_troops}" if def_troops is not None
+                   else f"{ws.defender_units * TROOPS_PER_TACTICAL_UNIT}")
         text = (f"WORLD WAR #{ws.match_id}: {ws.general_name} "
                 f"{ws.troops_committed} lev -> {ws.tactical_units} u "
                 f"(q{clamp_quality(ws.quality)}, {TROOPS_PER_TACTICAL_UNIT}/u) "
-                f"vs {ws.defender_units} garrison "
+                f"vs {def_txt} lev -> {ws.defender_units} u "
                 f"[{ws.attacker_nation} vs {ws.defender_nation}]")
         banner = self.font_hud.render(text, True, COLOR_WHITE)
         bar = pygame.Surface((SCREEN_WIDTH, banner.get_height() + 4), pygame.SRCALPHA)
