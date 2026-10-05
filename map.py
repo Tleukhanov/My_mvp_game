@@ -158,22 +158,54 @@ class TacticalMap:
                         pygame.draw.circle(surface, flower_color, (fx, fy), 1)
 
                 elif terrain == TerrainType.MOUNTAIN:
-                    pygame.draw.rect(surface, COLOR_MOUNTAIN, rect)
-                    cx = col * CELL_SIZE + CELL_SIZE // 2
-                    cy = row * CELL_SIZE + CELL_SIZE // 2
-                    peak_points = [
-                        (cx, cy - CELL_SIZE // 2 + 2),
-                        (cx - CELL_SIZE // 3, cy + CELL_SIZE // 3),
-                        (cx + CELL_SIZE // 3, cy + CELL_SIZE // 3),
+                    # Скала, а НЕ фигура. Раньше здесь лежал светло-серый
+                    # треугольник — визуально он был неотличим от юнита-лучника
+                    # (тоже треугольник), и на тактическом поле игрок
+                    # насчитывал «отрядов» больше, чем их там было.
+                    #
+                    # Теперь это широкая низкая гряда: силуэт в полторы ширины
+                    # клетки и вдвое ниже, чем был пик, тёмный камень без
+                    # белых граней, рваная вершина и трещины. Треугольник
+                    # юнита и гряда больше не путаются ни формой, ни тоном.
+                    rng_m = random.Random(col * 97 + row * 31)
+                    rock = COLOR_MOUNTAIN
+                    rock_dark = (54, 49, 41)
+                    rock_light = COLOR_MOUNTAIN_PEAK
+                    # земля в тон местности, а не серый блок
+                    pygame.draw.rect(surface, COLOR_GRASS_DARK, rect)
+
+                    # Рваный гребень: низ клетки занят массивом, верх остаётся
+                    # фоном, поэтому гряда не растёт из центра «столбиком».
+                    j = rng_m.randint(-2, 2)
+                    base_y = rect.y + CELL_SIZE - 5
+                    ridge = [
+                        (rect.x + 2, base_y),
+                        (rect.x + 4, rect.y + 15 + j),
+                        (rect.x + 10, rect.y + 8 + j),
+                        (rect.x + 15, rect.y + 13 + j),
+                        (rect.x + 21, rect.y + 6 + j),
+                        (rect.x + 27, rect.y + 14 + j),
+                        (rect.x + CELL_SIZE - 2, base_y),
                     ]
-                    pygame.draw.polygon(surface, COLOR_MOUNTAIN_PEAK, peak_points)
-                    shadow_points = [
-                        (cx, cy - CELL_SIZE // 2 + 2),
-                        (cx + CELL_SIZE // 3, cy + CELL_SIZE // 3),
-                        (cx, cy + CELL_SIZE // 3),
-                    ]
-                    shadow_color = (100, 90, 80)
-                    pygame.draw.polygon(surface, shadow_color, shadow_points)
+                    pygame.draw.polygon(surface, rock, ridge)
+
+                    # освещённая левая грань
+                    pygame.draw.polygon(surface, rock_light, [
+                        ridge[0], ridge[1], ridge[2], ridge[3],
+                        (rect.x + 15, base_y),
+                    ])
+                    # затенённая правая грань
+                    pygame.draw.polygon(surface, rock_dark, [
+                        ridge[3], ridge[4], ridge[5], ridge[6],
+                        (rect.x + 15, base_y),
+                    ])
+                    # трещины: горизонтальные, не вертикальные штрихи —
+                    # иначе гряда снова читается как частокол
+                    for i in range(3):
+                        ly = rect.y + 17 + i * 4
+                        pygame.draw.line(surface, rock_dark,
+                                         (rect.x + 5, ly),
+                                         (rect.x + 5 + rng_m.randint(8, 15), ly), 1)
 
                 elif terrain == TerrainType.RIVER:
                     pygame.draw.rect(surface, COLOR_RIVER, rect)

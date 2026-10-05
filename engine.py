@@ -916,15 +916,19 @@ class GameEngine:
         blue_alive = sum(1 for u in self.blue_units if u.alive)
         red_alive = sum(1 for u in self.red_units if u.alive)
 
+        # Три фиксированных ряда: ни одна подпись не заезжает на соседнюю.
+        row1 = hud_y + 2
+        row2 = hud_y + 22
+        row3 = hud_y + 42
+
         blue_text = self.font_hud.render(
             f"BLUE: {blue_alive} | HP:{total_blue} | Food:{int(self._blue_food)}", True, COLOR_BLUE
         )
         red_text = self.font_hud.render(
             f"RED: {red_alive} | HP:{total_red} | Food:{int(self._red_food)}", True, COLOR_RED
         )
-        y_off = 20 if self._mission_config else 6
-        self.screen.blit(blue_text, (12, hud_y + y_off))
-        self.screen.blit(red_text, (SCREEN_WIDTH - red_text.get_width() - 12, hud_y + y_off))
+        self.screen.blit(blue_text, (12, row2))
+        self.screen.blit(red_text, (SCREEN_WIDTH - red_text.get_width() - 12, row2))
 
         villages_info = []
         for col, row in self.game_map.get_all_villages():
@@ -936,7 +940,7 @@ class GameEngine:
         v_text = self.font_hud.render(
             f"Villages: B:{blue_v} R:{red_v}", True, COLOR_HUD_TEXT_DIM
         )
-        self.screen.blit(v_text, (SCREEN_WIDTH // 2 - v_text.get_width() // 2, hud_y + 2))
+        self.screen.blit(v_text, (SCREEN_WIDTH // 2 - v_text.get_width() // 2, row1))
 
         if self.selected_units:
             if len(self.selected_units) == 1:
@@ -954,7 +958,7 @@ class GameEngine:
                 parts = [f"{v}x{k}" for k, v in types_count.items()]
                 info = f"SELECTED: {len(self.selected_units)} units ({', '.join(parts)})"
             info_text = self.font_hud.render(info, True, COLOR_HUD_TEXT)
-            self.screen.blit(info_text, (SCREEN_WIDTH // 2 - info_text.get_width() // 2, hud_y + 6))
+            self.screen.blit(info_text, (SCREEN_WIDTH // 2 - info_text.get_width() // 2, row2))
 
         cmd_name = self._command_mode.name
         cmd_color = COLOR_ATTACK_RANGE if self._command_mode == CommandMode.ATTACK else (
@@ -963,13 +967,13 @@ class GameEngine:
         cmd_text = self.font_hud.render(
             f"[{cmd_name}] G:Attack H:Hold F:Defend", True, cmd_color
         )
-        self.screen.blit(cmd_text, (SCREEN_WIDTH - cmd_text.get_width() - 12, hud_y + 2))
+        self.screen.blit(cmd_text, (SCREEN_WIDTH - cmd_text.get_width() - 12, row1))
 
         controls = self.font_hud.render(
             "LMB: Select | Shift+LMB: Multi | Drag: Box | RMB: Move/Attack | A: All | ESC: Quit",
             True, COLOR_HUD_TEXT_DIM,
         )
-        self.screen.blit(controls, (SCREEN_WIDTH // 2 - controls.get_width() // 2, hud_y + 28))
+        self.screen.blit(controls, (SCREEN_WIDTH // 2 - controls.get_width() // 2, row3))
 
     def _render_game_over(self):
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
