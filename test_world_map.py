@@ -1,4 +1,4 @@
-﻿"""Регрессионные тесты мировой карты и моста мир↔тактика.
+"""Регрессионные тесты мировой карты и моста мир↔тактика.
 
 Раньше мировой слой тестами не был покрыт вообще: `test_tactics.py` создаёт
 `WorldMapScreen()` в блоке `try/except`, а `test_states.py` не импортирует
@@ -503,3 +503,185 @@ class TestCaptureOwnership:
             unlinked.province_idx = saved
 
 
+class TestRTSControls:
+    """Управление как в Warcraft 3: рамка, отряды 1..9, групповой приказ.
+
+    Регрессия, которую это закрывает: приказ движения был ОДИН на весь экран,
+    а выделение — одна армия. Воевать приходилось по одной: на каждый отряд
+    отдельный клик и отдельный маршрут. Теперь рамка выделяет группу,
+    ``Ctrl+1..9`` её запоминает, правый клик ведёт всю группу к цели.
+    """
+
+    def _army_rect(self, screen, generals):
+        """Прямоугольник, накрывающий флаги указанных армий."""
+        pts = []
+        for g in generals:
+            cx, cy = screen.provinces[g.province_idx].centroid
+            pts.append(screen._world_to_screen(cx, cy))
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return pygame.Rect(min(xs) - 4, min(ys) - 4,
+                           max(xs) - min(xs) + 8, max(ys) - min(ys) + 8)
+
+    def test_box_select_picks_group(self, fresh_screen):
+        w = fresh_screen
+        army = w._player_armies()[:2]
+        if len(army) < 2:
+            pytest.skip("нужно минимум две свои армии")
+        w._select_by_box(self._army_rect(w, army))
+        picked = set(id(g) for g in w.selected_generals)
+        assert picked == set(id(g) for g in army)
+
+    def test_tight_box_on_banner_still_selects(self, fresh_screen):
+        """Рамка вокруг самого флага выбирает армию.
+
+        Регрессия: попадание проверялось по точке «на 18 px выше центра», и
+        рамка, нарисованная прямо по флагу, не ловила ничего — игрок видел
+        курсор на отряде и не мог его выделить.
+        """
+        w = fresh_screen
+        g = w._player_armies()[0]
+        cx, cy = w.provinces[g.province_idx].centroid
+        bx, by = w._world_to_screen(cx, cy - 18)
+        w._select_by_box(pygame.Rect(int(bx) - 3, int(by) - 3, 7, 7))
+        assert w.selected_generals == [g]
+
+    def test_box_select_primary_is_selected_general(self, fresh_screen):
+        """Всё, что спрашивает selected_general, получает осмысленный ответ."""
+        w = fresh_screen
+        army = w._player_armies()[:2]
+        w._select_by_box(self._army_rect(w, army))
+        assert w.selected_general is not None
+        assert w.selected_general in w.selected_generals
+        assert w.selected_generals[0] is w.selected_general
+
+    def test_empty_box_clears_selection(self, fresh_screen):
+        w = fresh_screen
+        army = w._player_armies()[:1]
+        w._select_by_box(self._army_rect(w, army))
+        assert w.selected_generals
+        # рамка в дальнем углу океана: ни одной армии
+        w._select_by_box(pygame.Rect(-500, -500, 10, 10))
+        assert w.selected_generals == []
+        assert w.selected_general is None
+
+    def test_shift_box_adds_to_selection(self, fresh_screen):
+        w = fresh_screen
+        army = w._player_armies()
+        if len(army) < 2:
+            pytest.skip("нужно минимум две свои армии")
+        w._select_by_box(self._army_rect(w, army[:1]))
+        w._select_by_box(self._army_rect(w, army[1:2]), shift=True)
+        assert len(w.selected_generals) == 2
+
+    def test_control_group_round_trip(self, fresh_screen):
+        w = fresh_screen
+        army = w._player_armies()[:2]
+        if len(army) < 2:
+            pytest.skip("нужно минимум две свои армии")
+        w._select_by_box(self._army_rect(w, army))
+        w._store_control_group(3)
+        w._select_only([])
+        assert w.selected_generals == []
+        assert w._recall_control_group(3) is True
+        assert {id(g) for g in w.selected_generals} == {id(g) for g in army}
+
+    def test_recall_empty_slot_reports(self, fresh_screen):
+        w = fresh_screen
+        assert w._recall_control_group(7) is False
+
+    def test_group_order_issues_order_for_every_army(self, fresh_screen):
+        """Один правый клик — приказ всей группе, а не только первой."""
+        w = fresh_screen
+        w._cancel_move_order()
+        army = w._player_armies()
+        if len(army) < 2:
+            pytest.skip("нужно минимум две свои армии")
+        far = next((i for i, p in enumerate(w.provinces)
+                    if p.owner != PLAYER_NATION
+                    and all(len(w.find_province_path(g.province_idx, i, g)) > 2
+                            for g in army)), None)
+        if far is None:
+            pytest.skip("нет общей далёкой цели для группы")
+        w._select_only(army)
+        w._handle_map_click(*w._world_to_screen(*w.provinces[far].centroid),
+                            via_right=True)
+        assert len(w._orders) == len(army), \
+            f"приказ получили {len(w._orders)} из {len(army)}"
+        assert {o["goal"] for o in w._orders} == {far}
+
+    def test_selection_survives_order(self, fresh_screen):
+        """После приказа группа остаётся выделенной — как в WC3."""
+        w = fresh_screen
+        w._cancel_move_order()
+        army = w._player_armies()[:1]
+        w._select_only(army)
+        goal = next((i for i, p in enumerate(w.provinces)
+                     if p.owner != PLAYER_NATION
+                     and len(w.find_province_path(army[0].province_idx, i,
+                                                  army[0])) > 2), None)
+        if goal is None:
+            pytest.skip("нет далёкой цели")
+        w._handle_map_click(*w._world_to_screen(*w.provinces[goal].centroid),
+                            via_right=True)
+        assert w.selected_generals == army
+
+    def test_stop_cancels_only_selected_orders(self, fresh_screen):
+        w = fresh_screen
+        w._cancel_move_order()
+        army = w._player_armies()
+        if len(army) < 2:
+            pytest.skip("нужно минимум две свои армии")
+        far = next((i for i, p in enumerate(w.provinces)
+                    if all(len(w.find_province_path(g.province_idx, i, g)) > 2
+                           for g in army)), None)
+        if far is None:
+            pytest.skip("нет общей далёкой цели")
+        w._select_only(army)
+        w._issue_orders(army, far)
+        assert len(w._orders) == len(army)
+        w._select_only(army[:1])
+        w._stop_selection()
+        assert len(w._orders) == len(army) - 1
+        assert w._orders[0]["general"] is army[1]
+
+    def test_queued_order_waits_for_current(self, fresh_screen):
+        """Shift-приказ не отменяет текущий, а ждёт его выполнения."""
+        w = fresh_screen
+        w._cancel_move_order()
+        army = w._player_armies()
+        far = next((i for i, p in enumerate(w.provinces)
+                    if all(len(w.find_province_path(g.province_idx, i, g)) > 2
+                           for g in army)), None)
+        if far is None:
+            pytest.skip("нет общей далёкой цели")
+        w._issue_orders(army, far)
+        first = len(w._orders)
+        w._issue_orders(army[:1], far, queue=True)
+        assert len(w._orders) == first, "Shift-приказ заменил текущий"
+        assert len(w._queued_orders) == 1
+
+    def test_double_click_selects_whole_garrison(self, fresh_screen):
+        """Двойной клик выбирает весь гарнизон, а не одну армию."""
+        w = fresh_screen
+        idx = next((g.province_idx for g in w._player_armies()), None)
+        assert idx is not None
+        cx, cy = w.provinces[idx].centroid
+        sx, sy = w._world_to_screen(cx, cy)
+        w._handle_left_click(int(sx), int(sy))
+        w._handle_left_click(int(sx), int(sy))
+        here = [g for g in w._player_armies() if g.province_idx == idx]
+        assert set(id(g) for g in w.selected_generals) == \
+            set(id(g) for g in here)
+
+    def test_left_click_on_own_land_keeps_order_safe(self, fresh_screen):
+        """Клик по своей земле не сбрасывает выделение молча и не ломает приказ."""
+        w = fresh_screen
+        w._cancel_move_order()
+        army = w._player_armies()[:1]
+        w._select_only(army)
+        own = next(i for i, p in enumerate(w.provinces)
+                   if p.owner == PLAYER_NATION)
+        cx, cy = w.provinces[own].centroid
+        w._handle_left_click(*w._world_to_screen(cx, cy))
+        w._render()  # рендер не должен падать ни при каком выделении

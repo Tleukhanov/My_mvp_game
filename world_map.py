@@ -362,23 +362,40 @@ class WorldMapScreen:
         self._rmb_moved = False
         self._keys_held = set()
         self._mouse_pos = (0, 0)
+        # Рамка выделения левой кнопкой (как в WC3): зажал и потянул — выделил
+        # всё, что попало в прямоугольник. Порог в 6 px отделяет «рамка» от
+        # «клик», иначе микросдвиг мыши при обычном клике сбрасывал бы выбор.
+        self._lmb_down_pos: Optional[Tuple[int, int]] = None
+        self._lmb_rect: Optional[pygame.Rect] = None
+        self._SELECT_DRAG_PX = 6
+        # Двойной клик по поселению выбирает всю гарнизон, а не одну армию:
+        # иначе в провинции с тремя отрядами игрок кликает трижды в одну точку.
+        self._last_click_ms = 0
+        self._last_click_pos = (0, 0)
+        self._DOUBLE_CLICK_MS = 350
         self._hover_province = None
-        self._zoom_cache = {}
+        # Сколько подписей поселений реально легло на карту в последнем кадре.
+        # Считается ради проверки «названия не молчат»: часть имён молчала,
+        # и это было видно только по коду.
+        self._label_blits = 0
         # Подписи поселений: три ступени, как на референсе. Раньше шрифтов
         # было два, и города со столицами печатались одним и тем же кеглем,
         # а деревни не подписывались вовсе — из 50 провинций игрок видел
         # несколько названий и не знал, что находится в остальных.
+        # Кегли подняты до «карточных»: на референсе название столицы —
+        # это заметная надпись, а не подпись 12 px, и при 1600 px ширины
+        # экрана 27/18/13 читаются как имена, а не как штрих.
         try:
             self._place_fonts = (
-                pygame.font.SysFont("serif", 21),
-                pygame.font.SysFont("serif", 15),
-                pygame.font.SysFont("serif", 12),
+                pygame.font.SysFont("serif", 27),
+                pygame.font.SysFont("serif", 18),
+                pygame.font.SysFont("serif", 13),
             )
         except Exception:
             self._place_fonts = (
-                pygame.font.SysFont(None, 21),
-                pygame.font.SysFont(None, 15),
-                pygame.font.SysFont(None, 12),
+                pygame.font.SysFont(None, 27),
+                pygame.font.SysFont(None, 18),
+                pygame.font.SysFont(None, 13),
             )
 
         self.diplomacy = DiplomacyManager()
@@ -404,14 +421,24 @@ class WorldMapScreen:
         self._build_connection_index()
 
         self.selected_general: Optional[General] = None
-        #: Приказ движения: (генерал, индекс целевой провинции).
-        #: Выполняется по одному шагу за ход — маршрут длиннее одного
-        #: соседства провинции. Раньше армия могла сделать только один шаг,
-        #: и «кликнуть далёкого врага» было невозможно: игрок жал, ничего
-        #: не происходило, и надо было вручную кликать соседние клетки.
-        self._move_order: Optional[Tuple[General, int]] = None
-        self._move_path: List[int] = []
-        self._move_stuck = 0
+        #: Выделение армий. ``selected_general`` — всегда ПЕРВАЯ в этом списке
+        #: (или ``None``), и именно к нему относятся все панели и подсказки.
+        #: Остальные элементы работают только на приказы: рамкой выделяют
+        #: группу, а правый клик ведёт её к цели, как в Warcraft 3.
+        self.selected_generals: List[General] = []
+        #: Отряды игрока, попавшие в рамку выделения: под номером 1..9 хранится
+        #: состав (ссылки на армии), а не номер в списке.
+        self._control_groups: Dict[int, List[General]] = {}
+        #: Приказы движения: у каждой армии своя цель. Раньше приказ был один
+        #: на весь экран, поэтому за ход можно было вести только одну армию,
+        #: а остальные приходилось кликать по очереди — группа в один клик
+        #: работать не могла. Каждый приказ выполняется по одному шагу за ход,
+        #: и маршрут может быть длиннее одного соседства провинции.
+        self._orders: List[Dict] = []
+        #: Очередь приказов, накопленная Shift-правым кликом: приказ не
+        #: отменяет предыдущий, а встаёт в конец. В Warcraft 3 Shift-клик
+        #: именно так и добавляет действия в очередь.
+        self._queued_orders: List[Dict] = []
         self._turn = 1
         self._show_diplomacy = False
         self._diplomacy_target: Optional[str] = None
@@ -740,14 +767,35 @@ class WorldMapScreen:
                         self.running = False
                 elif event.key == pygame.K_SPACE:
                     self._end_turn()
+                elif event.key in (pygame.K_s, pygame.K_h):
+                    # S/H — стоп и удержание: маршруты выделенной группы
+                    # отменяются, армии остаются на месте. На мировой карте
+                    # «стой» и «держать позицию» — одно и то же действие.
+                    self._stop_selection()
+                elif (pygame.K_0 <= event.key <= pygame.K_9
+                        and not self._show_ownership
+                        and not self._show_diplomacy):
+                    # Цифры — только когда не открыта панель владений или
+                    # дипломатия: там те же клавиши означают строки панели.
+                    slot = event.key - pygame.K_0
+                    keys = pygame.key.get_pressed()
+                    ctrl = keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]
+                    if slot == 0:
+                        if ctrl:
+                            self._control_groups.clear()
+                            self._show_msg("Отряды забыты")
+                        else:
+                            self.zoom = 1.0
+                            self.cam_x, self.cam_y = 0, 0
+                            self._clamp_camera()
+                    elif ctrl:
+                        self._store_control_group(slot)
+                    else:
+                        self._recall_control_group(slot)
                 elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     self._zoom_at(SCREEN_WIDTH // 2, (SCREEN_HEIGHT - 80) // 2, 1.2)
                 elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
                     self._zoom_at(SCREEN_WIDTH // 2, (SCREEN_HEIGHT - 80) // 2, 1 / 1.2)
-                elif event.key == pygame.K_0:
-                    self.zoom = 1.0
-                    self.cam_x, self.cam_y = 0, 0
-                    self._clamp_camera()
                 elif event.key in (pygame.K_v, pygame.K_c):
                     if self._show_ownership:
                         self._close_ownership_panel()
@@ -812,12 +860,15 @@ class WorldMapScreen:
                     self._rmb_moved = False
                 elif event.button == 1:
                     mx, my = event.pos
+                    self._lmb_down_pos = (mx, my)
+                    self._lmb_rect = None
                     # панель лежит поверх карты: клик по её строке — это
                     # выбор в панели, а не выбор генерала под ней
                     if self._panel_hit(mx, my) is not None:
                         self._handle_panel_click(mx, my)
+                        self._lmb_down_pos = None
                     elif my < SCREEN_HEIGHT - 80:
-                        self._handle_map_click(mx, my)
+                        self._lmb_rect = pygame.Rect(mx, my, 0, 0)
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 2:
@@ -831,13 +882,35 @@ class WorldMapScreen:
                         if self._panel_hit(mx, my) is not None:
                             self._handle_panel_click(mx, my)
                         elif my < SCREEN_HEIGHT - 80:
-                            if self.selected_general:
+                            if self.selected_generals:
                                 self._handle_map_click(mx, my, via_right=True)
                             else:
-                                self.selected_general = None
+                                self._select_only([])
+                elif event.button == 1:
+                    down = self._lmb_down_pos
+                    self._lmb_down_pos = None
+                    rect = self._lmb_rect
+                    self._lmb_rect = None
+                    if down is None:
+                        continue          # клик ушёл в панель, карта его не ждёт
+                    mx, my = event.pos
+                    keys = pygame.key.get_pressed()
+                    shift = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+                    if rect is not None and (abs(mx - down[0]) >= self._SELECT_DRAG_PX
+                                             or abs(my - down[1]) >= self._SELECT_DRAG_PX):
+                        self._select_by_box(rect, shift=shift)
+                    elif my < SCREEN_HEIGHT - 80:
+                        self._handle_left_click(mx, my)
 
             elif event.type == pygame.MOUSEMOTION:
                 self._mouse_pos = event.pos
+                if self._lmb_down_pos and self._lmb_rect is not None:
+                    # рамка растёт от точки нажатия, а не от текущей позиции
+                    x0 = self._lmb_down_pos[0]
+                    y0 = self._lmb_down_pos[1]
+                    self._lmb_rect = pygame.Rect(
+                        min(x0, event.pos[0]), min(y0, event.pos[1]),
+                        abs(event.pos[0] - x0), abs(event.pos[1] - y0))
                 if self._dragging:
                     dx = (event.pos[0] - self._drag_start[0]) / self.zoom
                     dy = (event.pos[1] - self._drag_start[1]) / self.zoom
@@ -858,120 +931,385 @@ class WorldMapScreen:
                 # смена выделения тоже считается поводом перерисовать панель
                 self._invalidate_panel()
 
-    def _cancel_move_order(self):
-        """Снять маршрут: приказ выполнен, армия уничтожена или сменился выбор."""
-        self._move_order = None
-        self._move_path = []
-        self._move_stuck = 0
+    # --- приказы: список внутри, одиночный вид снаружи -------------------
+    # Выделение — тоже список, но наружу по-прежнему отдаётся один
+    # ``selected_general``: на него ссылаются панели, подсказки и все прежние
+    # проверки. Это ПЕРВАЯ армия в группе, и всё, что спрашивает «кого сейчас
+    # показывать», продолжает получать осмысленный ответ.
 
-    def _issue_move_order(self, general: General, goal_idx: int) -> bool:
-        """Отдать приказ идти в дальнюю провинцию. ``False``, если пути нет."""
-        if general.province_idx is None:
+    @property
+    def selected_general(self) -> Optional[General]:
+        """Первая армия выделения, ради совместимости с одиночным выбором."""
+        return self.selected_generals[0] if self.selected_generals else None
+
+    @selected_general.setter
+    def selected_general(self, value: Optional[General]):
+        self.selected_generals = [value] if value is not None else []
+
+    def _select_only(self, generals: List[General]):
+        self.selected_generals = list(generals)
+        self._invalidate_panel()
+
+    def _add_to_selection(self, generals: List[General]):
+        """Shift-клик: добавить к выделению, не снимая прежнее."""
+        for g in generals:
+            if g not in self.selected_generals:
+                self.selected_generals.append(g)
+        self._invalidate_panel()
+
+    def _toggle_selection(self, general: General):
+        if general in self.selected_generals:
+            self.selected_generals = [g for g in self.selected_generals
+                                      if g is not general]
+        else:
+            self.selected_generals.append(general)
+        self._invalidate_panel()
+
+    def _player_armies(self) -> List[General]:
+        """Свои армии, которыми можно командовать (в бой уже ушедшие — нет)."""
+        return [g for g in self.generals if g.nation == PLAYER_NATION]
+
+    def _player_armies_in_rect(self, rect: pygame.Rect) -> List[General]:
+        """Свои армии, чей флаг попал в рамку выделения.
+
+        Проверяются две точки — над провинцией (куда рисуется флаг) и её центр.
+        Только по флагу рамка должна была угадать с координатой «на 18 px
+        выше центра», и выбор рамкой отваливался у нижней кромки отряда.
+        """
+        picked: List[General] = []
+        for g in self._player_armies():
+            if g.province_idx is None:
+                continue
+            cx, cy = self.provinces[g.province_idx].centroid
+            banner = self._world_to_screen(cx, cy - 18)
+            centre = self._world_to_screen(cx, cy)
+            if (rect.collidepoint(int(banner[0]), int(banner[1]))
+                    or rect.collidepoint(int(centre[0]), int(centre[1]))):
+                picked.append(g)
+        return picked
+
+    def _store_control_group(self, slot: int):
+        """Ctrl + цифра: запомнить текущее выделение под номером."""
+        if not self.selected_generals:
+            return
+        self._control_groups[slot] = list(self.selected_generals)
+        self._show_msg(f"Отряд {slot}: {len(self.selected_generals)}")
+
+    def _recall_control_group(self, slot: int) -> bool:
+        """Цифра: вернуть выделение отряда.
+
+        Хранятся ССЫЛКИ на армии, а не номера в списке: нумерация сдвигается
+        при любом перестроении мира, и отряд «2» молча превратился бы в чужой.
+        Отряд считается пустым, только если все его армии действительно ушли
+        с поля — тогда про него честно сообщают, а не выделяют случайных.
+        """
+        group = self._control_groups.get(slot)
+        if not group:
             return False
-        path = self.find_province_path(general.province_idx, goal_idx, general)
-        if len(path) < 2:
-            self._show_msg("Пути туда нет!")
-            self._cancel_move_order()
+        alive = [g for g in group if g in self.generals]
+        if not alive:
+            self._show_msg(f"Отряд {slot} пуст — все армии погибли")
             return False
-        self._move_order = (general, goal_idx)
-        self._move_path = path[1:]
-        name = self.provinces[goal_idx].name
-        self._show_msg(f"{general.name} → {name}, шагов: {len(self._move_path)}")
+        self._select_only(alive)
+        self._show_msg(f"Отряд {slot}: {len(alive)}")
         return True
 
-    def _advance_move_order(self) -> bool:
-        """Один шаг маршрута в начале хода. ``True``, если армия сдвинулась.
+    # --- приказы: список внутри, одиночный вид снаружи -------------------
+    # Раньше приказ был один на весь экран, и всё, что о нём знал, —
+    # ``_move_order`` / ``_move_path`` / ``_move_stuck``. Теперь приказов
+    # много, но эти три имени по-прежнему отвечают на вопрос «что исполняется
+    # прямо сейчас», то есть показывают ПЕРВЫЙ приказ в очереди. Поэтому всё,
+    # что ими пользуется (подсказка, превью маршрута, тесты), продолжает
+    # работать без правок, а групповые приказы просто перестают быть
+    # невозможными.
 
-        Если подряд ``MOVE_ORDER_STUCK_TURNS`` ходов продвижения нет (армия
-        отбивается и откатывается), приказ снимается с честным сообщением.
-        Без этого приказ в запертой провинции перебивался вечно: генерал
-        бился о противника, отступал, бился снова — и выглядело это как
+    @property
+    def _move_order(self) -> Optional[Tuple[General, int]]:
+        """Приказ, который исполняется сейчас: (генерал, провинция)."""
+        if not self._orders:
+            return None
+        first = self._orders[0]
+        return (first["general"], first["goal"])
+
+    @property
+    def _move_path(self) -> List[int]:
+        """Остаток маршрута первого приказа."""
+        return self._orders[0]["path"] if self._orders else []
+
+    @property
+    def _move_stuck(self) -> int:
+        """Сколько ходов подряд приказ не продвигается."""
+        return self._orders[0]["stuck"] if self._orders else 0
+
+    def _cancel_move_order(self):
+        """Снять ВСЕ приказы: выполнены, армии не стало или сменился выбор."""
+        self._orders = []
+        self._queued_orders = []
+
+    def _issue_move_order(self, general: General, goal_idx: int) -> bool:
+        """Приказ одной армии идти в дальнюю провинцию. ``False``, если пути нет."""
+        return self._issue_orders([general], goal_idx) > 0
+
+    def _issue_orders(self, generals: List[General], goal_idx: int,
+                      queue: bool = False) -> int:
+        """Приказ группе армий идти к одной цели. Возвращает число принятых.
+
+        Часть армий может быть без пути (например, отрезаны после чужого
+        захвата) — тогда приказ получает только она, а остальные получают
+        честное сообщение. Молча выдавать половине группы приказ и прятать
+        вторую половину хуже, чем сказать, кто остался на месте.
+        """
+        if not generals or goal_idx is None:
+            return 0
+        target = self.provinces[goal_idx].name
+        issued, refused = 0, []
+        fresh: List[Dict] = []
+        for g in generals:
+            # `moved` НЕ проверяем: приказ — это «куда идти дальше», а не
+            # «пошли сейчас». Армия, уже сходившая в этом ходу, вправе получить
+            # маршрут на следующий, иначе после одного хода в провинции
+            # нельзя было бы запланировать ничего.
+            if g.province_idx is None or g not in self.generals:
+                refused.append(g)
+                continue
+            path = self.find_province_path(g.province_idx, goal_idx, g)
+            if len(path) < 2:
+                refused.append(g)
+                continue
+            fresh.append({"general": g, "goal": goal_idx,
+                          "path": path[1:], "stuck": 0})
+            issued += 1
+        if fresh:
+            if queue:
+                # Shift-клик не отменяет текущие приказы, а дописывает в конец
+                self._queued_orders.extend(fresh)
+            else:
+                self._orders = fresh
+                self._queued_orders = []
+        elif not queue:
+            # приказ невозможен — старый маршрут тоже сбрасываем, иначе игрок
+            # видит «пути нет» и продолжает смотреть на маршрут вчерашнего дня
+            self._cancel_move_order()
+        if refused:
+            self._show_msg(
+                f"{len(refused)} не могут идти к {target}: путь перекрыт")
+        if issued:
+            lead = fresh[0]["general"]
+            extra = f" (+ещё {issued - 1})" if issued > 1 else ""
+            self._show_msg(f"{lead.name}{extra} → {target}")
+        return issued
+
+    def _advance_move_order(self) -> bool:
+        """По одному шагу каждой армии с приказом. ``True``, если кто-то сдвинулся.
+
+        Если у одной армии подряд ``MOVE_ORDER_STUCK_TURNS`` ходов продвижения
+        нет (она отбивается и откатывается), приказ снимается с честным
+        сообщением. Без этого приказ в запертой провинции перебивался вечно:
+        генерал бился о противника, отступал, бился снова — и выглядело это как
         «соперник стоит и ничего не делает», хотя стоял и стоял наш.
         """
-        if self._move_order is None:
-            return False
-        general, goal = self._move_order
-        if general not in self.generals or general.moved:
-            self._cancel_move_order()
-            return False
-        if general.province_idx == goal:
-            self._cancel_move_order()
-            return False
-        path = self.find_province_path(general.province_idx, goal, general)
-        if len(path) < 2:
-            self._show_msg(f"{general.name}: путь перекрыт")
-            self._cancel_move_order()
-            return False
-        step = path[1]
-        before = general.province_idx
-        self._move_path = path[1:]
-        self._move_general_to_province(general, step)
-        moved = general.province_idx != before
+        if not self._orders:
+            if self._queued_orders:
+                self._orders = self._queued_orders
+                self._queued_orders = []
+            else:
+                return False
+        moved_any = False
+        alive: List[Dict] = []
+        for order in self._orders:
+            general, goal = order["general"], order["goal"]
+            if general not in self.generals or general.moved:
+                continue                      # армии нет — приказ отпадает
+            if general.province_idx == goal:
+                continue                      # дошли
+            path = self.find_province_path(general.province_idx, goal, general)
+            if len(path) < 2:
+                self._show_msg(f"{general.name}: путь перекрыт")
+                continue
+            order["path"] = path[1:]
+            before = general.province_idx
+            self._move_general_to_province(general, path[1])
+            moved = general.province_idx != before
+            if general.province_idx == goal:
+                self._show_msg(f"{general.name} занял {self.provinces[goal].name}")
+                continue
+            if moved:
+                order["stuck"] = 0
+                moved_any = True
+            else:
+                order["stuck"] += 1
+                if order["stuck"] >= MOVE_ORDER_STUCK_TURNS:
+                    self._show_msg(
+                        f"{general.name}: путь блокируют, приказ снят")
+                    continue
+            alive.append(order)
+        self._orders = alive
+        return moved_any
 
-        if general.province_idx == goal:
-            self._show_msg(f"{general.name} занял {self.provinces[goal].name}")
-            self._cancel_move_order()
-            return True
-
-        if moved:
-            self._move_stuck = 0
-        else:
-            self._move_stuck += 1
-            if self._move_stuck >= MOVE_ORDER_STUCK_TURNS:
-                self._show_msg(
-                    f"{general.name}: путь блокируют, приказ снят")
+    def _stop_selection(self):
+        """Отменить маршруты выделенной группы, оставив армии на месте."""
+        stopped = set(id(g) for g in self.selected_generals)
+        if not stopped:
+            if self._orders or self._queued_orders:
                 self._cancel_move_order()
-        return moved
+                self._show_msg("Все приказы сняты")
+            return
+        keep_q = [o for o in self._queued_orders
+                  if id(o["general"]) not in stopped]
+        keep = [o for o in self._orders if id(o["general"]) not in stopped]
+        count = (len(self._orders) + len(self._queued_orders)) - len(keep) - len(keep_q)
+        self._orders = keep
+        self._queued_orders = keep_q
+        self._show_msg(f"Стоп: снято приказов — {count}")
+
+    def _render_selection(self):
+        """Рамка выделения и подсветка всей выбранной группы.
+
+        Раньше выделение могло быть только одно, и игрок не видел, что
+        приказ уйдёт всем: флаг подсвечивался у одной армии, а двигались
+        две. Теперь видно каждую.
+        """
+        for g in self.selected_generals:
+            if g.province_idx is None:
+                continue
+            cx, cy = self.provinces[g.province_idx].centroid
+            x, y = self._world_to_screen(cx, cy)
+            pulse = abs(math.sin(pygame.time.get_ticks() * 0.005)) * 0.35 + 0.65
+            col = (int(255 * pulse), int(240 * pulse), int(120 * pulse))
+            pygame.draw.circle(self.screen, col, (int(x), int(y)),
+                               max(12, int(15 * self.zoom)), 2)
+        if self._lmb_rect is not None and self._lmb_down_pos is not None:
+            r = self._lmb_rect
+            if r.width > 0 and r.height > 0:
+                fill = pygame.Surface(r.size, pygame.SRCALPHA)
+                fill.fill((255, 236, 170, 38))
+                self.screen.blit(fill, r.topleft)
+                pygame.draw.rect(self.screen, (255, 236, 170), r, 1)
+
+    def _select_by_box(self, rect: pygame.Rect, shift: bool = False):
+        """Рамка выделения: все свои армии, чей флаг попал в прямоугольник.
+
+        Пустая рамка — щелчок по пустому полю — снимает выделение, если Shift
+        не зажат. Иначе игрок не мог «снять всё», не имея под рукой пустой
+        провинции, а одиночный клик по своей же земле сбивал выбор неожиданно.
+        """
+        picked = self._player_armies_in_rect(rect)
+        if not picked:
+            if not shift:
+                self._select_only([])
+                self._show_msg("Никого не выбрано")
+            return
+        if shift:
+            self._add_to_selection(picked)
+        else:
+            self._select_only(picked)
+        self._show_msg(f"Выбрано армий: {len(self.selected_generals)}")
+
+    def _handle_left_click(self, mx: int, my: int):
+        """Левый клик: выбор, двойной — вся гарнизон, Ctrl — переключение.
+
+        Раньше левый клик всегда и только выбирал одну армию, а при отсутствии
+        выделения клик по своей провинции запускал поход на врага. Второе
+        поведение осталось только для клика по ЧУЖОЙ земле: выделение не
+        сбивает приказ игрока, который он уже отдал.
+        """
+        keys = pygame.key.get_pressed()
+        ctrl = keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]
+        wx, wy = self._screen_to_world(mx, my)
+        idx = next((i for i, p in enumerate(self.provinces)
+                    if p.contains_point(wx, wy)), None)
+        if idx is None:
+            if not ctrl:
+                self._select_only([])
+            return
+
+        now = pygame.time.get_ticks()
+        near = (abs(mx - self._last_click_pos[0]) < 8
+                and abs(my - self._last_click_pos[1]) < 8)
+        dbl = now - self._last_click_ms <= self._DOUBLE_CLICK_MS and near
+        self._last_click_ms, self._last_click_pos = now, (mx, my)
+
+        garrison = [g for g in self._player_armies() if g.province_idx == idx]
+        if dbl and garrison:
+            # двойной клик — весь гарнизон поселения, как «выбрать всех»
+            self._select_only(garrison)
+            self._show_msg(f"{self.provinces[idx].name}: "
+                           f"{len(garrison)} армий")
+            return
+        if not garrison:
+            # своей армии тут нет: клик по своей земле просто снимает выбор,
+            # а по чужой — отдаёт приказ ближайшей своей армии
+            if not ctrl and not keys[pygame.K_LSHIFT]:
+                if self.selected_generals:
+                    self._select_only([])
+                elif self.provinces[idx].owner != PLAYER_NATION:
+                    self._auto_attack_order(idx)
+            return
+        target = garrison[0]
+        if ctrl:
+            self._toggle_selection(target)
+        elif keys[pygame.K_LSHIFT]:
+            self._add_to_selection([target])
+        else:
+            self._select_only([target])
 
     def _handle_map_click(self, mx: int, my: int, via_right: bool = False):
         if my >= SCREEN_HEIGHT - 80:
             return
 
+        if not via_right:
+            # Левая кнопка больше не «выбирает и сразу двигает»: выбор, рамка и
+            # двойной клик живут в _handle_left_click, а приказ — только правой.
+            # Смешивать их в одной функции было причиной того, что клик по своей
+            # же провинции неожиданно сбрасывал выделение.
+            self._handle_left_click(mx, my)
+            return
+
         wx, wy = self._screen_to_world(mx, my)
+        target = next((i for i, prov in enumerate(self.provinces)
+                       if prov.contains_point(wx, wy)), None)
+        if target is None:
+            return
 
-        clicked_province = None
-        for i, prov in enumerate(self.provinces):
-            if prov.contains_point(wx, wy):
-                clicked_province = i
-                break
+        keys = pygame.key.get_pressed()
+        queue = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+        army = self.selected_generals
+        if not army:
+            self._auto_attack_order(target)
+            return
 
-        if self.selected_general:
-            g = self.selected_general
-            g_prov = g.province_idx
+        # Правый клик по своей армии — это выбор, а не приказ самому себе.
+        here = [g for g in army if g.province_idx == target]
+        if len(here) == len(army):
+            self._select_only(here)
+            self._show_msg(f"{self.provinces[target].name}: "
+                           f"{len(here)} армий")
+            return
 
-            if clicked_province is not None and clicked_province != g_prov:
-                adj = self._adjacent_provinces(g_prov)
-                if clicked_province in adj:
-                    self._move_general_to_province(g, clicked_province)
-                    self.selected_general = None
-                    self._cancel_move_order()
-                    return
-                # дальняя цель: строим маршрут, армия пойдёт по одному
-                # шагу за ход. Раньше дальний клик просто игнорировался.
-                self._issue_move_order(g, clicked_province)
-                self.selected_general = None
-                return
+        stepped, marchers = [], []
+        for g in army:
+            if g.province_idx is None or g.province_idx == target:
+                continue
+            if target in self._adjacent_provinces(g.province_idx):
+                self._move_general_to_province(g, target)
+                stepped.append(g)
+            else:
+                marchers.append(g)
 
-            if clicked_province is not None:
-                for gen in self.generals:
-                    if gen.nation == PLAYER_NATION and not gen.moved:
-                        if gen.province_idx == clicked_province:
-                            self.selected_general = gen
-                            return
-            self.selected_general = None
-        else:
-            if clicked_province is not None:
-                for gen in self.generals:
-                    if gen.nation == PLAYER_NATION and not gen.moved:
-                        if gen.province_idx == clicked_province:
-                            self.selected_general = gen
-                            return
-                # клик по чужой территории без выбора армии — самый
-                # естественный способ «пойти на врага». Раньше это просто
-                # ничего не делало: игрок жал на далёкого соперника, а
-                # реакции не было. Теперь выбирается ближайшая своя армия
-                # и ей сразу выдаётся маршрут.
-                self._auto_attack_order(clicked_province)
+        name = self.provinces[target].name
+        if marchers:
+            # Далёкая цель: маршрут на несколько ходов. Группа получает приказ
+            # одним действием, а не по клику на каждую армию.
+            self._issue_orders(marchers, target, queue=queue)
+        elif stepped:
+            verb = "поставлены" if len(stepped) > 1 else "встал"
+            self._show_msg(f"{name}: {verb} на месте "
+                           f"{', '.join(g.name for g in stepped)}")
+        if stepped:
+            self._cancel_move_order()
+        # Выделение НЕ снимаем: в Warcraft 3 после приказа армия остаётся
+        # выбранной, иначе группу нельзя переставить одним движением, а
+        # отменять приказ, случайно ткнув в соседнюю провинцию, нечем.
 
     def _auto_attack_order(self, target_idx: int) -> bool:
         """Отдать приказ напасть на чужую провинцию без ручного выбора армии.
@@ -1928,8 +2266,8 @@ class WorldMapScreen:
         # на ровно ничего, кроме лишней копии 1.6 млн пикселей.
         self.screen.blit(self.tex_manager.get_ocean_texture(SCREEN_WIDTH, view_h), (0, 0))
 
-        # Местность и окантовка — одним блитом кэшированного слоя. Раньше это
-        # были два больших слоя (рельеф и окантовка), и каждый стоил отдельный
+        # Местность и окантовка — одним блитом кэшированного слоя. Раньше это были
+        # два больших слоя (рельеф и окантовка), и каждый стоил отдельный
         # полноэкранный блит с альфой.
         self.screen.blit(self._map_frame(), self._frame_origin_screen())
 
@@ -1949,6 +2287,7 @@ class WorldMapScreen:
 
         self._render_rivers()
         self._render_settlements()
+        self._render_selection()
         self._render_move_route()
 
         for general in self.generals:
@@ -2230,11 +2569,22 @@ class WorldMapScreen:
 
     def _render_hud(self):
         hud_y = SCREEN_HEIGHT - 80
-        pygame.draw.rect(self.screen, COLOR_HUD_BG, (0, hud_y, SCREEN_WIDTH, 80))
+        # Полоса под картой — не чёрная плашка, а часть карты: тёмный
+        # пергамент с золотой нитью сверху. Раньше это был плоской заливкой
+        # COLOR_HUD_BG, и он выглядел как чужое окно поверх рисунка.
+        bar = pygame.Surface((SCREEN_WIDTH, 80), pygame.SRCALPHA)
+        bar.fill((26, 23, 17, 236))
+        bar.fill((96, 82, 46, 90), (0, 0, SCREEN_WIDTH, 2))
+        bar.fill((58, 48, 26, 120), (0, 2, SCREEN_WIDTH, 1))
+        self.screen.blit(bar, (0, hud_y))
+        del bar
 
         turn_text = self._cached_text(
             self.font_hud,
-            f"Turn: {self._turn} | LMB/RMB: select+move | Wheel:+/-: zoom | WASD: pan | SPACE: turn | TAB: dipl | V: holdings | 0: reset",
+            f"Turn: {self._turn} | LMB: select (drag-box, dbl=гарнизон) | "
+            f"RMB: move/attack (Shift=queue) | Ctrl+1..9 /1..9: отряды | "
+            f"S: стоп | Wheel:+/-: zoom | WASD: pan | SPACE: turn | TAB: dipl | "
+            f"V: holdings | 0: reset",
             COLOR_HUD_TEXT
         )
         self.screen.blit(turn_text, (12, hud_y + 4))
