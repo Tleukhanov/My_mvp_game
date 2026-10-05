@@ -251,27 +251,27 @@ class GameEngine:
 
         hp_bonus, dmg_bonus = quality_bonuses(self.session.quality)
 
-        # Потолок TACTICS_UNIT_CAP = 9 не даёт выставить 30 отрядов, но
-        # ровнять по потолку нельзя: 1200 и 3000 солдат превращались в
-        # одинаковые «9 vs 9» и сила стороны полностью терялась. Поэтому
-        # каждый отряд получает прочность, пропорциональную числу солдат
-        # за ним: отряд перестаёт быть эталоном и становится куском армии.
-        blue_scale = self._troops_per_unit_scale(self.session.troops_committed,
-                                                 self.session.tactical_units)
+        # На поле выходят РАВНЫЕ отряды (battle_units = min(сторон)), а перевес
+        # выражается прочностью каждого отряда. Иначе армия в 1200 против
+        # 300 выставляла 9 отрядов против трёх: меньшая армия выглядела
+        # разобранной, хотя на самом деле её просто срезал потолок.
+        # Разница остаётся читаемой через полоски здоровья и числа в HUD.
+        n = self.session.battle_units
         def_troops = self.session.defender_troops
         if def_troops is None:
             def_troops = self.session.defender_units * TROOPS_PER_TACTICAL_UNIT
-        red_scale = self._troops_per_unit_scale(def_troops,
-                                                self.session.defender_units)
 
-        blue_cells = self._spawn_cells(Team.BLUE, self.session.tactical_units)
-        for i, cell in enumerate(blue_cells):
+        blue_scale = self._troops_per_unit_scale(self.session.troops_committed, n)
+        red_scale = self._troops_per_unit_scale(def_troops, n)
+
+        blue_cells = self._spawn_cells(Team.BLUE, n)
+        for cell in blue_cells:
             unit = self._make_warrior(UnitType.INFANTRY, Team.BLUE, cell,
                                       hp_bonus * blue_scale, dmg_bonus)
             self.blue_units.append(unit)
             self.all_units.append(unit)
 
-        red_cells = self._spawn_cells(Team.RED, self.session.defender_units)
+        red_cells = self._spawn_cells(Team.RED, n)
         for cell in red_cells:
             unit = self._make_warrior(UnitType.INFANTRY, Team.RED, cell,
                                       hp_bonus * red_scale, dmg_bonus)
@@ -859,6 +859,26 @@ class GameEngine:
             )
         self.screen.blit(indicator_surface, (0, 0))
 
+    def _war_banner_text(self):
+        """Строка плашки: сырые войска и выставленные отряды.
+
+        Показываем СЫРЫЕ войска обеих сторон рядом с числом отрядов. Отряды
+        у сторон равные (``WarSession.battle_units``), поэтому перевес виден
+        только по людям: без «1200 lev -> 9 u vs 3000 lev -> 9 u» игрок видел
+        бы симметричное поле и не понимал, откуда взялся перевес.
+        """
+        ws = self.session
+        if ws is None:
+            return ""
+        def_troops = ws.defender_troops
+        def_txt = (f"{def_troops}" if def_troops is not None
+                   else f"{ws.defender_units * TROOPS_PER_TACTICAL_UNIT}")
+        return (f"WORLD WAR #{ws.match_id}: {ws.general_name} "
+                f"{ws.troops_committed} lev -> {ws.battle_units} u "
+                f"(q{clamp_quality(ws.quality)}, {TROOPS_PER_TACTICAL_UNIT}/u) "
+                f"vs {def_txt} lev -> {ws.battle_units} u "
+                f"[{ws.attacker_nation} vs {ws.defender_nation}]")
+
     def _render_war_banner(self):
         """Плашка «этот бой вырос из мира» поверх верхнего края карты.
 
@@ -867,26 +887,14 @@ class GameEngine:
         юнитов выглядит как обычная тренировка, а итог боя на карте мира
         оказывается неожиданным.
 
-        Плашка рисуется НЕ в HUD: полоса снизу высотой 48 px уже занята
-        пятью строками, и шестая наезжала бы на счётчик деревень. Сверху
-        карты места нет, поэтому полоса с тёмной подложкой читается как
-        заголовок миссии и ничего не перекрывает.
+        Плашка рисуется НЕ в HUD: полоса снизу высотой 64 px занята тремя
+        рядами подписей. Сверху карты места нет, поэтому полоса с тёмной
+        подложкой читается как заголовок миссии и ничего не перекрывает.
         """
         ws = self.session
         if ws is None:
             return
-        # Показываем СЫРЫЕ войска обеих сторон, а не только число юнитов:
-        # потолок TACTICS_UNIT_CAP = 9 превращал 1200 и 3000 солдат в «9 vs 9»
-        # — игрок видел равные армии и решал, что метрика сломалась, хотя
-        # разница вчетверо. Реальные числа стоят рядом с числом отрядов.
-        def_troops = ws.defender_troops
-        def_txt = (f"{def_troops}" if def_troops is not None
-                   else f"{ws.defender_units * TROOPS_PER_TACTICAL_UNIT}")
-        text = (f"WORLD WAR #{ws.match_id}: {ws.general_name} "
-                f"{ws.troops_committed} lev -> {ws.tactical_units} u "
-                f"(q{clamp_quality(ws.quality)}, {TROOPS_PER_TACTICAL_UNIT}/u) "
-                f"vs {def_txt} lev -> {ws.defender_units} u "
-                f"[{ws.attacker_nation} vs {ws.defender_nation}]")
+        text = self._war_banner_text()
         banner = self.font_hud.render(text, True, COLOR_WHITE)
         bar = pygame.Surface((SCREEN_WIDTH, banner.get_height() + 4), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 170))

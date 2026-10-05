@@ -225,6 +225,21 @@ class WarSession:
     player_attacker: bool = True
 
     @property
+    def battle_units(self) -> int:
+        """Сколько отрядов выставят ОБЕ стороны.
+
+        Стороны выходят на поле равным числом отрядов, а разница в
+        перевесе остаётся в прочности каждого отряда (см.
+        ``GameEngine._troops_per_unit_scale``). Так бой читается: видно,
+        у кого больше людей, и не нужно гадать, почему у противника
+        вдвое меньше юнитов — из-за потолка ``TACTICS_UNIT_CAP`` меньшая
+        армия раньше просто выглядела «разобранной».
+        """
+        own = tactical_units_for(self.troops_committed)
+        foe = defender_units_for(self)
+        return max(1, min(own, foe, TACTICS_UNIT_CAP))
+
+    @property
     def tactical_units(self) -> int:
         """Сколько юнитов уйдёт в бой (с учётом потолка)."""
         return tactical_units_for(self.troops_committed)

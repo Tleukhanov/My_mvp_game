@@ -1,4 +1,4 @@
-"""Регрессионные тесты мировой карты и моста мир↔тактика.
+﻿"""Регрессионные тесты мировой карты и моста мир↔тактика.
 
 Раньше мировой слой тестами не был покрыт вообще: `test_tactics.py` создаёт
 `WorldMapScreen()` в блоке `try/except`, а `test_states.py` не импортирует
@@ -168,6 +168,64 @@ class TestTroopMetrics:
         assert blue / red == pytest.approx(1200 / 3000, rel=0.05)
         blue, red = total_hp(1200, 1200)
         assert blue / red == pytest.approx(1.0, rel=0.05)
+
+
+class TestEqualBattlefield:
+    """Обе стороны выходят на поле равным числом отрядов.
+
+    Раньше потолок `TACTICS_UNIT_CAP` превращал 1200 и 3000 солдат в «9 против
+    4»: игрок видел на поле меньше юнитов и считал метрику сломанной. Теперь
+    число отрядов симметрично, а перевес читается по прочности отряда.
+    """
+
+    CASES = [
+        # (свои, чужие, ожидаемое число отрядов на сторону)
+        (1200, 3000, 9),
+        (1200, 1200, 9),
+        (3000, 400, 4),
+        (500, 500, 5),
+        (100, 5000, 1),
+        (0, 3000, 1),
+    ]
+
+    @pytest.mark.parametrize("troops,defender,expected", CASES)
+    def test_battle_units_is_symmetric(self, troops, defender, expected):
+        session = _session(troops, defender=defender)
+        assert session.battle_units == expected
+
+    @pytest.mark.parametrize("troops,defender,expected", CASES)
+    def test_engine_spawns_equal_count(self, troops, defender, expected):
+        engine = GameEngine(session=_session(troops, defender=defender))
+        blue = sum(1 for u in engine.blue_units if u.alive)
+        red = sum(1 for u in engine.red_units if u.alive)
+        assert blue == red == expected, f"{troops} vs {defender}: получено {blue} vs {red}"
+
+    def test_battle_units_never_exceeds_cap(self):
+        assert _session(99999, defender=99999).battle_units == TACTICS_UNIT_CAP
+
+    @pytest.mark.parametrize("troops,defender", [
+        (1200, 3000), (1200, 1200), (3000, 400), (500, 500), (100, 5000),
+    ])
+    def test_hp_still_encodes_real_troop_ratio(self, troops, defender):
+        """Равенство отрядов не съело разницу в людях — она в HP."""
+        engine = GameEngine(session=_session(troops, defender=defender))
+        blue = sum(u.max_health for u in engine.blue_units)
+        red = sum(u.max_health for u in engine.red_units)
+        assert blue / red == pytest.approx(troops / defender, rel=0.05)
+
+    def test_unit_cap_does_not_shrink_smaller_side(self):
+        """Потолок режет Обе стороны, а не только атакующего."""
+        assert len(GameEngine(session=_session(1200, defender=3000)).blue_units) == \
+            len(GameEngine(session=_session(1200, defender=3000)).red_units)
+
+    def test_banner_reports_raw_troops_next_to_unit_count(self):
+        """В баннере видно и людей, и отряды — иначе цифры выглядят обманом."""
+        ws = _session(1200, defender=3000)
+        engine = GameEngine(session=ws)
+        banner = engine._war_banner_text()
+        assert "1200" in banner and "3000" in banner
+        assert banner.count(f"{ws.battle_units} u") == 2, \
+            f"обе стороны должны показывать одинаковые отряды: {banner}"
 
 
 class TestPathfinding:
@@ -443,3 +501,5 @@ class TestCaptureOwnership:
             assert screen.provinces[target].owner == unlinked.nation
         finally:
             unlinked.province_idx = saved
+
+
