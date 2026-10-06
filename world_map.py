@@ -523,6 +523,60 @@ class WorldMapScreen:
         """
         apply_deltas_to_screen(self, deltas)
 
+    # ---- сохранение партии (слой savegame.py) ---------------------------
+    #
+    # Формат живёт в savegame.py, а не здесь: он общий для чтения и записи,
+    # и держать две копии правил в двух модулях — значит однажды забыть про
+    # новое поле. Здесь только три тонких входа, чтобы мировой слой знал о
+    # сохранении ровно столько же, сколько знает о тактическом бое.
+
+    def to_state(self) -> Dict[str, object]:
+        """Снимок кампании: см. ``savegame.campaign_state``.
+
+        Хешировать надо ЭТОТ словарь (через ``savegame.campaign_fingerprint``),
+        а не сам экран: ``WorldMapScreen`` — обычный класс, и ``repr`` его
+        содержит адрес памяти, поэтому два одинаковых мира дали бы разные
+        хеши. Ровно та же причина, по которой у ``Hierarchy`` есть
+        ``to_state``/``state_fingerprint``.
+        """
+        from savegame import campaign_state
+        return campaign_state(self)
+
+    def state_fingerprint(self) -> str:
+        """Хеш состояния кампании. Единственная точка хеширования экрана."""
+        from savegame import campaign_fingerprint
+        return campaign_fingerprint(self.to_state())
+
+    def save_game(self, path=None):
+        """Записать партию на диск. ``None``, если сохранять нельзя.
+
+        Сообщение о причине отказа показывается на карте: игрок должен видеть
+        «нельзя сохранить посреди боя», а не что партия пропала.
+        """
+        from savegame import SaveError, save_campaign
+        try:
+            info = save_campaign(self, path=path)
+        except SaveError as exc:
+            self._show_msg(f"Сохранение не удалось: {exc}")
+            return None
+        self._show_msg(f"Партия сохранена (ход {info.turn})")
+        return info
+
+    def load_game(self, path=None):
+        """Восстановить партию с диска. ``None``, если читать нечего.
+
+        Экран переиспользуется, а не пересоздаётся: пересоздание сбросило бы
+        текстуры, кэши и панели, ради которых объект и жил между заходами.
+        """
+        from savegame import SaveError, load_screen
+        try:
+            load_screen(path=path, screen=self)
+        except SaveError as exc:
+            self._show_msg(f"Загрузка не удалась: {exc}")
+            return None
+        self._show_msg(f"Партия загружена (ход {self._turn})")
+        return self
+
     def _battle_rng(self, salt: int):
         """Ветка именованного потока ``world:battle`` под целочисленной солью.
 
@@ -767,6 +821,13 @@ class WorldMapScreen:
                         self.running = False
                 elif event.key == pygame.K_SPACE:
                     self._end_turn()
+                elif event.key == pygame.K_F5:
+                    # F5/F9 — стандартная пара «сохранить/загрузить» в
+                    # стратегиях. Клавиши именно те, потому что на карте
+                    # заняты почти все буквы, а F-ряд не занят ничем.
+                    self.save_game()
+                elif event.key == pygame.K_F9:
+                    self.load_game()
                 elif event.key in (pygame.K_s, pygame.K_h):
                     # S/H — стоп и удержание: маршруты выделенной группы
                     # отменяются, армии остаются на месте. На мировой карте
@@ -2584,7 +2645,7 @@ class WorldMapScreen:
             f"Turn: {self._turn} | LMB: select (drag-box, dbl=гарнизон) | "
             f"RMB: move/attack (Shift=queue) | Ctrl+1..9 /1..9: отряды | "
             f"S: стоп | Wheel:+/-: zoom | WASD: pan | SPACE: turn | TAB: dipl | "
-            f"V: holdings | 0: reset",
+            f"V: holdings | 0: reset | F5/F9: save/load",
             COLOR_HUD_TEXT
         )
         self.screen.blit(turn_text, (12, hud_y + 4))

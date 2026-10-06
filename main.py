@@ -3,6 +3,49 @@ from campaigns import MISSIONS
 from war import WarSession, BattleOutcome, outcome_to_world
 
 
+def _autosave(world_screen) -> None:
+    """Сохранить партию при выходе с карты в меню.
+
+    Раньше выход в меню просто выбрасывал экран вместе со всей партией, и
+    двадцать ходов исчезали молча. Теперь выход сохраняет, а F5 на карте
+    сохраняет явно.
+
+    Отказ не роняет игру: сохранение может быть невозможно (партия кончена,
+    бой не доигран), и это не повод закрывать окно.
+    """
+    if world_screen is None:
+        return
+    try:
+        world_screen.save_game()
+    except Exception:
+        # экран мог не иметь метода (тестовая заглушка) или упасть на
+        # отрисовке плашки; сохранение не обязано быть сильнее выхода
+        pass
+
+
+def _open_world():
+    """Экран карты из сохранения, если оно есть, иначе новая партия.
+
+    Один вход из главного меню делает обе вещи без новой кнопки: пункт
+    «ГЛОБАЛЬНАЯ КАРТА» продолжает партию, если она сохранена, и начинает
+    новую, если сохранения нет. Так «продолжить» работает сразу, без
+    отдельного экрана выбора сохранений, которого в игре не существует.
+    """
+    from savegame import SaveError, has_save, load_screen
+    from world_map import WorldMapScreen
+
+    if not has_save():
+        return WorldMapScreen()
+    try:
+        return load_screen()
+    except SaveError as exc:
+        # битое сохранение не должно запрещать игру: говорим ПОЧЕМУ оно не
+        # читается (текст ошибки написан специально для игрока) и начинаем
+        # партию с нуля, а не падаем на пустом меню
+        print(f"[save] {exc}")
+        return WorldMapScreen()
+
+
 def _run_tactics(mission=None, session=None):
     """Прогнать тактический бой. Вернуть (следующая миссия, исход боя).
 
@@ -57,8 +100,16 @@ def main():
     while True:
         if world_active:
             world_active = False
-            world_screen = _run_world(world_screen)
+            # экран запоминаем ДО _run_world: тот возвращает None, когда
+            # игрок ушёл с карты, и после этого держать объект для
+            # сохранения было бы уже нечем
+            screen = world_screen
+            world_screen = _run_world(screen)
             if world_screen is None or world_screen.is_finished:
+                # партия кончена — перезаписывать ею хорошее сохранение
+                # нельзя, поэтому автосохранение только при обычном выходе
+                if world_screen is None and not screen.is_finished:
+                    _autosave(screen)
                 world_screen = None
                 continue
             # вернулись из тактики — сразу обратно на карту, а не в меню
@@ -101,8 +152,9 @@ def main():
             else:
                 break
         elif result == "world_map":
-            from world_map import WorldMapScreen
-            world_screen = WorldMapScreen()
+            # тот же пункт меню продолжает сохранённую партию и начинает
+            # новую, если сохранения нет (см. _open_world)
+            world_screen = _open_world()
             world_active = True
             continue
         elif result == "tutorial":
