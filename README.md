@@ -129,13 +129,20 @@ docker compose --profile headless up --build
 | Key | Action |
 |---|---|
 | **Left Click** | Select a Blue unit |
-| **Shift + Left Click** | Add unit to selection (up to 6) |
+| **Shift + Left Click** | Add unit to selection / remove it |
 | **Drag (Left Mouse)** | Box-select multiple units |
-| **A** | Select all friendly units |
-| **Right Click** | Move selected units / Attack enemy unit |
-| **G** | Attack mode — units aggressively pursue enemies |
-| **H** | Hold mode — units move to position then hold ground |
-| **F** | Defend mode — units move to position and engage nearby enemies |
+| **Double Click** | Select all units of that type on the field |
+| **Ctrl + A** | Select all friendly units |
+| **Right Click** | Order the selection (see the mode keys) |
+| **Shift + Right Click** | Queue the order instead of replacing the current one |
+| **A** | Attack-move mode (default) — engage enemies on the way |
+| **G** | Attack mode — right-click a unit to focus it, ground clicks ignore enemies |
+| **H** | Hold mode — move there and stand, engage nobody |
+| **F** | Defend mode — move there, hold the spot, engage what comes in |
+| **S** | Stop — drop the orders and the queue of the selection |
+| **Ctrl + 1..9** | Assign the selection to a control group |
+| **1..9** | Recall a control group (dead units are dropped silently) |
+| **Ctrl + 0** | Forget all control groups |
 | **ESC** | Deselect unit / Quit game |
 | **SPACE** | Toggle range indicators on/off |
 | **R** | Restart the battle |
