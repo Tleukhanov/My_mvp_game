@@ -9,12 +9,13 @@ pygame.init()
 pygame.display.set_mode((1, 1))
 
 from config import (
-    TerrainType, UnitType, Team, AIState,
-    CELL_SIZE, MAP_COLS, MAP_ROWS,
+    TerrainType, UnitType, Team, AIState, CommandMode,
+    CELL_SIZE, MAP_COLS, MAP_ROWS, HUD_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT,
+    MAX_SELECTION, ORDER_QUEUE_LIMIT, DOUBLE_CLICK_MS,
     TERRAIN_MOVE_COST, UNIT_STATS, COMBAT_ADVANTAGE,
     COLOR_GRASS_1, COLOR_GRASS_2, COLOR_GRASS_3,
     COLOR_RIVER, COLOR_RIVER_LIGHT, COLOR_RIVER_FLOW,
-    MAX_SELECTION, FOOD_MAX, FOOD_PER_UNIT_PER_SEC,
+    FOOD_MAX, FOOD_PER_UNIT_PER_SEC,
     FOOD_PER_VILLAGE_PER_SEC, SELECT_CLICK_RADIUS,
 )
 from world_data import Relation
@@ -64,7 +65,12 @@ class TestConfig:
                 assert (attacker, defender) in COMBAT_ADVANTAGE
 
     def test_max_selection(self):
-        assert MAX_SELECTION == 6
+        # Потолок выделения перестал быть ограничением боя: на поле выходит до
+        # TACTICS_UNIT_CAP (9) отрядов, и шесть не вмещали даже треть армии.
+        assert MAX_SELECTION >= 9
+        # Но и «без потолка» нельзя: рамка по всей карте выделила бы полсотни
+        # юнитов, и приказ пошёл бы от всех сразу.
+        assert MAX_SELECTION <= 32
 
     def test_food_constants(self):
         assert FOOD_MAX == 1000
@@ -1009,6 +1015,328 @@ class TestWorldMapTopology:
         assert "red" in nations_with_caps
         assert "blue" in nations_with_caps
         assert "green" in nations_with_caps
+
+
+class TestTacticalOrders:
+    """Управление боем: выделение, отряды, приказы, очередь.
+
+    Раньше тактический слой проверялся ровно одним тестом на ``import engine``:
+    потолок выделения в шесть юнитов, отсутствие отрядов, очереди и
+    атаки-марша не ловил никто — и ловить было нечем.
+    """
+
+    def setup_method(self):
+        from engine import GameEngine
+        self.engine = GameEngine()
+        # Тренировочный бой выставляет четверку, а проверять надо состав,
+        # который и вызывал правку потолка: бой из мира выводит до
+        # ``TACTICS_UNIT_CAP`` (9) отрядов. Добираем своих до девяти юнитами
+        # того же типа, что уже на поле.
+        template = self.engine.blue_units[0]
+        while len(self.engine.blue_units) < 9:
+            unit = Unit(template.unit_type, Team.BLUE,
+                        template.x, template.y)
+            self.engine.blue_units.append(unit)
+            self.engine.all_units.append(unit)
+
+    def teardown_method(self):
+        self.engine.running = False
+
+    def _cells(self, col, row):
+        # именно int: pygame отдаёт координаты мыши целыми, а ``pixel_to_grid``
+        # делит на CELL_SIZE и отдаёт float, если на вход пришёл float
+        return (int(col * CELL_SIZE + CELL_SIZE / 2),
+                int(row * CELL_SIZE + CELL_SIZE / 2))
+
+    def _place_all_blue(self, col=4, row=8, step=1):
+        """Разложить всех своих по свободным клеткам и выделить."""
+        for i, unit in enumerate(self.engine.blue_units):
+            c, r = col + i * step, row
+            unit.x, unit.y = self._cells(c, r)
+        self.engine._set_selection(list(self.engine.blue_units))
+        return self.engine.blue_units
+
+    # ---- выделение ----
+
+    def test_selection_covers_whole_army(self):
+        """Потолок в шесть юнитов не должен резать выделение пополам."""
+        blue = self._place_all_blue()
+        assert len(self.engine.selected_units) == len(blue)
+        assert len(self.engine.selected_units) > 6
+
+    def test_box_select_takes_more_than_six(self):
+        blue = self._place_all_blue(col=3, row=8)
+        self.engine._box_select(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT)
+        assert len(self.engine.selected_units) == len(blue)
+
+    def test_selection_still_bounded(self):
+        """Потолок остаётся: absurd-рамка не должна выбрать полкарты."""
+        from config import MAX_SELECTION
+        for i in range(MAX_SELECTION + 10):
+            unit = Unit(UnitType.INFANTRY, Team.BLUE, *self._cells(i % MAP_COLS,
+                                                                 i // MAP_COLS))
+            self.engine.blue_units.append(unit)
+            self.engine.all_units.append(unit)
+        self.engine._box_select(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT - HUD_HEIGHT)
+        assert len(self.engine.selected_units) == MAX_SELECTION
+
+    def test_double_click_selects_all_of_type(self):
+        blue = self.engine.blue_units
+        archer = next(u for u in blue if u.unit_type is UnitType.ARCHER)
+        archer.x, archer.y = self._cells(6, 6)
+        self.engine._click_select(int(archer.x), int(archer.y))
+        self.engine._last_click_time = 0
+        self.engine._last_click_pos = None
+        self.engine._click_select(int(archer.x), int(archer.y))
+        chosen = self.engine.selected_units
+        assert len(chosen) == sum(1 for u in blue if u.unit_type is UnitType.ARCHER)
+        assert all(u.unit_type is UnitType.ARCHER for u in chosen)
+
+    def test_two_slow_clicks_are_not_double(self):
+        blue = self.engine.blue_units
+        first, second = blue[0], blue[1]
+        first.x, first.y = self._cells(6, 6)
+        second.x, second.y = self._cells(14, 6)
+        self.engine._click_select(int(first.x), int(first.y))
+        self.engine._last_click_time -= config_doubled_click_ms() * 4
+        self.engine._click_select(int(second.x), int(second.y))
+        assert self.engine.selected_units == [second]
+
+    def test_select_all_moves_to_ctrl_a(self):
+        """Само «выбрать всех» больше не висит на A — A это атака-марш."""
+        from config import CommandMode
+        blue = self._place_all_blue()
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._clear_selection()
+        self.engine._select_all_blue()
+        assert len(self.engine.selected_units) == len(blue)
+
+    # ---- отряды ----
+
+    def test_control_group_round_trip(self):
+        blue = self._place_all_blue()
+        self.engine._store_control_group(3)
+        self.engine._clear_selection()
+        assert self.engine.selected_units == []
+        assert self.engine._recall_control_group(3) is True
+        assert self.engine.selected_units == blue
+
+    def test_recall_empty_slot_reports(self):
+        assert self.engine._recall_control_group(7) is False
+        assert "пуст" in self.engine._message
+
+    def test_recall_skips_the_dead(self):
+        """Погибшего молча выбрасываем: пересобирать отряд руками — не WC3."""
+        blue = self._place_all_blue()
+        blue[0].take_damage(blue[0].max_health)
+        self.engine._store_control_group(1)
+        self.engine._clear_selection()
+        assert self.engine._recall_control_group(1) is True
+        assert blue[0] not in self.engine.selected_units
+        assert len(self.engine.selected_units) == len(blue) - 1
+        assert "погибло 1" in self.engine._message
+
+    def test_recall_of_fully_dead_group_frees_slot(self):
+        blue = self._place_all_blue()
+        self.engine._store_control_group(2)
+        for unit in blue:
+            unit.take_damage(unit.max_health)
+        self.engine._clear_selection()
+        assert self.engine._recall_control_group(2) is False
+        assert self.engine.selected_units == []
+        assert 2 not in self.engine._control_groups
+
+    def test_group_survives_roster_change(self):
+        """Отряд хранит ссылки на юнитов, а не номера в списке."""
+        blue = list(self._place_all_blue())
+        self.engine._store_control_group(4)
+        # новый юнит в начало списка сдвигает всю нумерацию: отряд, хранивший
+        # номера, после этого указал бы на чужих
+        self.engine.blue_units.insert(0, Unit(UnitType.INFANTRY, Team.BLUE,
+                                              *self._cells(1, 1)))
+        self.engine._clear_selection()
+        self.engine._recall_control_group(4)
+        expected = {id(u) for u in blue}
+        assert {id(u) for u in self.engine.selected_units} == expected
+
+    # ---- приказы ----
+
+    def test_group_move_spreads_over_cells(self):
+        """Правый клик ведёт весь отряд, и не в одну клетку."""
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        self.engine._command_mode = CommandMode.ATTACK
+        target = self._cells(20, 12)
+        self.engine._handle_right_click(*target)
+        assert len(self.engine._current_order) == len(blue)
+        points = [self.engine._current_order[id(u)]["point"] for u in blue]
+        assert len(set(points)) == len(points), "строй слипся в одну точку"
+
+    def test_click_on_enemy_attacks_that_enemy(self):
+        from config import CommandMode
+        blue = self._place_all_blue()
+        enemy = self.engine.red_units[0]
+        self.engine._command_mode = CommandMode.ATTACK_MOVE
+        self.engine._handle_right_click(int(enemy.x), int(enemy.y))
+        for unit in blue:
+            assert unit._attack_target is enemy
+
+    def test_attack_move_engages_enemy_in_range(self):
+        """Атака-марш сбивается с маршрута на подошедшего врага."""
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        unit = blue[0]
+        self.engine._command_mode = CommandMode.ATTACK_MOVE
+        self.engine._handle_right_click(*self._cells(30, 8))
+        assert unit.is_moving
+        enemy = self.engine.red_units[0]
+        enemy.x, enemy.y = unit.x + unit.attack_range * 0.5, unit.y
+        self.engine._update_orders()
+        assert unit._attack_target is enemy
+
+    def test_plain_move_ignores_enemy_in_range(self):
+        """Обычное перемещение врага не трогает — иначе G и A не различались бы."""
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        unit = blue[0]
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(30, 8))
+        enemy = self.engine.red_units[0]
+        enemy.x, enemy.y = unit.x + unit.attack_range * 0.5, unit.y
+        self.engine._update_orders()
+        assert unit._attack_target is None
+
+    def test_hold_never_engages(self):
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        unit = blue[0]
+        self.engine._command_mode = CommandMode.HOLD
+        self.engine._handle_right_click(*self._cells(30, 8))
+        enemy = self.engine.red_units[0]
+        enemy.x, enemy.y = unit.x + unit.attack_range * 0.5, unit.y
+        for _ in range(30):
+            self.engine._update_orders()
+            self.engine._update_defenders()
+        assert unit._attack_target is None
+
+    def test_defend_engages_and_keeps_post(self):
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        unit = blue[0]
+        self.engine._command_mode = CommandMode.DEFEND
+        post = self._cells(4, 8)
+        self.engine._handle_right_click(*post)
+        enemy = self.engine.red_units[0]
+        enemy.x, enemy.y = post[0] + unit.attack_range * 0.5, post[1]
+        for _ in range(10):
+            self.engine._update_orders()
+        self.engine._update_defenders()
+        assert unit._attack_target is enemy
+
+    def test_stop_clears_orders_and_queue(self):
+        from config import CommandMode
+        blue = self._place_all_blue()
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(20, 12))
+        self.engine._handle_right_click(*self._cells(24, 12), queue=True)
+        assert self.engine._order_queue.get(id(blue[0]))
+        self.engine._stop_selection()
+        for unit in blue:
+            assert id(unit) not in self.engine._current_order
+            assert id(unit) not in self.engine._order_queue
+            assert id(unit) not in self.engine._defend_posts
+
+    def test_stop_without_selection_clears_all(self):
+        from config import CommandMode
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._set_selection(self.engine.blue_units)
+        self.engine._handle_right_click(*self._cells(20, 12))
+        self.engine._clear_selection()
+        self.engine._stop_selection()
+        assert not self.engine._current_order
+
+    # ---- очередь ----
+
+    def test_queued_order_waits_for_current(self):
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(10, 8))
+        first_point = self.engine._current_order[id(blue[0])]["point"]
+        self.engine._handle_right_click(*self._cells(30, 8), queue=True)
+        assert self.engine._current_order[id(blue[0])]["point"] == first_point
+        assert self.engine._queue_len(blue[0]) == 1
+
+    def test_queue_runs_after_arrival(self):
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        unit = blue[0]
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(5, 8))
+        second = self._cells(20, 8)
+        self.engine._handle_right_click(*second, queue=True)
+        # юнит дошёл до своей клетки строя первого приказа
+        first_point = self.engine._current_order[id(unit)]["point"]
+        unit.x, unit.y = first_point
+        unit.clear_orders()
+        self.engine._update_orders()
+        assert self.engine._queue_len(unit) == 0
+        assert self.engine._current_order[id(unit)]["kind"] == "move"
+        assert self.engine._current_order[id(unit)]["point"] != first_point
+
+    def test_queue_limit_is_respected(self):
+        from config import CommandMode, ORDER_QUEUE_LIMIT
+        blue = self._place_all_blue(col=4, row=8)
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(10, 8))
+        for i in range(ORDER_QUEUE_LIMIT + 3):
+            self.engine._handle_right_click(
+                *self._cells(12 + i % 5, 8 + i % 7), queue=True)
+        assert self.engine._queue_len(blue[0]) == ORDER_QUEUE_LIMIT
+
+    def test_plain_order_clears_queue(self):
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(10, 8))
+        self.engine._handle_right_click(*self._cells(20, 8), queue=True)
+        self.engine._handle_right_click(*self._cells(25, 8))
+        assert self.engine._queue_len(blue[0]) == 0
+
+    def test_queue_drops_after_unit_dies(self):
+        from config import CommandMode
+        blue = self._place_all_blue(col=4, row=8)
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(10, 8))
+        self.engine._handle_right_click(*self._cells(20, 8), queue=True)
+        blue[0].take_damage(blue[0].max_health)
+        self.engine._update_orders()
+        assert id(blue[0]) not in self.engine._order_queue
+        assert id(blue[0]) not in self.engine._current_order
+
+    # ---- HUD ----
+
+    def test_render_draws_queue_and_hud(self):
+        from config import CommandMode
+        self._place_all_blue(col=4, row=8)
+        self.engine._command_mode = CommandMode.ATTACK
+        self.engine._handle_right_click(*self._cells(20, 8))
+        self.engine._handle_right_click(*self._cells(26, 8), queue=True)
+        self.engine._show_msg("Отряд 1: 4")
+        self.engine._render()
+
+    def test_mode_hints_match_command_modes(self):
+        from engine import _MODE_HINTS
+        from config import CommandMode
+        assert set(_MODE_HINTS) == set(CommandMode)
+        for mode, hint in _MODE_HINTS.items():
+            assert "A:A-MOVE" in hint, hint
+            assert "S:STOP" in hint, hint
+
+
+def config_doubled_click_ms():
+    from config import DOUBLE_CLICK_MS
+    return DOUBLE_CLICK_MS
 
 
 class TestWorldMapInit:

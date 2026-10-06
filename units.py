@@ -70,6 +70,16 @@ class Unit:
     def distance_to_point(self, px: float, py: float) -> float:
         return math.hypot(self.x - px, self.y - py)
 
+    @property
+    def is_moving(self) -> bool:
+        """Остался ли не пройденный маршрут.
+
+        Тактическому слою это нужно для очереди приказов: следующий приказ
+        выдаётся, когда юнит дошёл, а «дошёл» извне не видно — путь приватный.
+        Read-only свойство честнее, чем чтение ``_path`` из ``engine.py``.
+        """
+        return bool(self._path)
+
     def set_move_path(self, pixel_path: List[Tuple[float, float]]):
         if pixel_path and len(pixel_path) >= 2:
             self._path = pixel_path
