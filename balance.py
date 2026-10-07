@@ -147,6 +147,12 @@ class BattleSpec:
     dt: float = DEFAULT_DT
     max_ticks: int = DEFAULT_MAX_TICKS
     stall_ticks: int = DEFAULT_STALL_TICKS
+    #: Заморозить бой: юниты не двигаются и не бьются. Нужно стенду, чтобы
+    #: проверять СВОЙ предохранитель зависания на заведомо мёртвом бою.
+    #: Раньше такой фикстурой был дедлок самого движка (равные армии не
+    #: доигрывались), и тест зависания падал вместе с ним; после починки
+    #: дедлока заморозка должна быть задана явно, иначе проверять нечего.
+    frozen: bool = False
 
     @property
     def troop_ratio(self) -> float:
@@ -272,6 +278,23 @@ def _alive(units: Sequence) -> int:
     return sum(1 for u in units if u.alive)
 
 
+def _freeze_engage(engine: GameEngine):
+    """Заморозить бой: сбросить приказы и вернуть юнитов на исходные места.
+
+    Суммарное здоровье не меняется, ни одна пара не сближается — то есть
+    ровно то состояние, ради которого в стенде и нужен предохранитель.
+    """
+    home = getattr(engine, "_balance_home", None)
+    if home is None:
+        home = {id(u): (u.x, u.y) for u in engine.all_units}
+        engine._balance_home = home
+    for unit in engine.all_units:
+        if not unit.alive:
+            continue
+        unit.x, unit.y = home[id(unit)]
+        unit.clear_orders()
+
+
 def _drive(engine: GameEngine, spec: BattleSpec,
            blue_ai: Optional[AIController]) -> Tuple[int, str, bool]:
     """Прогнать бой до конца. Возвращает (тики, исход, признак зависания).
@@ -292,6 +315,8 @@ def _drive(engine: GameEngine, spec: BattleSpec,
 
     for _ in range(max(1, int(spec.max_ticks))):
         ticks += 1
+        if spec.frozen:
+            _freeze_engage(engine)
         engine._update(spec.dt)
 
         hp = _total_hp(engine.blue_units) + _total_hp(engine.red_units)

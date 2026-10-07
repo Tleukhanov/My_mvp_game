@@ -10,6 +10,22 @@ HOLD_DISTANCE = CELL_SIZE * 4
 FLANK_ANGLE = 1.2
 COORDINATE_MIN_ALLIES = 2
 RETREAT_HEALTH = 0.35
+#: Сколько раз за бой юнит может сорваться в отступление. Раньше отступление
+#: было терминальным (выйти из него можно было только вылечившись, а лечения в
+#: бою нет): раненый убегал до конца карты и больше не участвовал. Обе стороны
+#: копили таких беглецов, никто не добивал оставшихся — и бой на равных
+#: армиях не заканчивался ВООБЩЕ (0 из 24 замеров дошли до исхода за 600 с).
+#: Лимит конечен, поэтому раненый в конце концов возвращается и умирает.
+RETREAT_ALLOWANCE = 2
+#: Сколько think-тиков юнит может бежать, прежде чем отход засчитывается.
+RETREAT_TIMEOUT = 2.4
+#: Отступление считается удавшимся, когда юнит оторвался на столько клеток.
+#: Дальше он не бежит, а дерётся: разорвать контакт и вернуться в строй — две
+#: разные вещи, и раньше «оторвался» означало «убежал и забыл про бой».
+RETREAT_BREAK_DIST = CELL_SIZE * 6
+#: На столько пикселей должно вырасти расстояние до врага, чтобы отход считался
+#: идущим. Не растёт — отступать некуда, и юнит идёт в бой.
+RETREAT_STALL_EPS = CELL_SIZE * 0.35
 ADVANCE_SAFE_DIST = CELL_SIZE * 12
 
 
@@ -21,6 +37,9 @@ class UnitAI:
         self._think_timer = 0.0
         self._think_interval = 0.8
         self._retreat_threshold = RETREAT_HEALTH
+        self._retreat_used = 0
+        self._retreat_timer = 0.0
+        self._retreat_best_dist = 0.0
         self._target_village: Optional[Tuple[int, int]] = None
         self._hold_pos: Optional[Tuple[float, float]] = None
         self._flank_side = random.choice([-1, 1])
@@ -46,8 +65,15 @@ class UnitAI:
             self._do_retreat(alive_enemies)
             return
 
-        if self.unit.health_ratio < self._retreat_threshold:
+        # Отступление разрешено, только пока юнит не исчерпал лимит срывов. Порог
+        # не «ползёт», а счётчик растёт: иначе юнит с 6% здоровья вечно
+        # удовлетворяет «здоровье ниже порога», срывается и тут же возвращается
+        # обратно, не доходя до выбора цели, — и партия не заканчивается.
+        if (self.unit.health_ratio < self._retreat_threshold
+                and self._retreat_used < RETREAT_ALLOWANCE):
             self.state = AIState.RETREAT
+            self._retreat_timer = 0.0
+            self._retreat_best_dist = 0.0
             self._do_retreat(alive_enemies)
             return
 
@@ -128,11 +154,14 @@ class UnitAI:
                     self._move_towards(center[0], center[1])
                 return
             else:
-                self.state = AIState.GROUP_UP
-                center = self._find_allies_center(allies)
-                if center:
-                    self._group_up_target = center
-                    self._move_towards(center[0], center[1])
+                # Собираться не с кем. Раньше юнит без союзников всё равно
+                # уходил в GROUP_UP с ПУСТОЙ точкой сбора и ping-pong'ил между
+                # IDLE и GROUP_UP, не приближаясь к врагу: последние выжившие
+                # на поле так и не добивали друг друга, и равные армии не
+                # доигрывались (2 против 1 — и тишина до конца матча).
+                self.state = AIState.MOVE
+                if nearest_enemy:
+                    self._move_towards(nearest_enemy.x, nearest_enemy.y)
                 return
 
         if villages and village_owners is not None:
@@ -145,6 +174,18 @@ class UnitAI:
             return
 
         nearby = self._count_nearby_allies(allies, self.unit, GROUP_UP_RANGE)
+
+        # Ждать некого. Пока у юнита есть хотя бы один союзник, сбор имеет
+        # смысл; когда не осталось никого, ожидание бессмысленно — идём на
+        # ближайшего врага. Без этого юнит без союзников бесконечно ходил
+        # IDLE -> GROUP_UP с пустой точкой сбора и никогда не вступал в бой.
+        if not allies:
+            if nearest_enemy:
+                self.state = AIState.MOVE
+                self._move_towards(nearest_enemy.x, nearest_enemy.y)
+            else:
+                self.state = AIState.IDLE
+            return
 
         if self.unit.unit_type == UnitType.INFANTRY and nearby >= COORDINATE_MIN_ALLIES:
             if nearest_enemy:
@@ -274,6 +315,29 @@ class UnitAI:
             dx, dy = 1, 0
             dist = 1
 
+        # Отступление обязано когда-то закончиться, иначе раненый неубиваем:
+        # он вечно уходит от врага, которого не отрывается, и бой не
+        # заканчивается никогда. Три правила выхода, все про дистанцию:
+        #   оторвались — ушли на RETREAT_BREAK_DIST, контакт разорван;
+        #   не оторвались — расстояние перестало расти, отступать некуда;
+        #   время вышло — страховка на случай, если враг тоже бежит.
+        if dist >= RETREAT_BREAK_DIST:
+            self._end_retreat()
+            return
+        # «Отход не идёт» имеет смысл только ПОСЛЕ первой попытки. Иначе юнит,
+        # стоящий вплотную к врагу, срывался бы в отступление и тут же
+        # возвращался обратно, не сделав ни шага: правило проверялось бы на
+        # расстоянии, которого он ещё даже не пытался увеличить.
+        if (self._retreat_best_dist > 0
+                and dist <= self._retreat_best_dist + RETREAT_STALL_EPS):
+            self._end_retreat()
+            return
+        self._retreat_best_dist = dist
+        self._retreat_timer += self._think_interval
+        if self._retreat_timer >= RETREAT_TIMEOUT:
+            self._end_retreat()
+            return
+
         flee_dist = CELL_SIZE * 8
         fx = self.unit.x + (dx / dist) * flee_dist
         fy = self.unit.y + (dy / dist) * flee_dist
@@ -284,7 +348,24 @@ class UnitAI:
         self._move_towards(fx, fy)
 
         if self.unit.health_ratio > self._retreat_threshold + 0.15:
+            self._retreat_used = 0
             self.state = AIState.IDLE
+            return
+
+        # Всё время отступления ещё не вышло и враг всё ещё рядом — продолжаем
+        # отходить; выход по дистанции и по времени разобран выше.
+
+    def _end_retreat(self):
+        """Отступление закончено: юнит возвращается в строй и дерётся дальше.
+
+        Счётчик срывов растёт, и когда ``RETREAT_ALLOWANCE`` исчерпан, юнит
+        больше не отступает никогда — раненый идёт в бой и умирает. Именно
+        конечность счётчика гарантирует, что бой заканчивается.
+        """
+        self._retreat_used += 1
+        self._retreat_timer = 0.0
+        self._retreat_best_dist = 0.0
+        self.state = AIState.IDLE
 
     def _do_capture(self, villages, village_owners):
         if not self._target_village:

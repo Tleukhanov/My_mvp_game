@@ -12,6 +12,53 @@ from config import (
 )
 
 
+def separate_units(units: List["Unit"], min_sep: Optional[float] = None,
+                   strength: float = 0.5):
+    """Развести юниты ОДНИМ проходом, результат не зависящий от порядка списка.
+
+    Раньше каждый юнит раздвигался сам, по ходу обхода (Гаусс-Зейдель): того,
+    кто в списке раньше, уже никто не сдвинет — он доходит до цели вплотную и
+    там и стоит. Списки всегда строятся синими первыми, поэтому исход боя
+    решал порядок элементов, а не сила армий. Замер 1200 против 1200 это показал
+    прямо: в естественном порядке выживало 5 синих и 3 красных, при
+    перестановке списка — 7 синих и 1 красный, а после перемешивания синий
+    выигрывал вчистую.
+
+    Теперь смещения считаются по позициям на начало прохода и применяются разом
+    (Якоби). Перестановка юнитов меняет картинку, но не исход боя.
+
+    Сразу атакующие пары не разводятся: сражающиеся стоят вплотную по замыслу,
+    иначе они никогда не достают друг друга.
+    """
+    live = [u for u in units if u.alive]
+    n = len(live)
+    if n < 2:
+        return
+    sep = Unit.MIN_SEPARATION if min_sep is None else min_sep
+    off_x = [0.0] * n
+    off_y = [0.0] * n
+    for i in range(n):
+        a = live[i]
+        for j in range(i + 1, n):
+            b = live[j]
+            if a._attack_target is b or b._attack_target is a:
+                continue
+            dx = a.x - b.x
+            dy = a.y - b.y
+            dist = math.hypot(dx, dy)
+            if dist >= sep or dist <= 0.1:
+                continue
+            overlap = (sep - dist) * strength
+            ux, uy = dx / dist, dy / dist
+            off_x[i] += ux * overlap
+            off_y[i] += uy * overlap
+            off_x[j] -= ux * overlap
+            off_y[j] -= uy * overlap
+    for i, u in enumerate(live):
+        u.x += off_x[i]
+        u.y += off_y[i]
+
+
 class Unit:
     def __init__(
         self,
@@ -117,7 +164,6 @@ class Unit:
                     self._chase_timer = 1.0
 
         self._move_along_path(dt, game_map)
-        self._resolve_collisions(all_units)
 
     def _move_along_path(self, dt: float, game_map):
         if not self._path or self._path_index >= len(self._path):
@@ -166,6 +212,13 @@ class Unit:
     MIN_SEPARATION = CELL_SIZE * 0.6
 
     def _resolve_collisions(self, all_units: List["Unit"]):
+        """Развести юнита от соседей, сдвинув САМОГО себя.
+
+        Метод остался для точечных проверок (и для тестов), но движок его
+        больше не зовёт: он сдвигает только ``self``, поэтому результат зависит
+        от того, в каком порядке обходится список. Симметричное разделение
+        делает :func:`separate_units`.
+        """
         for other in all_units:
             if other is self or not other.alive:
                 continue

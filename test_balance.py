@@ -130,8 +130,14 @@ class TestHarnessIsTrustworthy:
         assert half.ticks < full.ticks
 
     def test_stall_detection_reports_a_frozen_battle(self):
-        """Замерший бой помечается stalled и не выдаётся за победу."""
-        frozen = run_battle(BattleSpec(*DEADLOCK, seed=1))
+        """Замерший бой помечается stalled и не выдаётся за победу.
+
+        Заморозка задана явно (``frozen=True``). Раньше фикстурой был дедлок
+        движка — равные армии не доигрывались из-за вечного отступления, — и
+        тест зависания был на самом деле тестом бага. Дедлок починен, поэтому
+        мёртвый бой для проверки предохранителя надо построить самому.
+        """
+        frozen = run_battle(BattleSpec(*DEADLOCK, seed=1, frozen=True))
         assert frozen.stalled is True
         assert frozen.outcome == UNRESOLVED
 
@@ -142,12 +148,12 @@ class TestHarnessIsTrustworthy:
     def test_stall_detection_matches_a_long_run(self):
         """Предохранитель зависания не обрывает бой, который доигрался бы.
 
-        Тот же бой без ограничителя зависания и с длинным потолком обязан
-        остаться недоигранным: иначе «не доигралось» означало бы «проиграло»,
-        а это ровно тот подменяющий вывод, который стенд запрещает.
+        Тот же замороженный бой без ограничителя зависания и с длинным потолком
+        обязан остаться недоигранным: иначе «не доигралось» означало бы
+        «проиграло», а это ровно тот подменяющий вывод, который стенд запрещает.
         """
-        with_guard = run_battle(BattleSpec(*DEADLOCK, seed=1))
-        without_guard = run_battle(BattleSpec(*DEADLOCK, seed=1,
+        with_guard = run_battle(BattleSpec(*DEADLOCK, seed=1, frozen=True))
+        without_guard = run_battle(BattleSpec(*DEADLOCK, seed=1, frozen=True,
                                               stall_ticks=0,
                                               max_ticks=30 * 200))
         assert without_guard.outcome == UNRESOLVED
@@ -286,9 +292,6 @@ class TestStructuralInvariants:
 class TestBalanceInvariants:
     """Требования к бою. Сегодня не выполняются — помечены xfail."""
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "равные армии 1200:1200 не доигрываются: 0 из 24 боёв закончились "
-        "исходом за 600 игровых секунд, все замерли на 1-5 уцелевших отрядах"))
     def test_equal_armies_battle_must_resolve(self):
         """1200 против 1200 обязаны доиграться, а не замереть.
 

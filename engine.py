@@ -17,7 +17,7 @@ from config import (
     RECRUIT_INTERVAL, TerrainType,
 )
 from map import TacticalMap
-from units import Unit
+from units import Unit, separate_units
 from pathfinding import Pathfinder
 from ai import AIController
 from war import (
@@ -1045,6 +1045,12 @@ class GameEngine:
     def _update(self, dt: float):
         for unit in self.all_units:
             unit.update(dt, self.game_map, self.all_units)
+
+        # Разделение — отдельным проходом ПОСЛЕ движения всех юнитов. Раньше
+        # каждый раздвигался сам по ходу обхода, и итог зависел от порядка в
+        # all_units: список всегда синий первым, значил исход боя решала сборка
+        # списка, а не сила армий (см. units.separate_units).
+        separate_units(self.all_units)
 
         villages = self.game_map.get_all_villages()
         v_owners = self.game_map.village_owners
